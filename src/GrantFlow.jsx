@@ -15,21 +15,29 @@ import {
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 const CATEGORIES = [
-  { name: "Employee Expenses", type: "expense", subs: ["Salaries", "Payroll Taxes", "Benefits"] },
-  { name: "Consulting Expenses", type: "expense", subs: [] },
-  { name: "Equipment Expenses", type: "expense", subs: [] },
-  { name: "Facility Expenses", type: "expense", subs: ["Rent", "Utilities", "Maintenance"] },
-  { name: "Vehicle Expenses", type: "expense", subs: [] },
-  { name: "Insurance Claim Expense", type: "expense", subs: [] },
-  { name: "Grants and Contracts Indirect Billing", type: "expense", subs: [] },
-  { name: "Non Federal Grant Client Expenses", type: "expense", subs: [] },
-  { name: "G & S - Expenses", type: "expense", subs: [] },
-  { name: "Program Fees Revenue", type: "revenue", subs: [] },
-  { name: "Grants and Contracts", type: "revenue", subs: [] },
-  { name: "REC F.A./EQ. Grantor", type: "revenue", subs: [] },
-  { name: "TFA Category 1 and 2", type: "revenue", subs: ["Category 1 TFA", "Category 2 TFA"] },
-  { name: "Other Total Budget", type: "revenue", subs: [] },
+  { name: "Grants and Contracts", type: "revenue", subs: ["4100 - Grants and Contracts"] },
+  { name: "Grants and Contracts Indirect Billing", type: "revenue", subs: ["4101 - Grants and Contracts Indirect Billing"] },
+  { name: "Donations Without In Kind", type: "revenue", subs: ["4000 - Donation"] },
+  { name: "Other Non-SSVF Revenue", type: "revenue", subs: [
+    "4004 - Event Revenue", "4020 - Interest/Dividends", "4025 - F/B transfer in", "4060 - WEG Misc. Income",
+    "4120 - Program Fees Revenue", "4601 - Gain on Sale", "4625 - Forgiveness of Debt", "4990 - MISC", "4999 - Insurance Claim",
+  ] },
+  { name: "Wages and Benefits", type: "expense", subs: ["5000 - Salary and Wages", "5900 - Payroll taxes and benefits"] },
+  { name: "Operations", type: "expense", subs: [
+    "6000 - Outreach/Recruitment", "6001 - Marketing", "6005 - Employee Expenses", "6015 - Dues and Membership",
+    "6016 - Donations", "6018 - Grant Expense", "6020 - Equipment Expenses", "6025 - Vehicle Expenses",
+    "6027 - F/B tsfr out", "6040 - Facility Expenses", "6045 - Fees/Licenses", "6047 - Software & Licensing",
+    "6050 - Office Supplies", "6055 - Postage/Freight", "6060 - Printing/Duplication",
+    "6071 - Homeless Management Information System (HMIS)", "6085 - Non Federal Grant Client Expenses",
+    "6120 - Consulting Expenses", "6127 - CARF Certification", "6130 - G & S - Expenses", "6135 - Insurance",
+    "6140 - Interest", "6145 - Ret. Forfeiture", "6150 - Spec. Projects", "6155 - Taxes", "6175 - Miscellaneous",
+    "6185 - Insurance Claim Expense", "6190 - Refunds/NSF Checks", "6300 - Bad Debt", "6700 - Depreciation",
+    "6750 - Intercompany Billing", "6989 - Other Total Budget", "6990 - Indirect", "6998 - REC F.A./EQ. Grantor",
+    "6999 - Asses Sale Gain/Loss",
+  ] },
+  { name: "TFA", type: "expense", subs: ["7100 - Category 1 Temporary Financial Assistance", "7200 - Category 2 Temporary Financial Assistance"] },
 ];
+const CUSTOM_CATEGORY = "__custom__";
 
 const STAGES = ["Prospecting", "Writing", "Applied", "Awarded", "Rejected", "Active", "Closing", "Closed"];
 const SITE_OPTIONS = [
@@ -62,7 +70,11 @@ const fmtDate = (d) => (d ? new Date(d + "T00:00:00").toLocaleDateString("en-US"
 
 function newLine() {
   const c = CATEGORIES[0];
-  return { id: uid(), category: c.name, type: c.type, subcategory: "", amounts: Array(12).fill(0), actuals: Array(12).fill(0) };
+  return {
+    id: uid(), category: c.name, type: c.type, categoryCustom: false,
+    subcategory: "", subcategoryCustom: false,
+    amounts: Array(12).fill(0), actuals: Array(12).fill(0),
+  };
 }
 
 function lineTotal(line) {
@@ -774,7 +786,7 @@ function BudgetModal({ budget, grantId, onSave, onClose }) {
         <table className="text-xs w-full" style={{ fontFamily: "var(--mono-font)" }}>
           <thead>
             <tr style={{ background: "#F6F7F3" }}>
-              <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 170 }}>Category</th>
+              <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
               <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Subcategory</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
               {MONTHS.map((m) => <th key={m} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{m}</th>)}
@@ -792,37 +804,90 @@ function BudgetModal({ budget, grantId, onSave, onClose }) {
               return (
                 <tr key={line.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
                   <td className="px-2 py-1.5 sticky left-0 bg-white">
-                    <select
-                      value={line.category}
-                      onChange={(e) => {
-                        const nc = CATEGORIES.find((c) => c.name === e.target.value);
-                        updateLine(line.id, { category: nc.name, type: nc.type, subcategory: "" });
-                      }}
-                      className="w-full rounded border px-1.5 py-1 text-xs"
-                      style={inputStyle}
-                    >
-                      {CATEGORIES.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
-                    </select>
+                    {line.categoryCustom ? (
+                      <div className="flex gap-1">
+                        <input
+                          value={line.category}
+                          onChange={(e) => updateLine(line.id, { category: e.target.value })}
+                          placeholder="Custom category"
+                          className="w-full rounded border px-1.5 py-1 text-xs"
+                          style={inputStyle}
+                          autoFocus
+                        />
+                        <select
+                          value={line.type}
+                          onChange={(e) => updateLine(line.id, { type: e.target.value })}
+                          className="shrink-0 rounded border px-1 py-1 text-xs"
+                          style={inputStyle}
+                        >
+                          <option value="expense">Exp</option>
+                          <option value="revenue">Rev</option>
+                        </select>
+                        <button
+                          onClick={() => updateLine(line.id, { categoryCustom: false, category: CATEGORIES[0].name, type: CATEGORIES[0].type, subcategory: "", subcategoryCustom: false })}
+                          className="shrink-0 px-1 rounded hover:bg-red-50"
+                          title="Back to category list"
+                        >
+                          <X size={12} style={{ color: "#B5443A" }} />
+                        </button>
+                      </div>
+                    ) : (
+                      <select
+                        value={line.category}
+                        onChange={(e) => {
+                          if (e.target.value === CUSTOM_CATEGORY) {
+                            updateLine(line.id, { categoryCustom: true, category: "", subcategory: "", subcategoryCustom: false });
+                            return;
+                          }
+                          const nc = CATEGORIES.find((c) => c.name === e.target.value);
+                          updateLine(line.id, { category: nc.name, type: nc.type, subcategory: "", subcategoryCustom: false });
+                        }}
+                        className="w-full rounded border px-1.5 py-1 text-xs"
+                        style={inputStyle}
+                      >
+                        {CATEGORIES.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
+                        <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
+                      </select>
+                    )}
                   </td>
                   <td className="px-2 py-1.5">
-                    {cat.subs.length > 0 ? (
+                    {line.categoryCustom || line.subcategoryCustom ? (
+                      <div className="flex gap-1">
+                        <input
+                          value={line.subcategory}
+                          onChange={(e) => updateLine(line.id, { subcategory: e.target.value })}
+                          placeholder="Custom subcategory"
+                          className="w-full rounded border px-1.5 py-1 text-xs"
+                          style={inputStyle}
+                          autoFocus={line.subcategoryCustom && !line.categoryCustom}
+                        />
+                        {!line.categoryCustom && (
+                          <button
+                            onClick={() => updateLine(line.id, { subcategoryCustom: false, subcategory: "" })}
+                            className="shrink-0 px-1 rounded hover:bg-red-50"
+                            title="Back to subcategory list"
+                          >
+                            <X size={12} style={{ color: "#B5443A" }} />
+                          </button>
+                        )}
+                      </div>
+                    ) : (
                       <select
                         value={line.subcategory}
-                        onChange={(e) => updateLine(line.id, { subcategory: e.target.value })}
+                        onChange={(e) => {
+                          if (e.target.value === CUSTOM_CATEGORY) {
+                            updateLine(line.id, { subcategoryCustom: true, subcategory: "" });
+                            return;
+                          }
+                          updateLine(line.id, { subcategory: e.target.value });
+                        }}
                         className="w-full rounded border px-1.5 py-1 text-xs"
                         style={inputStyle}
                       >
                         <option value="">Select subcategory</option>
-                        {cat.subs.map((s) => <option key={s} value={s}>{s}</option>)}
+                        {cat?.subs.map((s) => <option key={s} value={s}>{s}</option>)}
+                        <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
                       </select>
-                    ) : (
-                      <input
-                        value={line.subcategory}
-                        onChange={(e) => updateLine(line.id, { subcategory: e.target.value })}
-                        placeholder="optional"
-                        className="w-full rounded border px-1.5 py-1 text-xs"
-                        style={inputStyle}
-                      />
                     )}
                   </td>
                   <td className="px-2 py-1.5">
