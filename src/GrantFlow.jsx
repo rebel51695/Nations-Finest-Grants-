@@ -198,7 +198,7 @@ const stageColor = {
 const ANNUAL_HOURS = 1768;
 
 function newAllocation() {
-  return { id: uid(), grantId: "", percent: 0 };
+  return { id: uid(), type: "grant", grantId: "", costCenterId: "", percent: 0 };
 }
 
 function staffAnnualCost(staff) {
@@ -220,6 +220,18 @@ function personnelCostByGrant(staffList) {
     (s.allocations || []).forEach((al) => {
       if (!al.grantId) return;
       map[al.grantId] = (map[al.grantId] || 0) + cost * ((Number(al.percent) || 0) / 100);
+    });
+  });
+  return map;
+}
+
+function personnelCostByCostCenter(staffList) {
+  const map = {};
+  staffList.forEach((s) => {
+    const cost = staffAnnualCost(s);
+    (s.allocations || []).forEach((al) => {
+      if (!al.costCenterId) return;
+      map[al.costCenterId] = (map[al.costCenterId] || 0) + cost * ((Number(al.percent) || 0) / 100);
     });
   });
   return map;
@@ -2681,7 +2693,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 
 // ---------- personnel / payroll ----------
 
-function StaffModal({ staff, grants, onSave, onClose, onDelete }) {
+function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
   const [form, setForm] = useState(staff || {
     id: uid(), name: "", position: "", department: "", exempt: "Non-exempt",
     payType: "Salary", annualSalary: 0, hourlyRate: 0, annualHours: ANNUAL_HOURS,
@@ -2752,34 +2764,65 @@ function StaffModal({ staff, grants, onSave, onClose, onDelete }) {
 
       <div className="mt-5">
         <div className="flex items-center justify-between mb-2">
-          <h3 className="text-sm font-medium" style={{ color: "#1C2624" }}>Grant allocations</h3>
+          <h3 className="text-sm font-medium" style={{ color: "#1C2624" }}>Allocations</h3>
           <span className="text-xs" style={{ color: allocatedPct > 100 ? "#B5443A" : "#8A8F87" }}>{allocatedPct}% allocated</span>
         </div>
         <div className="space-y-2">
-          {form.allocations.map((a) => (
-            <div key={a.id} className="flex items-center gap-2">
-              <GrantPicker
-                grants={grants}
-                value={a.grantId}
-                onChange={(v) => updateAlloc(a.id, { grantId: v })}
-                noneLabel="Select a grant"
-                wrapStyle={{ flex: 1 }}
-              />
-              <div className="relative w-28">
-                <input
-                  type="number" min="0" max="100"
-                  value={a.percent}
-                  onChange={(e) => updateAlloc(a.id, { percent: e.target.value })}
-                  className="w-full rounded-md border px-2 py-1.5 text-sm text-right"
-                  style={inputStyle}
-                />
+          {form.allocations.map((a) => {
+            const isCostCenter = a.type === "costCenter";
+            return (
+              <div key={a.id} className="flex items-center gap-2">
+                <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
+                  <button
+                    onClick={() => updateAlloc(a.id, { type: "grant", costCenterId: "" })}
+                    className="px-2 py-1.5 text-xs font-medium"
+                    style={{ background: !isCostCenter ? "#1F5C6B" : "#FFFFFF", color: !isCostCenter ? "#FFFFFF" : "#5B6B66" }}
+                  >
+                    Grant
+                  </button>
+                  <button
+                    onClick={() => updateAlloc(a.id, { type: "costCenter", grantId: "" })}
+                    className="px-2 py-1.5 text-xs font-medium"
+                    style={{ background: isCostCenter ? "#1F5C6B" : "#FFFFFF", color: isCostCenter ? "#FFFFFF" : "#5B6B66" }}
+                  >
+                    Cost Center
+                  </button>
+                </div>
+                {isCostCenter ? (
+                  <select
+                    value={a.costCenterId}
+                    onChange={(e) => updateAlloc(a.id, { costCenterId: e.target.value })}
+                    className={inputCls}
+                    style={{ ...inputStyle, flex: 1 }}
+                  >
+                    <option value="">Select a cost center</option>
+                    {(costCenters || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                ) : (
+                  <GrantPicker
+                    grants={grants}
+                    value={a.grantId}
+                    onChange={(v) => updateAlloc(a.id, { grantId: v })}
+                    noneLabel="Select a grant"
+                    wrapStyle={{ flex: 1 }}
+                  />
+                )}
+                <div className="relative w-28">
+                  <input
+                    type="number" min="0" max="100"
+                    value={a.percent}
+                    onChange={(e) => updateAlloc(a.id, { percent: e.target.value })}
+                    className="w-full rounded-md border px-2 py-1.5 text-sm text-right"
+                    style={inputStyle}
+                  />
+                </div>
+                <span className="text-xs" style={{ color: "#8A8F87" }}>%</span>
+                <button onClick={() => removeAlloc(a.id)} className="p-1 rounded hover:bg-red-50">
+                  <Trash2 size={14} style={{ color: "#B5443A" }} />
+                </button>
               </div>
-              <span className="text-xs" style={{ color: "#8A8F87" }}>%</span>
-              <button onClick={() => removeAlloc(a.id)} className="p-1 rounded hover:bg-red-50">
-                <Trash2 size={14} style={{ color: "#B5443A" }} />
-              </button>
-            </div>
-          ))}
+            );
+          })}
         </div>
         <button onClick={addAlloc} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border mt-2" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
           <Plus size={13} /> Add allocation
@@ -2805,7 +2848,7 @@ function StaffModal({ staff, grants, onSave, onClose, onDelete }) {
   );
 }
 
-function PersonnelView({ grants, staff, setStaff, initialOpenStaffId, logActivity }) {
+function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
@@ -2816,6 +2859,7 @@ function PersonnelView({ grants, staff, setStaff, initialOpenStaffId, logActivit
     .filter((s) => deptFilter === "All" || s.department === deptFilter)
     .filter((s) => siteFilter === "All" || s.site === siteFilter);
   const costByGrant = personnelCostByGrant(staff);
+  const costByCostCenter = personnelCostByCostCenter(staff);
   const totalPersonnelCost = staff.reduce((a, s) => a + staffAnnualCost(s), 0);
 
   const saveStaff = (s) => {
@@ -2868,6 +2912,23 @@ function PersonnelView({ grants, staff, setStaff, initialOpenStaffId, logActivit
         </div>
       )}
 
+      {Object.keys(costByCostCenter).length > 0 && (
+        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Personnel cost by cost center</h2>
+          <div className="space-y-1.5 text-sm">
+            {Object.entries(costByCostCenter).map(([ccId, cost]) => {
+              const cc = (costCenters || []).find((x) => x.id === ccId);
+              return (
+                <div key={ccId} className="flex items-center justify-between">
+                  <span style={{ color: "#1C2624" }}>{cc ? cc.name : "Unknown cost center"}</span>
+                  <span style={{ color: "#1C2624", fontVariantNumeric: "tabular-nums" }}>{fmt(cost)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="flex gap-3">
         <Field label="Filter by department">
           <select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
@@ -2909,6 +2970,10 @@ function PersonnelView({ grants, staff, setStaff, initialOpenStaffId, logActivit
                       const g = grants.find((x) => x.id === a.grantId);
                       return <Badge key={a.id} color="#5B7FA6">{g ? g.title : "Unknown"} · {a.percent}%</Badge>;
                     })}
+                    {s.allocations.filter((a) => a.costCenterId).map((a) => {
+                      const cc = (costCenters || []).find((x) => x.id === a.costCenterId);
+                      return <Badge key={a.id} color="#8A8F87">{cc ? cc.name : "Unknown"} · {a.percent}%</Badge>;
+                    })}
                   </div>
                 )}
                 <div className="flex gap-2 mt-3">
@@ -2929,6 +2994,7 @@ function PersonnelView({ grants, staff, setStaff, initialOpenStaffId, logActivit
         <StaffModal
           staff={modal === "new" ? null : modal}
           grants={grants}
+          costCenters={costCenters}
           onSave={saveStaff}
           onClose={() => setModal(null)}
           onDelete={modal === "new" ? undefined : () => { setConfirm(modal.id); setModal(null); }}
@@ -4180,7 +4246,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
         ) : tab === "personnel" ? (
           <PersonnelView
             key={pendingOpenStaffId ? `staff-open-${pendingOpenStaffId}` : "personnel"}
-            grants={grants} staff={staff} setStaff={setStaff}
+            grants={grants} staff={staff} setStaff={setStaff} costCenters={costCenters}
             initialOpenStaffId={pendingOpenStaffId} logActivity={logActivity}
           />
         ) : tab === "activity-log" ? (
