@@ -2,10 +2,10 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./storageShim";
 import "./index.css";
-import GrantFlow from "./GrantFlow.jsx";
+import AppGate from "./AppGate.jsx";
 
 createRoot(document.getElementById("root")).render(
   <StrictMode>
-    <GrantFlow />
+    <AppGate />
   </StrictMode>
 );
