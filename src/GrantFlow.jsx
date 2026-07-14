@@ -451,15 +451,15 @@ function ConfirmModal({ message, onConfirm, onCancel }) {
 
 // ---------- grant form ----------
 
-function CostCenterModal({ costCenter, onSave, onClose, onDelete }) {
-  const [form, setForm] = useState(costCenter || { id: uid(), name: "", description: "" });
+function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
+  const [form, setForm] = useState(budgetGroup || { id: uid(), name: "", description: "" });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
+    <Modal title={budgetGroup ? "Edit budget group" : "New budget group"} onClose={onClose}>
       <div className="space-y-4">
         <Field label="Name">
-          <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Administration, Fundraising, Facilities" autoFocus />
+          <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Housing Programs, Veteran Support Services" autoFocus />
         </Field>
         <Field label="Description (optional)">
           <textarea className={inputCls} style={inputStyle} rows={2} value={form.description} onChange={set("description")} />
@@ -484,15 +484,79 @@ function CostCenterModal({ costCenter, onSave, onClose, onDelete }) {
   );
 }
 
-function GrantModal({ grant, onSave, onClose }) {
+function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivity, onSave, onClose, onDelete }) {
+  const [form, setForm] = useState(costCenter || { id: uid(), name: "", description: "", budgetGroupId: "" });
+  const [bgModal, setBgModal] = useState(null);
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  const saveBudgetGroup = (bg) => {
+    setBudgetGroups((prev) => {
+      const exists = prev.some((x) => x.id === bg.id);
+      logActivity?.("Budget Group", exists ? "Updated" : "Created", bg.name || "Untitled budget group");
+      return exists ? prev.map((x) => (x.id === bg.id ? bg : x)) : [...prev, bg];
+    });
+    setForm((f) => ({ ...f, budgetGroupId: bg.id }));
+    setBgModal(null);
+  };
+
+  return (
+    <Modal title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
+      <div className="space-y-4">
+        <Field label="Name">
+          <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Administration, Fundraising, Facilities" autoFocus />
+        </Field>
+        <Field label="Budget group (optional)">
+          <div className="flex items-center gap-2">
+            <select value={form.budgetGroupId || ""} onChange={set("budgetGroupId")} className={inputCls} style={inputStyle}>
+              <option value="">No group</option>
+              {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
+            </select>
+            <button onClick={() => setBgModal("new")} className="shrink-0 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>+ New</button>
+          </div>
+        </Field>
+        <Field label="Description (optional)">
+          <textarea className={inputCls} style={inputStyle} rows={2} value={form.description} onChange={set("description")} />
+        </Field>
+      </div>
+      <div className="flex justify-between gap-2 mt-6">
+        {onDelete ? (
+          <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete</button>
+        ) : <span />}
+        <div className="flex gap-2">
+          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button
+            onClick={() => { if (!form.name.trim()) return; onSave(form); }}
+            className="px-4 py-2 rounded-md text-sm text-white"
+            style={{ background: "#1F5C6B" }}
+          >
+            Save
+          </button>
+        </div>
+      </div>
+      {bgModal && <BudgetGroupModal budgetGroup={bgModal === "new" ? null : bgModal} onSave={saveBudgetGroup} onClose={() => setBgModal(null)} />}
+    </Modal>
+  );
+}
+
+function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, onSave, onClose }) {
   const [form, setForm] = useState(grant || {
     id: uid(), title: "", programCode: "", funding: "", sites: [], stage: "Prospecting",
     awardAmount: 0, start: "", end: "", riskStatus: "Low", cadence: [],
     complianceOwner: "", financeOwner: "", internalOwner: "", operationsOwner: "", renewal: false,
     doclibUrl: "", contractUrl: "", notes: "",
     budgetPeriodStart: "", budgetPeriodEnd: "", obligatedFunds: 0, obligatedFundsRemaining: 0, paymentMethod: PAYMENT_METHODS[0],
-    beds: "", bedRate: 0, grantPoc: "", awardAmountRemaining: 0,
+    beds: "", bedRate: 0, grantPoc: "", awardAmountRemaining: 0, budgetGroupId: "",
   });
+  const [bgModal, setBgModal] = useState(null);
+  const saveBudgetGroup = (bg) => {
+    setBudgetGroups((prev) => {
+      const exists = prev.some((x) => x.id === bg.id);
+      logActivity?.("Budget Group", exists ? "Updated" : "Created", bg.name || "Untitled budget group");
+      return exists ? prev.map((x) => (x.id === bg.id ? bg : x)) : [...prev, bg];
+    });
+    setForm((f) => ({ ...f, budgetGroupId: bg.id }));
+    setBgModal(null);
+  };
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value });
   const toggleSite = (site) => {
     setForm((f) => ({
@@ -577,6 +641,15 @@ function GrantModal({ grant, onSave, onClose }) {
         <Field label="Operations owner">
           <input className={inputCls} style={inputStyle} value={form.operationsOwner} onChange={set("operationsOwner")} />
         </Field>
+        <Field label="Budget group (optional)">
+          <div className="flex items-center gap-2">
+            <select value={form.budgetGroupId || ""} onChange={set("budgetGroupId")} className={inputCls} style={inputStyle}>
+              <option value="">No group</option>
+              {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
+            </select>
+            <button onClick={() => setBgModal("new")} className="shrink-0 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>+ New</button>
+          </div>
+        </Field>
         <Field label="Document library URL">
           <input className={inputCls} style={inputStyle} value={form.doclibUrl} onChange={set("doclibUrl")} placeholder="https://…" />
         </Field>
@@ -629,6 +702,7 @@ function GrantModal({ grant, onSave, onClose }) {
           Save grant
         </button>
       </div>
+      {bgModal && <BudgetGroupModal budgetGroup={bgModal === "new" ? null : bgModal} onSave={saveBudgetGroup} onClose={() => setBgModal(null)} />}
     </Modal>
   );
 }
@@ -1382,7 +1456,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
   );
 }
 
-function GrantsView({ grants, budgets, staff, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, autoOpenNew, initialExpandId, goTo, logActivity }) {
+function GrantsView({ grants, budgets, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, autoOpenNew, initialExpandId, goTo, logActivity }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("All");
   const [riskFilter, setRiskFilter] = useState("All");
@@ -1578,7 +1652,7 @@ function GrantsView({ grants, budgets, staff, setGrants, setBudgets, setReports,
         </div>
       )}
 
-      {modal && <GrantModal grant={modal === "new" ? null : modal} onSave={saveGrant} onClose={() => setModal(null)} />}
+      {modal && <GrantModal grant={modal === "new" ? null : modal} budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} logActivity={logActivity} onSave={saveGrant} onClose={() => setModal(null)} />}
       {confirm && (
         <ConfirmModal
           message="This will permanently delete the grant, all of its budgets, invoices, linked grant reports and tasks, and remove it from any staff allocations."
@@ -1590,7 +1664,7 @@ function GrantsView({ grants, budgets, staff, setGrants, setBudgets, setReports,
   );
 }
 
-function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, initialOpenBudgetId, logActivity }) {
+function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, initialOpenBudgetId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenBudgetId ? budgets.find((b) => b.id === stripNonce(initialOpenBudgetId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
@@ -1821,6 +1895,9 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       {ccModal && (
         <CostCenterModal
           costCenter={ccModal === "new" ? null : ccModal}
+          budgetGroups={budgetGroups}
+          setBudgetGroups={setBudgetGroups}
+          logActivity={logActivity}
           onSave={saveCostCenter}
           onClose={() => setCcModal(null)}
           onDelete={ccModal === "new" ? undefined : () => deleteCostCenter(ccModal.id)}
@@ -2334,12 +2411,26 @@ function OrgBudgetRow({ label, values, bold, indent, color, isHeader }) {
   );
 }
 
-function OrgBudgetView({ grants, budgets }) {
+function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const [fyFilter, setFyFilter] = useState("All");
+  const [scope, setScope] = useState("all"); // all | a budget group id
   const [viewMode, setViewMode] = useState("monthly");
   const [dataMode, setDataMode] = useState("plan");
   const fys = [...new Set(budgets.map((b) => b.fy).filter(Boolean))];
-  const relevant = fyFilter === "All" ? budgets : budgets.filter((b) => b.fy === fyFilter);
+
+  const scopedGrantIds = useMemo(() => {
+    if (scope === "all") return null;
+    return new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
+  }, [scope, grants]);
+  const scopedCostCenterIds = useMemo(() => {
+    if (scope === "all") return null;
+    return new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
+  }, [scope, costCenters]);
+
+  const fyScoped = fyFilter === "All" ? budgets : budgets.filter((b) => b.fy === fyFilter);
+  const relevant = scope === "all"
+    ? fyScoped
+    : fyScoped.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)));
   const amountsField = dataMode === "plan" ? "amounts" : "actuals";
   const lineValue = (l) => (dataMode === "plan" ? lineTotal(l) : lineActualTotal(l));
 
@@ -2362,11 +2453,15 @@ function OrgBudgetView({ grants, budgets }) {
     return map;
   }, [relevant, amountsField]);
 
+  const scopedBudgets = scope === "all"
+    ? budgets
+    : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)));
+
   const yearCompare = useMemo(() => {
-    const years = [...new Set(budgets.map((b) => b.fy || "Unspecified"))].sort();
+    const years = [...new Set(scopedBudgets.map((b) => b.fy || "Unspecified"))].sort();
     const byYear = {};
     years.forEach((fy) => {
-      const budgetsForFy = budgets.filter((b) => (b.fy || "Unspecified") === fy);
+      const budgetsForFy = scopedBudgets.filter((b) => (b.fy || "Unspecified") === fy);
       const catTotals = {};
       CATEGORIES.forEach((c) => { catTotals[c.name] = 0; });
       budgetsForFy.forEach((b) => b.lines.forEach((l) => {
@@ -2378,7 +2473,7 @@ function OrgBudgetView({ grants, budgets }) {
       byYear[fy] = { catTotals, revenue, expense, net: revenue - expense };
     });
     return { years, byYear };
-  }, [budgets, dataMode]);
+  }, [scopedBudgets, dataMode]);
 
   const sumRows = (rows) => rows.reduce((acc, r) => acc.map((v, i) => v + r[i]), Array(12).fill(0));
   const totalRevenue = sumRows(revenueCats.map((c) => grouped[c.name].monthly));
@@ -2452,14 +2547,22 @@ function OrgBudgetView({ grants, budgets }) {
         </div>
       </div>
 
-      {viewMode === "monthly" && (
-        <Field label="Fiscal year">
-          <select value={fyFilter} onChange={(e) => setFyFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 240 }}>
-            <option value="All">All fiscal years</option>
-            {fys.map((fy) => <option key={fy} value={fy}>{fy}</option>)}
+      <div className="flex flex-wrap gap-4">
+        <Field label="Scope">
+          <select value={scope} onChange={(e) => setScope(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
+            <option value="all">Whole Organization</option>
+            {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
           </select>
         </Field>
-      )}
+        {viewMode === "monthly" && (
+          <Field label="Fiscal year">
+            <select value={fyFilter} onChange={(e) => setFyFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 240 }}>
+              <option value="All">All fiscal years</option>
+              {fys.map((fy) => <option key={fy} value={fy}>{fy}</option>)}
+            </select>
+          </Field>
+        )}
+      </div>
 
       <div id="org-budget-print-area">
       {viewMode === "compare" ? (
@@ -3149,7 +3252,7 @@ function WhoamiModal({ current, onSave, onSkip }) {
 function ActivityLogView({ activity }) {
   const [entityFilter, setEntityFilter] = useState("All");
   const [personFilter, setPersonFilter] = useState("All");
-  const entities = ["All", "Grant", "Budget", "Cost Center", "Report", "Staff", "Task", "Invoice", "Data"];
+  const entities = ["All", "Grant", "Budget", "Cost Center", "Budget Group", "Report", "Staff", "Task", "Invoice", "Data"];
   const people = ["All", ...new Set(activity.map((a) => a.by).filter(Boolean))];
   const visible = activity
     .filter((a) => entityFilter === "All" || a.entity === entityFilter)
@@ -3356,7 +3459,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, logActivity }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, logActivity }) {
   const [restoreError, setRestoreError] = useState("");
   const [restoreSummary, setRestoreSummary] = useState("");
   const [importError, setImportError] = useState("");
@@ -3367,16 +3470,16 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, activity };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
   const [showBackupText, setShowBackupText] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, activity };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, activity]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, activity]);
 
   const copyBackupText = async () => {
     try {
@@ -3403,9 +3506,10 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.tasks)) setTasks(data.tasks);
         if (Array.isArray(data.invoices)) setInvoices(data.invoices);
         if (Array.isArray(data.costCenters)) setCostCenters(data.costCenters);
+        if (Array.isArray(data.budgetGroups)) setBudgetGroups(data.budgetGroups);
         if (Array.isArray(data.activity)) setActivity(data.activity);
         logActivity?.("Data", "Restored", `Restored from backup file "${file.name}"`);
-        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers.`);
+        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups.`);
       } catch (err) {
         setRestoreError("Couldn't read that file — make sure it's a GrantFlow backup JSON exported from this app.");
       }
@@ -3749,6 +3853,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
   const [invoices, setInvoices] = useState([]);
   const [selectedGrantId, setSelectedGrantId] = useState("");
   const [costCenters, setCostCenters] = useState([]);
+  const [budgetGroups, setBudgetGroups] = useState([]);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
   const [reportsGrantFilter, setReportsGrantFilter] = useState("All");
   const [loaded, setLoaded] = useState(false);
@@ -3831,6 +3936,10 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
       const cc = await withTimeout(loadData("grantflow:costcenters"));
       if (cc) setCostCenters(cc);
     } catch (e) { /* no data yet */ }
+    try {
+      const bg = await withTimeout(loadData("grantflow:budgetgroups"));
+      if (bg) setBudgetGroups(bg);
+    } catch (e) { /* no data yet */ }
     setLastSyncedAt(Date.now());
     setTimeout(() => { isSyncingRef.current = false; }, 500);
   };
@@ -3904,6 +4013,11 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:costcenters", costCenters, "Cost Centers");
   }, [costCenters, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:budgetgroups", budgetGroups, "Budget Groups");
+  }, [budgetGroups, loaded]);
 
   const logActivity = (entity, action, label) => {
     setActivity((prev) => [{ id: uid(), timestamp: new Date().toISOString(), entity, action, label, by: whoami || "Unknown" }, ...prev].slice(0, 150));
@@ -4027,6 +4141,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             key={pendingNewGrant ? "grants-new" : pendingExpandGrantId ? `grants-expand-${pendingExpandGrantId}` : "grants"}
             grants={grants} budgets={budgets} setGrants={setGrants} setBudgets={setBudgets}
             setReports={setReports} setTasks={setTasks} setStaff={setStaff} setInvoices={setInvoices} staff={staff}
+            budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
             autoOpenNew={pendingNewGrant} initialExpandId={pendingExpandGrantId} goTo={goTo} logActivity={logActivity}
           />
         ) : tab === "budgets" ? (
@@ -4036,6 +4151,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             selectedGrantId={selectedGrantId} setSelectedGrantId={setSelectedGrantId}
             costCenters={costCenters} setCostCenters={setCostCenters}
             selectedCostCenterId={selectedCostCenterId} setSelectedCostCenterId={setSelectedCostCenterId}
+            budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
             initialOpenBudgetId={pendingOpenBudgetId} logActivity={logActivity}
           />
         ) : tab === "invoicing" ? (
@@ -4058,7 +4174,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             initialOpenReportId={pendingOpenReportId} logActivity={logActivity}
           />
         ) : tab === "org-budget" ? (
-          <OrgBudgetView grants={grants} budgets={budgets} />
+          <OrgBudgetView grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups} />
         ) : tab === "burn-rate" ? (
           <BurnRateView grants={grants} budgets={budgets} />
         ) : tab === "personnel" ? (
@@ -4071,8 +4187,8 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <ActivityLogView activity={activity} />
         ) : tab === "data" ? (
           <DataView
-            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} activity={activity}
-            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setActivity={setActivity}
+            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} activity={activity}
+            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setActivity={setActivity}
             logActivity={logActivity}
           />
         ) : tab === "user-access" && isAdmin ? (
