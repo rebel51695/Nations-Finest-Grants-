@@ -3,8 +3,9 @@ import * as XLSX from "xlsx";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
   ExternalLink, Download, Search, ArrowRight, AlertCircle, CheckCircle2,
-  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu,
+  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield,
 } from "lucide-react";
+import AdminPanel from "./AdminPanel.jsx";
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend,
@@ -787,7 +788,7 @@ function BudgetModal({ budget, grantId, onSave, onClose }) {
           <thead>
             <tr style={{ background: "#F6F7F3" }}>
               <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
-              <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Subcategory</th>
+              <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
               {MONTHS.map((m) => <th key={m} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{m}</th>)}
               <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
@@ -3617,7 +3618,7 @@ const NAV = [
   { key: "data", label: "Data & Backup", icon: Upload },
 ];
 
-export default function GrantFlow() {
+export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {}) {
   const [tab, setTab] = useState("dashboard");
   const [grants, setGrants] = useState([]);
   const [budgets, setBudgets] = useState([]);
@@ -3671,34 +3672,37 @@ export default function GrantFlow() {
   const [editingWhoami, setEditingWhoami] = useState(false);
   const [skippedWhoami, setSkippedWhoami] = useState(false);
 
+  const withTimeout = (promise, ms = 8000) =>
+    Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(undefined), ms))]);
+
   const refreshAll = async () => {
     isSyncingRef.current = true;
     try {
-      const g = await loadData("grantflow:grants");
+      const g = await withTimeout(loadData("grantflow:grants"));
       if (g) setGrants(g);
     } catch (e) { /* no data yet */ }
     try {
-      const b = await loadData("grantflow:budgets");
+      const b = await withTimeout(loadData("grantflow:budgets"));
       if (b) setBudgets(b);
     } catch (e) { /* no data yet */ }
     try {
-      const r = await loadData("grantflow:reports");
+      const r = await withTimeout(loadData("grantflow:reports"));
       if (r) setReports(r);
     } catch (e) { /* no data yet */ }
     try {
-      const s = await loadData("grantflow:staff");
+      const s = await withTimeout(loadData("grantflow:staff"));
       if (s) setStaff(s);
     } catch (e) { /* no data yet */ }
     try {
-      const act = await loadData("grantflow:activity");
+      const act = await withTimeout(loadData("grantflow:activity"));
       if (act) setActivity(act.slice(0, 150));
     } catch (e) { /* no data yet */ }
     try {
-      const tk = await loadData("grantflow:tasks");
+      const tk = await withTimeout(loadData("grantflow:tasks"));
       if (tk) setTasks(tk);
     } catch (e) { /* no data yet */ }
     try {
-      const iv = await loadData("grantflow:invoices");
+      const iv = await withTimeout(loadData("grantflow:invoices"));
       if (iv) setInvoices(iv);
     } catch (e) { /* no data yet */ }
     setLastSyncedAt(Date.now());
@@ -3711,6 +3715,11 @@ export default function GrantFlow() {
       setLoaded(true);
     })();
     (async () => {
+      if (currentUserEmail) {
+        setWhoami(currentUserEmail);
+        setWhoamiLoaded(true);
+        return;
+      }
       try {
         const w = await window.storage.get("grantflow:whoami", false);
         if (w?.value) setWhoami(w.value);
@@ -3720,7 +3729,7 @@ export default function GrantFlow() {
   }, []);
 
   useEffect(() => {
-    if (!whoamiLoaded) return;
+    if (!whoamiLoaded || currentUserEmail) return;
     if (whoami) window.storage.set("grantflow:whoami", whoami, false).catch(() => {});
   }, [whoami, whoamiLoaded]);
 
@@ -3827,7 +3836,7 @@ export default function GrantFlow() {
           </button>
         </div>
         <nav className="px-3 space-y-1 overflow-y-auto">
-          {NAV.map(({ key, label, icon: Icon }) => (
+          {[...NAV, ...(isAdmin ? [{ key: "user-access", label: "User Access", icon: Shield }] : [])].map(({ key, label, icon: Icon }) => (
             <button
               key={key}
               onClick={() => { setTab(key); setMobileNavOpen(false); }}
@@ -3855,9 +3864,16 @@ export default function GrantFlow() {
           <button onClick={refreshAll} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
             <RefreshCw size={11} /> Refresh now{lastSyncedAt ? ` · ${Math.max(0, Math.round((Date.now() - lastSyncedAt) / 1000))}s ago` : ""}
           </button>
-          <button onClick={() => setEditingWhoami(true)} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
-            <Users size={11} /> You: {whoami || "set your name"}
-          </button>
+          {currentUserEmail ? (
+            <div className="flex items-center justify-between gap-1.5 text-xs" style={{ color: "#B9CBCF" }}>
+              <span className="inline-flex items-center gap-1.5 truncate"><Users size={11} className="shrink-0" /> {currentUserEmail}</span>
+              <button onClick={onSignOut} className="shrink-0 hover:underline" style={{ color: "#F0B21E" }}>Sign out</button>
+            </div>
+          ) : (
+            <button onClick={() => setEditingWhoami(true)} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
+              <Users size={11} /> You: {whoami || "set your name"}
+            </button>
+          )}
         </div>
       </aside>
 
@@ -3926,16 +3942,18 @@ export default function GrantFlow() {
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setActivity={setActivity}
             logActivity={logActivity}
           />
+        ) : tab === "user-access" && isAdmin ? (
+          <AdminPanel />
         ) : (
           <ReportingView grants={grants} budgets={budgets} />
         )}
         </main>
       </div>
 
-      {editingWhoami && (
+      {!currentUserEmail && editingWhoami && (
         <WhoamiModal current={whoami} onSave={(n) => { setWhoami(n); setEditingWhoami(false); }} onSkip={() => setEditingWhoami(false)} />
       )}
-      {!editingWhoami && whoamiLoaded && !whoami && !skippedWhoami && (
+      {!currentUserEmail && !editingWhoami && whoamiLoaded && !whoami && !skippedWhoami && (
         <WhoamiModal current={whoami} onSave={(n) => setWhoami(n)} onSkip={() => setSkippedWhoami(true)} />
       )}
     </div>
