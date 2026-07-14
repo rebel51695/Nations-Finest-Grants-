@@ -64,6 +64,7 @@ const DEFAULT_BUCKETS = ["Backlog", "Upcoming", "Up next", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
+const APP_VERSION = "1.1";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => (Number(n) || 0).toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
@@ -419,10 +420,11 @@ function GrantPicker({ grants, value, onChange, placeholder = "Select a grant", 
   );
 }
 
-function Modal({ title, onClose, children, wide }) {
+function Modal({ title, onClose, children, wide, size }) {
+  const widthClass = size === "xl" ? "max-w-[1400px]" : wide ? "max-w-4xl" : "max-w-lg";
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
-      <div className={`bg-white rounded-xl shadow-xl w-full ${wide ? "max-w-4xl" : "max-w-lg"} my-auto`}>
+      <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto`}>
         <div className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "#E1E5DE" }}>
           <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>{title}</h2>
           <button onClick={onClose} className="p-1 rounded hover:bg-stone-100">
@@ -448,6 +450,39 @@ function ConfirmModal({ message, onConfirm, onCancel }) {
 }
 
 // ---------- grant form ----------
+
+function CostCenterModal({ costCenter, onSave, onClose, onDelete }) {
+  const [form, setForm] = useState(costCenter || { id: uid(), name: "", description: "" });
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  return (
+    <Modal title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
+      <div className="space-y-4">
+        <Field label="Name">
+          <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Administration, Fundraising, Facilities" autoFocus />
+        </Field>
+        <Field label="Description (optional)">
+          <textarea className={inputCls} style={inputStyle} rows={2} value={form.description} onChange={set("description")} />
+        </Field>
+      </div>
+      <div className="flex justify-between gap-2 mt-6">
+        {onDelete ? (
+          <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete</button>
+        ) : <span />}
+        <div className="flex gap-2">
+          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button
+            onClick={() => { if (!form.name.trim()) return; onSave(form); }}
+            className="px-4 py-2 rounded-md text-sm text-white"
+            style={{ background: "#1F5C6B" }}
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
 
 function GrantModal({ grant, onSave, onClose }) {
   const [form, setForm] = useState(grant || {
@@ -600,9 +635,9 @@ function GrantModal({ grant, onSave, onClose }) {
 
 // ---------- budget form ----------
 
-function BudgetModal({ budget, grantId, onSave, onClose }) {
+function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
   const [form, setForm] = useState(budget || {
-    id: uid(), grantId, title: "", fy: "", periodStart: "", periodEnd: "",
+    id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
     status: "Draft", notes: "", lines: [newLine()],
     approvedBy: "", approvedAt: "", rejectionReason: "",
   });
@@ -661,7 +696,7 @@ function BudgetModal({ budget, grantId, onSave, onClose }) {
   });
 
   return (
-    <Modal title={budget ? "Edit budget" : "New budget"} onClose={onClose} wide>
+    <Modal title={budget ? "Edit budget" : "New budget"} onClose={onClose} size="xl">
       {budget?.status === "Closed" && (
         <div className="rounded-md px-3 py-2 mb-4 flex items-start gap-2" style={{ background: "#FBEAE8", border: "1px solid #B5443A" }}>
           <AlertCircle size={15} style={{ color: "#B5443A", marginTop: 1 }} className="shrink-0" />
@@ -1555,17 +1590,41 @@ function GrantsView({ grants, budgets, staff, setGrants, setBudgets, setReports,
   );
 }
 
-function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, initialOpenBudgetId, logActivity }) {
+function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, initialOpenBudgetId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenBudgetId ? budgets.find((b) => b.id === stripNonce(initialOpenBudgetId)) || null : null));
   const [confirm, setConfirm] = useState(null);
+  const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
+  const [budgetMode, setBudgetMode] = useState("grant"); // grant | costCenter
 
   const grant = grants.find((g) => g.id === selectedGrantId);
-  const myBudgets = budgets.filter((b) => b.grantId === selectedGrantId);
+  const costCenter = costCenters.find((c) => c.id === selectedCostCenterId);
+  const activeSelection = budgetMode === "grant" ? grant : costCenter;
+  const myBudgets = budgets.filter((b) =>
+    budgetMode === "grant" ? b.grantId === selectedGrantId && !b.costCenterId : b.costCenterId === selectedCostCenterId && !b.grantId
+  );
+
+  const saveCostCenter = (cc) => {
+    setCostCenters((prev) => {
+      const exists = prev.some((x) => x.id === cc.id);
+      logActivity?.("Cost Center", exists ? "Updated" : "Created", cc.name || "Untitled cost center");
+      return exists ? prev.map((x) => (x.id === cc.id ? cc : x)) : [...prev, cc];
+    });
+    setSelectedCostCenterId(cc.id);
+    setCcModal(null);
+  };
+  const deleteCostCenter = (id) => {
+    const cc = costCenters.find((x) => x.id === id);
+    setCostCenters((prev) => prev.filter((x) => x.id !== id));
+    setBudgets((prev) => prev.filter((b) => b.costCenterId !== id));
+    logActivity?.("Cost Center", "Deleted", cc?.name || "Untitled cost center");
+    if (selectedCostCenterId === id) setSelectedCostCenterId("");
+    setCcModal(null);
+  };
 
   const saveBudget = (b) => {
     setBudgets((prev) => {
       const exists = prev.some((x) => x.id === b.id);
-      logActivity?.("Budget", exists ? "Updated" : "Created", `${b.title || "Untitled budget"}${grant ? ` (${grant.title})` : ""}`);
+      logActivity?.("Budget", exists ? "Updated" : "Created", `${b.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""}`);
       return exists ? prev.map((x) => (x.id === b.id ? b : x)) : [...prev, b];
     });
     setModal(null);
@@ -1573,7 +1632,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const deleteBudget = (id) => {
     const b = budgets.find((x) => x.id === id);
     setBudgets((prev) => prev.filter((b) => b.id !== id));
-    logActivity?.("Budget", "Deleted", `${b?.title || "Untitled budget"}${grant ? ` (${grant.title})` : ""}`);
+    logActivity?.("Budget", "Deleted", `${b?.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""}`);
     setConfirm(null);
   };
   const nextFyLabel = (fy) => {
@@ -1602,7 +1661,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       })),
     };
     setBudgets((prev) => [...prev, newBudget]);
-    logActivity?.("Budget", "Created", `${newBudget.title || "Untitled budget"}${grant ? ` (${grant.title})` : ""} — rolled over from ${budget.fy || "prior year"}`);
+    logActivity?.("Budget", "Created", `${newBudget.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""} — rolled over from ${budget.fy || "prior year"}`);
     setModal(newBudget);
   };
   const exportCsv = (budget) => {
@@ -1615,9 +1674,11 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   };
   const exportXlsx = (budget) => {
     const g = grants.find((x) => x.id === budget.grantId);
+    const cc = costCenters.find((x) => x.id === budget.costCenterId);
+    const label = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Budget";
     const t = budgetTotals(budget);
     const rows = [
-      [g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "Grant"],
+      [label],
       [`${budget.title}${budget.fy ? ` (${budget.fy})` : ""}`],
       [`Period: ${fmtDate(budget.periodStart)} – ${fmtDate(budget.periodEnd)}`, `Status: ${budget.status}`],
       [],
@@ -1634,31 +1695,72 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     XLSX.utils.book_append_sheet(wb, ws, "Budget");
     const safe = (s) => (s || "budget").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
     const arrayBuffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-    downloadFile(`${safe(g?.title)}-${safe(budget.title)}.xlsx`, arrayBuffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    downloadFile(`${safe(g?.title || cc?.name)}-${safe(budget.title)}.xlsx`, arrayBuffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   };
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Budgets</h1>
-        {grant && (
+        {activeSelection && (
           <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
             <Plus size={16} /> New budget
           </button>
         )}
       </div>
 
-      <Field label="Select a grant to manage budgets">
-        <GrantPicker grants={grants} value={selectedGrantId} onChange={setSelectedGrantId} noneLabel="Select a grant" wrapStyle={{ maxWidth: 400 }} />
-      </Field>
+      <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+        <button
+          onClick={() => setBudgetMode("grant")}
+          className="px-3 py-2 text-sm font-medium"
+          style={{ background: budgetMode === "grant" ? "#1F5C6B" : "#FFFFFF", color: budgetMode === "grant" ? "#FFFFFF" : "#5B6B66" }}
+        >
+          Grants
+        </button>
+        <button
+          onClick={() => setBudgetMode("costCenter")}
+          className="px-3 py-2 text-sm font-medium"
+          style={{ background: budgetMode === "costCenter" ? "#1F5C6B" : "#FFFFFF", color: budgetMode === "costCenter" ? "#FFFFFF" : "#5B6B66" }}
+        >
+          Cost Centers
+        </button>
+      </div>
 
-      {!grant ? (
+      {budgetMode === "grant" ? (
+        <Field label="Select a grant to manage budgets">
+          <GrantPicker grants={grants} value={selectedGrantId} onChange={setSelectedGrantId} noneLabel="Select a grant" wrapStyle={{ maxWidth: 400 }} />
+        </Field>
+      ) : (
+        <Field label="Select a cost center to manage budgets">
+          <div className="flex items-center gap-2" style={{ maxWidth: 500 }}>
+            <select
+              value={selectedCostCenterId}
+              onChange={(e) => setSelectedCostCenterId(e.target.value)}
+              className={inputCls}
+              style={{ ...inputStyle, maxWidth: 320 }}
+            >
+              <option value="">Select a cost center</option>
+              {costCenters.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <button onClick={() => setCcModal("new")} className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+              <Plus size={13} /> New
+            </button>
+            {costCenter && (
+              <button onClick={() => setCcModal(costCenter)} className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+                <Pencil size={13} /> Edit
+              </button>
+            )}
+          </div>
+        </Field>
+      )}
+
+      {!activeSelection ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          Select a grant to view its details.
+          {budgetMode === "grant" ? "Select a grant to view its details." : "Select or create a cost center to view its budgets."}
         </div>
       ) : myBudgets.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center space-y-3" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          <p>No budgets for this grant yet.</p>
+          <p>No budgets for this {budgetMode === "grant" ? "grant" : "cost center"} yet.</p>
           <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
             <Plus size={16} /> Create the first budget
           </button>
@@ -1704,9 +1806,25 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
         </div>
       )}
 
-      {modal && <BudgetModal budget={modal === "new" ? null : modal} grantId={selectedGrantId} onSave={saveBudget} onClose={() => setModal(null)} />}
+      {modal && (
+        <BudgetModal
+          budget={modal === "new" ? null : modal}
+          grantId={budgetMode === "grant" ? selectedGrantId : ""}
+          costCenterId={budgetMode === "costCenter" ? selectedCostCenterId : ""}
+          onSave={saveBudget}
+          onClose={() => setModal(null)}
+        />
+      )}
       {confirm && (
         <ConfirmModal message="This will permanently delete this budget." onConfirm={() => deleteBudget(confirm)} onCancel={() => setConfirm(null)} />
+      )}
+      {ccModal && (
+        <CostCenterModal
+          costCenter={ccModal === "new" ? null : ccModal}
+          onSave={saveCostCenter}
+          onClose={() => setCcModal(null)}
+          onDelete={ccModal === "new" ? undefined : () => deleteCostCenter(ccModal.id)}
+        />
       )}
     </div>
   );
@@ -3031,7 +3149,7 @@ function WhoamiModal({ current, onSave, onSkip }) {
 function ActivityLogView({ activity }) {
   const [entityFilter, setEntityFilter] = useState("All");
   const [personFilter, setPersonFilter] = useState("All");
-  const entities = ["All", "Grant", "Budget", "Report", "Staff", "Task", "Invoice", "Data"];
+  const entities = ["All", "Grant", "Budget", "Cost Center", "Report", "Staff", "Task", "Invoice", "Data"];
   const people = ["All", ...new Set(activity.map((a) => a.by).filter(Boolean))];
   const visible = activity
     .filter((a) => entityFilter === "All" || a.entity === entityFilter)
@@ -3086,7 +3204,7 @@ function ActivityLogView({ activity }) {
 
 // ---------- global search ----------
 
-function GlobalSearch({ grants, budgets, reports, staff, tasks, invoices, goTo }) {
+function GlobalSearch({ grants, budgets, reports, staff, tasks, invoices, costCenters, goTo }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(0);
@@ -3099,7 +3217,8 @@ function GlobalSearch({ grants, budgets, reports, staff, tasks, invoices, goTo }
     ...budgets.filter((b) => matches(b.title) || matches(b.notes))
       .slice(0, 5).map((b) => {
         const g = grants.find((x) => x.id === b.grantId);
-        return { type: "Budget", label: b.title, sub: g?.title || "", action: () => goTo("budgets", null, b.grantId, b.id) };
+        const cc = costCenters?.find((x) => x.id === b.costCenterId);
+        return { type: "Budget", label: b.title, sub: g?.title || cc?.name || "", action: () => goTo("budgets", null, b.grantId, b.id) };
       }),
     ...reports.filter((r) => matches(r.title) || matches(r.notes))
       .slice(0, 5).map((r) => {
@@ -3237,7 +3356,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, logActivity }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, logActivity }) {
   const [restoreError, setRestoreError] = useState("");
   const [restoreSummary, setRestoreSummary] = useState("");
   const [importError, setImportError] = useState("");
@@ -3248,16 +3367,16 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, activity };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
   const [showBackupText, setShowBackupText] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, activity };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, activity]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, activity]);
 
   const copyBackupText = async () => {
     try {
@@ -3283,9 +3402,10 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.staff)) setStaff(data.staff);
         if (Array.isArray(data.tasks)) setTasks(data.tasks);
         if (Array.isArray(data.invoices)) setInvoices(data.invoices);
+        if (Array.isArray(data.costCenters)) setCostCenters(data.costCenters);
         if (Array.isArray(data.activity)) setActivity(data.activity);
         logActivity?.("Data", "Restored", `Restored from backup file "${file.name}"`);
-        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices.`);
+        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers.`);
       } catch (err) {
         setRestoreError("Couldn't read that file — make sure it's a GrantFlow backup JSON exported from this app.");
       }
@@ -3628,6 +3748,8 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
   const [tasks, setTasks] = useState([]);
   const [invoices, setInvoices] = useState([]);
   const [selectedGrantId, setSelectedGrantId] = useState("");
+  const [costCenters, setCostCenters] = useState([]);
+  const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
   const [reportsGrantFilter, setReportsGrantFilter] = useState("All");
   const [loaded, setLoaded] = useState(false);
   const [pendingNewGrant, setPendingNewGrant] = useState(false);
@@ -3705,6 +3827,10 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
       const iv = await withTimeout(loadData("grantflow:invoices"));
       if (iv) setInvoices(iv);
     } catch (e) { /* no data yet */ }
+    try {
+      const cc = await withTimeout(loadData("grantflow:costcenters"));
+      if (cc) setCostCenters(cc);
+    } catch (e) { /* no data yet */ }
     setLastSyncedAt(Date.now());
     setTimeout(() => { isSyncingRef.current = false; }, 500);
   };
@@ -3773,6 +3899,11 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:invoices", invoices, "Invoices");
   }, [invoices, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:costcenters", costCenters, "Cost Centers");
+  }, [costCenters, loaded]);
 
   const logActivity = (entity, action, label) => {
     setActivity((prev) => [{ id: uid(), timestamp: new Date().toISOString(), entity, action, label, by: whoami || "Unknown" }, ...prev].slice(0, 150));
@@ -3883,7 +4014,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             <Menu size={18} />
           </button>
           <div className="flex-1 flex justify-end">
-            <GlobalSearch grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} goTo={goTo} />
+            <GlobalSearch grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} goTo={goTo} />
           </div>
         </div>
         <main className="flex-1 px-4 md:px-8 py-4 md:py-8" style={{ maxWidth: (tab === "grant-reports" || tab === "org-budget" || tab === "burn-rate") ? "100%" : "72rem" }}>
@@ -3903,6 +4034,8 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             key={pendingOpenBudgetId ? `budgets-open-${pendingOpenBudgetId}` : "budgets"}
             grants={grants} budgets={budgets} setBudgets={setBudgets}
             selectedGrantId={selectedGrantId} setSelectedGrantId={setSelectedGrantId}
+            costCenters={costCenters} setCostCenters={setCostCenters}
+            selectedCostCenterId={selectedCostCenterId} setSelectedCostCenterId={setSelectedCostCenterId}
             initialOpenBudgetId={pendingOpenBudgetId} logActivity={logActivity}
           />
         ) : tab === "invoicing" ? (
@@ -3938,8 +4071,8 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <ActivityLogView activity={activity} />
         ) : tab === "data" ? (
           <DataView
-            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} activity={activity}
-            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setActivity={setActivity}
+            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} activity={activity}
+            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setActivity={setActivity}
             logActivity={logActivity}
           />
         ) : tab === "user-access" && isAdmin ? (
@@ -3956,6 +4089,9 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
       {!currentUserEmail && !editingWhoami && whoamiLoaded && !whoami && !skippedWhoami && (
         <WhoamiModal current={whoami} onSave={(n) => setWhoami(n)} onSkip={() => setSkippedWhoami(true)} />
       )}
+      <div className="no-print fixed bottom-2 right-3 text-xs z-40 pointer-events-none" style={{ color: "#8A8F87" }}>
+        v{APP_VERSION}
+      </div>
     </div>
   );
 }
