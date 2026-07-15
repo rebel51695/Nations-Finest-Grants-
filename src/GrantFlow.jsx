@@ -15,6 +15,25 @@ import {
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
+// Given a budget's Period Start date, returns 12 entries describing which real
+// calendar month/year each of the budget's 12 monthly slots actually falls on.
+// This lets a budget's columns be labeled correctly (e.g. "Oct 2025" instead of
+// always assuming "Jan") for grants that don't run on the calendar year.
+function monthColumnsForBudget(periodStart) {
+  let startYear, startMonth; // startMonth is 0-indexed
+  if (periodStart) {
+    const d = new Date(periodStart + "T00:00:00");
+    if (!isNaN(d)) { startYear = d.getFullYear(); startMonth = d.getMonth(); }
+  }
+  if (startYear === undefined) { startYear = new Date().getFullYear(); startMonth = 0; }
+  return Array.from({ length: 12 }, (_, i) => {
+    const totalMonth = startMonth + i;
+    const year = startYear + Math.floor(totalMonth / 12);
+    const monthIndex = ((totalMonth % 12) + 12) % 12;
+    return { year, monthIndex, label: `${MONTHS[monthIndex]} ${String(year).slice(2)}` };
+  });
+}
+
 const CATEGORIES = [
   { name: "Grants and Contracts", type: "revenue", subs: ["4100 - Grants and Contracts"] },
   { name: "Grants and Contracts Indirect Billing", type: "revenue", subs: ["4101 - Grants and Contracts Indirect Billing"] },
@@ -911,7 +930,7 @@ function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
               <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
               <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
-              {MONTHS.map((m) => <th key={m} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{m}</th>)}
+              {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{col.label}</th>)}
               <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
               <th className="px-2 py-2"></th>
             </tr>
@@ -1751,7 +1770,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     setModal(newBudget);
   };
   const exportCsv = (budget) => {
-    const rows = [["Category", "Subcategory", "Type", ...MONTHS, "Total"]];
+    const labels = monthColumnsForBudget(budget.periodStart).map((c) => c.label);
+    const rows = [["Category", "Subcategory", "Type", ...labels, "Total"]];
     budget.lines.forEach((l) => {
       rows.push([l.category, l.subcategory, l.type, ...l.amounts, lineTotal(l)]);
     });
@@ -1763,12 +1783,13 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     const cc = costCenters.find((x) => x.id === budget.costCenterId);
     const label = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Budget";
     const t = budgetTotals(budget);
+    const labels = monthColumnsForBudget(budget.periodStart).map((c) => c.label);
     const rows = [
       [label],
       [`${budget.title}${budget.fy ? ` (${budget.fy})` : ""}`],
       [`Period: ${fmtDate(budget.periodStart)} – ${fmtDate(budget.periodEnd)}`, `Status: ${budget.status}`],
       [],
-      ["Category", "Subcategory", "Type", ...MONTHS, "Total"],
+      ["Category", "Subcategory", "Type", ...labels, "Total"],
       ...budget.lines.map((l) => [l.category, l.subcategory || "", l.type, ...l.amounts, lineTotal(l)]),
       [],
       ["Total Revenue", "", "", ...Array(12).fill(""), t.revenue],
@@ -2307,10 +2328,11 @@ function ReportingView({ grants, budgets }) {
   }, { revenue: 0, expense: 0 });
 
   const exportAllCsv = () => {
-    const rows = [["Grant", "Budget", "Category", "Subcategory", "Type", ...MONTHS, "Total"]];
+    const monthCols = MONTHS.map((_, i) => `Month ${i + 1}`);
+    const rows = [["Grant", "Budget", "Period Start", "Category", "Subcategory", "Type", ...monthCols, "Total"]];
     budgets.forEach((b) => {
       const g = grants.find((x) => x.id === b.grantId);
-      b.lines.forEach((l) => rows.push([g?.title || "", b.title, l.category, l.subcategory, l.type, ...l.amounts, lineTotal(l)]));
+      b.lines.forEach((l) => rows.push([g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.type, ...l.amounts, lineTotal(l)]));
     });
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     downloadFile("nations-finest-budget-lines.csv", csv, "text/csv");
@@ -2424,11 +2446,10 @@ function OrgBudgetRow({ label, values, bold, indent, color, isHeader }) {
 }
 
 function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
-  const [fyFilter, setFyFilter] = useState("All");
+  const [calYear, setCalYear] = useState("All");
   const [scope, setScope] = useState("all"); // all | a budget group id
   const [viewMode, setViewMode] = useState("monthly");
   const [dataMode, setDataMode] = useState("plan");
-  const fys = [...new Set(budgets.map((b) => b.fy).filter(Boolean))];
 
   const scopedGrantIds = useMemo(() => {
     if (scope === "all") return null;
@@ -2439,10 +2460,18 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
     return new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
   }, [scope, costCenters]);
 
-  const fyScoped = fyFilter === "All" ? budgets : budgets.filter((b) => b.fy === fyFilter);
-  const relevant = scope === "all"
-    ? fyScoped
-    : fyScoped.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)));
+  const scopedBudgets = scope === "all"
+    ? budgets
+    : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)));
+
+  // Real calendar years actually touched by any in-scope budget's period, so the
+  // year picker reflects reality even when grants run off the calendar year.
+  const calendarYears = useMemo(() => {
+    const years = new Set();
+    scopedBudgets.forEach((b) => monthColumnsForBudget(b.periodStart).forEach((col) => years.add(col.year)));
+    return [...years].sort();
+  }, [scopedBudgets]);
+
   const amountsField = dataMode === "plan" ? "amounts" : "actuals";
   const lineValue = (l) => (dataMode === "plan" ? lineTotal(l) : lineActualTotal(l));
 
@@ -2452,22 +2481,26 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const grouped = useMemo(() => {
     const map = {};
     CATEGORIES.forEach((c) => { map[c.name] = { type: c.type, monthly: Array(12).fill(0), subs: {} }; });
-    relevant.forEach((b) => b.lines.forEach((l) => {
-      if (!map[l.category]) map[l.category] = { type: l.type, monthly: Array(12).fill(0), subs: {} };
-      const bucket = map[l.category];
-      const vals = l[amountsField] || Array(12).fill(0);
-      vals.forEach((a, i) => { bucket.monthly[i] += Number(a) || 0; });
-      if (l.subcategory) {
-        if (!bucket.subs[l.subcategory]) bucket.subs[l.subcategory] = Array(12).fill(0);
-        vals.forEach((a, i) => { bucket.subs[l.subcategory][i] += Number(a) || 0; });
-      }
-    }));
+    scopedBudgets.forEach((b) => {
+      const cols = monthColumnsForBudget(b.periodStart);
+      b.lines.forEach((l) => {
+        if (!map[l.category]) map[l.category] = { type: l.type, monthly: Array(12).fill(0), subs: {} };
+        const bucket = map[l.category];
+        const vals = l[amountsField] || Array(12).fill(0);
+        vals.forEach((a, i) => {
+          const col = cols[i];
+          if (calYear !== "All" && col.year !== calYear) return;
+          const slot = calYear === "All" ? col.monthIndex : col.monthIndex;
+          bucket.monthly[slot] += Number(a) || 0;
+          if (l.subcategory) {
+            if (!bucket.subs[l.subcategory]) bucket.subs[l.subcategory] = Array(12).fill(0);
+            bucket.subs[l.subcategory][slot] += Number(a) || 0;
+          }
+        });
+      });
+    });
     return map;
-  }, [relevant, amountsField]);
-
-  const scopedBudgets = scope === "all"
-    ? budgets
-    : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)));
+  }, [scopedBudgets, amountsField, calYear]);
 
   const yearCompare = useMemo(() => {
     const years = [...new Set(scopedBudgets.map((b) => b.fy || "Unspecified"))].sort();
@@ -2493,7 +2526,8 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const net = totalRevenue.map((v, i) => v - totalExpense[i]);
 
   const exportCsv = () => {
-    const rows = [["Category", "Subcategory", ...MONTHS, "Total"]];
+    const monthLabels = MONTHS.map((m) => (calYear === "All" ? m : `${m} ${calYear}`));
+    const rows = [["Category", "Subcategory", ...monthLabels, "Total"]];
     const pushSection = (cats) => cats.forEach((c) => {
       const bucket = grouped[c.name];
       rows.push([c.name, "", ...bucket.monthly, bucket.monthly.reduce((a, b) => a + b, 0)]);
@@ -2567,10 +2601,10 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
           </select>
         </Field>
         {viewMode === "monthly" && (
-          <Field label="Fiscal year">
-            <select value={fyFilter} onChange={(e) => setFyFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 240 }}>
-              <option value="All">All fiscal years</option>
-              {fys.map((fy) => <option key={fy} value={fy}>{fy}</option>)}
+          <Field label="Calendar year">
+            <select value={calYear} onChange={(e) => setCalYear(e.target.value === "All" ? "All" : Number(e.target.value))} className={inputCls} style={{ ...inputStyle, maxWidth: 240 }}>
+              <option value="All">All years combined</option>
+              {calendarYears.map((y) => <option key={y} value={y}>{y}</option>)}
             </select>
           </Field>
         )}
@@ -2645,7 +2679,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
             </table>
           </div>
         )
-      ) : relevant.length === 0 ? (
+      ) : scopedBudgets.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
           No budget data yet — add grant budgets to see the organizational rollup.
         </div>
@@ -2655,7 +2689,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
             <thead>
               <tr style={{ background: "#F6F7F3" }}>
                 <th className="text-left px-3 py-2 text-xs sticky left-0" style={{ background: "#F6F7F3", minWidth: 220 }}>Account</th>
-                {MONTHS.map((m) => <th key={m} className="text-right px-2 py-2 text-xs" style={{ minWidth: 90 }}>{m}</th>)}
+                {MONTHS.map((m) => <th key={m} className="text-right px-2 py-2 text-xs" style={{ minWidth: 90 }}>{calYear === "All" ? m : `${m} ${String(calYear).slice(2)}`}</th>)}
                 <th className="text-right px-3 py-2 text-xs" style={{ minWidth: 100 }}>Total</th>
               </tr>
             </thead>
