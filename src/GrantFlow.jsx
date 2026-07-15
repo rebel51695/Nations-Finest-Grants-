@@ -3,7 +3,7 @@ import * as XLSX from "xlsx";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
   ExternalLink, Download, Search, ArrowRight, AlertCircle, CheckCircle2,
-  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield,
+  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
 import {
@@ -254,6 +254,53 @@ function personnelCostByCostCenter(staffList) {
     });
   });
   return map;
+}
+
+function newScenario(basedOn) {
+  return {
+    id: uid(), title: "", notes: "", createdBy: "", createdAt: new Date().toISOString(),
+    basedOn: basedOn || { type: "blank" },
+    fy: "", periodStart: "", periodEnd: "",
+    lines: [newLine()],
+  };
+}
+
+// Computes the CURRENT real numbers a scenario should be compared against,
+// based on what it was snapshotted from. Always re-derived live — never a
+// frozen copy — so the comparison reflects reality as of right now.
+function liveComparisonForScenario(scenario, grants, budgets, costCenters) {
+  const basedOn = scenario.basedOn || { type: "blank" };
+  if (basedOn.type === "grant" || basedOn.type === "costCenter") {
+    const b = budgets.find((x) => x.id === basedOn.budgetId);
+    if (!b) return { available: false, reason: "The original budget this was based on no longer exists." };
+    const map = {};
+    b.lines.forEach((l) => {
+      if (!map[l.category]) map[l.category] = Array(12).fill(0);
+      (l.amounts || Array(12).fill(0)).forEach((a, i) => { map[l.category][i] += Number(a) || 0; });
+    });
+    return { available: true, byCategory: map, periodStart: b.periodStart };
+  }
+  if (basedOn.type === "org") {
+    const scope = basedOn.scope || "all";
+    const calYear = basedOn.calYear ?? "All";
+    const scopedGrantIds = scope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
+    const scopedCcIds = scope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
+    const scopedBudgets = scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)));
+    const map = {};
+    scopedBudgets.forEach((b) => {
+      const cols = monthColumnsForBudget(b.periodStart);
+      b.lines.forEach((l) => {
+        if (!map[l.category]) map[l.category] = Array(12).fill(0);
+        (l.amounts || Array(12).fill(0)).forEach((a, i) => {
+          const col = cols[i];
+          if (calYear !== "All" && col.year !== calYear) return;
+          map[l.category][col.monthIndex] += Number(a) || 0;
+        });
+      });
+    });
+    return { available: true, byCategory: map, periodStart: "" };
+  }
+  return { available: false, reason: "This scenario started blank, with nothing to compare against." };
 }
 
 function daysOutstanding(inv) {
@@ -2445,6 +2492,509 @@ function OrgBudgetRow({ label, values, bold, indent, color, isHeader }) {
   );
 }
 
+function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate, onClose }) {
+  const [title, setTitle] = useState("");
+  const [startMode, setStartMode] = useState("blank"); // blank | existing | org
+  const [pickMode, setPickMode] = useState("grant"); // grant | costCenter (for "existing")
+  const [pickedGrantId, setPickedGrantId] = useState("");
+  const [pickedCcId, setPickedCcId] = useState("");
+  const [pickedBudgetId, setPickedBudgetId] = useState("");
+  const [orgScope, setOrgScope] = useState("all");
+  const [orgYear, setOrgYear] = useState("All");
+
+  const candidateBudgets = pickMode === "grant"
+    ? budgets.filter((b) => b.grantId === pickedGrantId)
+    : budgets.filter((b) => b.costCenterId === pickedCcId);
+
+  const orgCalendarYears = useMemo(() => {
+    const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
+    const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
+    const scoped = orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)));
+    const years = new Set();
+    scoped.forEach((b) => monthColumnsForBudget(b.periodStart).forEach((col) => years.add(col.year)));
+    return [...years].sort();
+  }, [orgScope, grants, costCenters, budgets]);
+
+  const canCreate = title.trim() && (
+    startMode === "blank" ||
+    (startMode === "existing" && pickedBudgetId) ||
+    startMode === "org"
+  );
+
+  const handleCreate = () => {
+    let scen;
+    if (startMode === "blank") {
+      scen = newScenario({ type: "blank" });
+    } else if (startMode === "existing") {
+      const b = budgets.find((x) => x.id === pickedBudgetId);
+      const g = pickMode === "grant" ? grants.find((x) => x.id === pickedGrantId) : null;
+      const cc = pickMode === "costCenter" ? costCenters.find((x) => x.id === pickedCcId) : null;
+      scen = newScenario({
+        type: pickMode, grantId: pickedGrantId || "", costCenterId: pickedCcId || "", budgetId: pickedBudgetId,
+        label: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "",
+      });
+      scen.fy = b.fy;
+      scen.periodStart = b.periodStart;
+      scen.periodEnd = b.periodEnd;
+      scen.lines = b.lines.map((l) => ({ ...l, id: uid(), amounts: [...l.amounts] }));
+    } else {
+      const bg = budgetGroups.find((x) => x.id === orgScope);
+      scen = newScenario({ type: "org", scope: orgScope, calYear: orgYear, label: orgScope === "all" ? "Whole Organization" : (bg?.name || "Budget Group") });
+      scen.periodStart = orgYear !== "All" ? `${orgYear}-01-01` : "";
+      const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
+      const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
+      const scoped = orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)));
+      const map = {};
+      scoped.forEach((b) => {
+        const cols = monthColumnsForBudget(b.periodStart);
+        b.lines.forEach((l) => {
+          const key = l.category;
+          if (!map[key]) {
+            const catDef = CATEGORIES.find((c) => c.name === l.category);
+            map[key] = { category: l.category, type: catDef ? catDef.type : l.type, subcategory: "", amounts: Array(12).fill(0) };
+          }
+          (l.amounts || Array(12).fill(0)).forEach((a, i) => {
+            const col = cols[i];
+            if (orgYear !== "All" && col.year !== orgYear) return;
+            map[key].amounts[col.monthIndex] += Number(a) || 0;
+          });
+        });
+      });
+      scen.lines = Object.values(map).map((l) => ({ id: uid(), category: l.category, type: l.type, categoryCustom: false, subcategory: "", subcategoryCustom: false, amounts: l.amounts }));
+      if (scen.lines.length === 0) scen.lines = [newLine()];
+    }
+    scen.title = title.trim();
+    onCreate(scen);
+  };
+
+  return (
+    <Modal title="New scenario" onClose={onClose} wide>
+      <div className="space-y-4">
+        <Field label="Scenario name">
+          <input className={inputCls} style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. FY27 Conservative Case" autoFocus />
+        </Field>
+
+        <Field label="Starting point">
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { key: "blank", label: "Start blank" },
+              { key: "existing", label: "Snapshot a grant/cost center budget" },
+              { key: "org", label: "Snapshot the Org Budget rollup" },
+            ].map((opt) => (
+              <button
+                key={opt.key}
+                onClick={() => setStartMode(opt.key)}
+                className="text-sm px-3 py-2.5 rounded-md border text-left"
+                style={{
+                  borderColor: startMode === opt.key ? "#1F5C6B" : "#E1E5DE",
+                  background: startMode === opt.key ? "rgba(31,92,107,0.06)" : "#FFFFFF",
+                  color: "#1C2624",
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        {startMode === "existing" && (
+          <div className="space-y-3 rounded-md border p-4" style={{ borderColor: "#E1E5DE" }}>
+            <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+              <button onClick={() => { setPickMode("grant"); setPickedBudgetId(""); }} className="px-3 py-1.5 text-sm font-medium" style={{ background: pickMode === "grant" ? "#1F5C6B" : "#FFFFFF", color: pickMode === "grant" ? "#FFFFFF" : "#5B6B66" }}>Grant</button>
+              <button onClick={() => { setPickMode("costCenter"); setPickedBudgetId(""); }} className="px-3 py-1.5 text-sm font-medium" style={{ background: pickMode === "costCenter" ? "#1F5C6B" : "#FFFFFF", color: pickMode === "costCenter" ? "#FFFFFF" : "#5B6B66" }}>Cost Center</button>
+            </div>
+            {pickMode === "grant" ? (
+              <GrantPicker grants={grants} value={pickedGrantId} onChange={(v) => { setPickedGrantId(v); setPickedBudgetId(""); }} noneLabel="Select a grant" />
+            ) : (
+              <select value={pickedCcId} onChange={(e) => { setPickedCcId(e.target.value); setPickedBudgetId(""); }} className={inputCls} style={inputStyle}>
+                <option value="">Select a cost center</option>
+                {(costCenters || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            )}
+            {(pickedGrantId || pickedCcId) && (
+              <select value={pickedBudgetId} onChange={(e) => setPickedBudgetId(e.target.value)} className={inputCls} style={inputStyle}>
+                <option value="">Select a budget to snapshot</option>
+                {candidateBudgets.map((b) => <option key={b.id} value={b.id}>{b.title}{b.fy ? ` (${b.fy})` : ""}</option>)}
+              </select>
+            )}
+          </div>
+        )}
+
+        {startMode === "org" && (
+          <div className="grid grid-cols-2 gap-3 rounded-md border p-4" style={{ borderColor: "#E1E5DE" }}>
+            <Field label="Scope">
+              <select value={orgScope} onChange={(e) => { setOrgScope(e.target.value); setOrgYear("All"); }} className={inputCls} style={inputStyle}>
+                <option value="all">Whole Organization</option>
+                {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
+              </select>
+            </Field>
+            <Field label="Calendar year">
+              <select value={orgYear} onChange={(e) => setOrgYear(e.target.value === "All" ? "All" : Number(e.target.value))} className={inputCls} style={inputStyle}>
+                <option value="All">All years combined</option>
+                {orgCalendarYears.map((y) => <option key={y} value={y}>{y}</option>)}
+              </select>
+            </Field>
+          </div>
+        )}
+      </div>
+      <div className="flex justify-end gap-2 mt-6">
+        <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+        <button
+          disabled={!canCreate}
+          onClick={handleCreate}
+          className="px-4 py-2 rounded-md text-sm text-white"
+          style={{ background: canCreate ? "#1F5C6B" : "#8A8F87" }}
+        >
+          Create scenario
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function ScenarioEditor({ scenario, grants, costCenters, budgets, onSave, onDelete, onBack }) {
+  const [form, setForm] = useState(scenario);
+  const [showCompare, setShowCompare] = useState(true);
+  const cols = monthColumnsForBudget(form.periodStart);
+
+  const updateLine = (id, patch) => setForm((f) => ({ ...f, lines: f.lines.map((l) => (l.id === id ? { ...l, ...patch } : l)) }));
+  const addLine = () => setForm((f) => ({ ...f, lines: [...f.lines, newLine()] }));
+  const removeLine = (id) => setForm((f) => ({ ...f, lines: f.lines.filter((l) => l.id !== id) }));
+  const setAnnual = (id, val) => {
+    const per = Math.round((Number(val) || 0) / 12 * 100) / 100;
+    updateLine(id, { amounts: Array(12).fill(per) });
+  };
+
+  const totals = useMemo(() => {
+    const revenue = form.lines.filter((l) => l.type === "revenue").reduce((a, l) => a + lineTotal(l), 0);
+    const expense = form.lines.filter((l) => l.type === "expense").reduce((a, l) => a + lineTotal(l), 0);
+    return { revenue, expense, net: revenue - expense };
+  }, [form.lines]);
+
+  const comparison = useMemo(() => liveComparisonForScenario(form, grants, budgets, costCenters), [form, grants, budgets, costCenters]);
+
+  const exportXlsx = () => {
+    const labels = cols.map((c) => c.label);
+    const rows = [
+      [form.title],
+      [`Scenario${form.basedOn?.label ? ` — based on ${form.basedOn.label}` : " — started blank"}`],
+      [],
+      ["Category", "Subcategory", "Type", ...labels, "Total"],
+      ...form.lines.map((l) => [l.category, l.subcategory || "", l.type, ...l.amounts, lineTotal(l)]),
+      [],
+      ["Total Revenue", "", "", ...Array(12).fill(""), totals.revenue],
+      ["Total Expense", "", "", ...Array(12).fill(""), totals.expense],
+      ["Net", "", "", ...Array(12).fill(""), totals.net],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Scenario");
+    const safe = (s) => (s || "scenario").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
+    const arrayBuffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    downloadFile(`${safe(form.title)}.xlsx`, arrayBuffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <button onClick={onBack} className="text-sm inline-flex items-center gap-1" style={{ color: "#1F5C6B" }}>
+          <ArrowRight size={14} style={{ transform: "rotate(180deg)" }} /> Back to scenarios
+        </button>
+        <div className="flex items-center gap-2">
+          <button onClick={exportXlsx} className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Download size={14} /> Export Excel
+          </button>
+          <button onClick={() => onSave(form)} className="px-4 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Save scenario</button>
+          <button onClick={onDelete} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Delete</button>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border p-5 space-y-4" style={{ borderColor: "#E1E5DE" }}>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <Field label="Scenario name">
+            <input className={inputCls} style={inputStyle} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+          </Field>
+          <Field label="Fiscal year label (optional)">
+            <input className={inputCls} style={inputStyle} value={form.fy} onChange={(e) => setForm({ ...form, fy: e.target.value })} placeholder="e.g. FY27" />
+          </Field>
+          <Field label="Period start (for month labels)">
+            <input type="date" className={inputCls} style={inputStyle} value={form.periodStart} onChange={(e) => setForm({ ...form, periodStart: e.target.value })} />
+          </Field>
+          <Field label="Period end">
+            <input type="date" className={inputCls} style={inputStyle} value={form.periodEnd} onChange={(e) => setForm({ ...form, periodEnd: e.target.value })} />
+          </Field>
+        </div>
+        <p className="text-xs" style={{ color: "#8A8F87" }}>
+          {form.basedOn?.type === "blank" ? "Started blank — not tied to any real grant or budget." : `Based on: ${form.basedOn?.label || "unknown"}`}
+        </p>
+
+        <div className="overflow-x-auto border rounded-lg" style={{ borderColor: "#E1E5DE" }}>
+          <table className="text-xs w-full" style={{ fontFamily: "var(--mono-font)" }}>
+            <thead>
+              <tr style={{ background: "#F6F7F3" }}>
+                <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
+                <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
+                <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
+                {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{c.label}</th>)}
+                <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
+                <th className="px-2 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {form.lines.map((line) => {
+                const cat = CATEGORIES.find((c) => c.name === line.category);
+                return (
+                  <tr key={line.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                    <td className="px-2 py-1.5 sticky left-0 bg-white">
+                      {line.categoryCustom ? (
+                        <div className="flex gap-1">
+                          <input value={line.category} onChange={(e) => updateLine(line.id, { category: e.target.value })} placeholder="Custom category" className="w-full rounded border px-1.5 py-1 text-xs" style={inputStyle} />
+                          <select value={line.type} onChange={(e) => updateLine(line.id, { type: e.target.value })} className="shrink-0 rounded border px-1 py-1 text-xs" style={inputStyle}>
+                            <option value="expense">Exp</option>
+                            <option value="revenue">Rev</option>
+                          </select>
+                          <button onClick={() => updateLine(line.id, { categoryCustom: false, category: CATEGORIES[0].name, type: CATEGORIES[0].type, subcategory: "", subcategoryCustom: false })} className="shrink-0 px-1 rounded hover:bg-red-50">
+                            <X size={12} style={{ color: "#B5443A" }} />
+                          </button>
+                        </div>
+                      ) : (
+                        <select
+                          value={line.category}
+                          onChange={(e) => {
+                            if (e.target.value === CUSTOM_CATEGORY) { updateLine(line.id, { categoryCustom: true, category: "", subcategory: "", subcategoryCustom: false }); return; }
+                            const nc = CATEGORIES.find((c) => c.name === e.target.value);
+                            updateLine(line.id, { category: nc.name, type: nc.type, subcategory: "", subcategoryCustom: false });
+                          }}
+                          className="w-full rounded border px-1.5 py-1 text-xs"
+                          style={inputStyle}
+                        >
+                          {CATEGORIES.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
+                          <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
+                        </select>
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {line.categoryCustom || line.subcategoryCustom ? (
+                        <div className="flex gap-1">
+                          <input value={line.subcategory} onChange={(e) => updateLine(line.id, { subcategory: e.target.value })} placeholder="Custom subcategory" className="w-full rounded border px-1.5 py-1 text-xs" style={inputStyle} />
+                          {!line.categoryCustom && (
+                            <button onClick={() => updateLine(line.id, { subcategoryCustom: false, subcategory: "" })} className="shrink-0 px-1 rounded hover:bg-red-50">
+                              <X size={12} style={{ color: "#B5443A" }} />
+                            </button>
+                          )}
+                        </div>
+                      ) : (
+                        <select
+                          value={line.subcategory}
+                          onChange={(e) => {
+                            if (e.target.value === CUSTOM_CATEGORY) { updateLine(line.id, { subcategoryCustom: true, subcategory: "" }); return; }
+                            updateLine(line.id, { subcategory: e.target.value });
+                          }}
+                          className="w-full rounded border px-1.5 py-1 text-xs"
+                          style={inputStyle}
+                        >
+                          <option value="">Select subcategory</option>
+                          {cat?.subs.map((s) => <option key={s} value={s}>{s}</option>)}
+                          <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
+                        </select>
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <input
+                        type="number"
+                        className="w-full rounded border px-1.5 py-1 text-xs text-right"
+                        style={inputStyle}
+                        placeholder="0"
+                        onChange={(e) => setAnnual(line.id, e.target.value)}
+                      />
+                    </td>
+                    {line.amounts.map((a, i) => (
+                      <td key={i} className="px-1 py-1.5">
+                        <input
+                          type="number"
+                          value={a}
+                          onChange={(e) => {
+                            const vals = [...line.amounts];
+                            vals[i] = Number(e.target.value) || 0;
+                            updateLine(line.id, { amounts: vals });
+                          }}
+                          className="w-full rounded border px-1.5 py-1 text-xs text-right"
+                          style={inputStyle}
+                        />
+                      </td>
+                    ))}
+                    <td className="px-2 py-1.5 text-right font-medium" style={{ color: "#1C2624" }}>{fmt(lineTotal(line))}</td>
+                    <td className="px-2 py-1.5">
+                      <button onClick={() => removeLine(line.id)} className="p-1 rounded hover:bg-red-50">
+                        <Trash2 size={13} style={{ color: "#B5443A" }} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <button onClick={addLine} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+          <Plus size={13} /> Add row
+        </button>
+
+        <div className="grid grid-cols-3 gap-4 text-sm pt-2 border-t" style={{ borderColor: "#E1E5DE" }}>
+          <div>Revenue: <span style={{ color: "#2F6F53", fontWeight: 600 }}>{fmt(totals.revenue)}</span></div>
+          <div>Expense: <span style={{ color: "#B5443A", fontWeight: 600 }}>{fmt(totals.expense)}</span></div>
+          <div>Net: <span style={{ fontWeight: 600 }}>{fmt(totals.net)}</span></div>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-display text-base" style={{ color: "#1C2624" }}>Compare to real numbers</h2>
+          <button onClick={() => setShowCompare((v) => !v)} className="text-xs" style={{ color: "#1F5C6B" }}>{showCompare ? "Hide" : "Show"}</button>
+        </div>
+        {showCompare && (
+          comparison.available ? (
+            <div className="overflow-x-auto">
+              <table className="text-sm w-full">
+                <thead>
+                  <tr style={{ color: "#8A8F87" }}>
+                    <th className="text-left py-1.5 font-medium">Category</th>
+                    <th className="text-right py-1.5 font-medium">Scenario</th>
+                    <th className="text-right py-1.5 font-medium">Real (current)</th>
+                    <th className="text-right py-1.5 font-medium">Variance</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {form.lines.reduce((acc, l) => { if (!acc.includes(l.category)) acc.push(l.category); return acc; }, []).map((catName) => {
+                    const scenarioTotal = form.lines.filter((l) => l.category === catName).reduce((a, l) => a + lineTotal(l), 0);
+                    const realVals = comparison.byCategory[catName] || Array(12).fill(0);
+                    const realTotal = realVals.reduce((a, b) => a + b, 0);
+                    const variance = scenarioTotal - realTotal;
+                    return (
+                      <tr key={catName} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                        <td className="py-1.5" style={{ color: "#1C2624" }}>{catName}</td>
+                        <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{fmt(scenarioTotal)}</td>
+                        <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{fmt(realTotal)}</td>
+                        <td className="py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: variance >= 0 ? "#2F6F53" : "#B5443A" }}>
+                          {variance >= 0 ? "+" : ""}{fmt(variance)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="text-sm" style={{ color: "#8A8F87" }}>{comparison.reason}</p>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, budgetGroups, whoami, logActivity }) {
+  const [openId, setOpenId] = useState(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [confirm, setConfirm] = useState(null);
+
+  const open = scenarios.find((s) => s.id === openId);
+
+  const createScenario = (scen) => {
+    scen.createdBy = whoami || "Unknown";
+    setScenarios((prev) => [...prev, scen]);
+    logActivity?.("Scenario", "Created", scen.title);
+    setWizardOpen(false);
+    setOpenId(scen.id);
+  };
+  const saveScenario = (scen) => {
+    setScenarios((prev) => prev.map((s) => (s.id === scen.id ? scen : s)));
+    logActivity?.("Scenario", "Updated", scen.title);
+  };
+  const deleteScenario = (id) => {
+    const s = scenarios.find((x) => x.id === id);
+    setScenarios((prev) => prev.filter((x) => x.id !== id));
+    logActivity?.("Scenario", "Deleted", s?.title || "Untitled scenario");
+    setOpenId(null);
+    setConfirm(null);
+  };
+
+  if (open) {
+    return (
+      <ScenarioEditor
+        scenario={open}
+        grants={grants}
+        costCenters={costCenters}
+        budgets={budgets}
+        onSave={saveScenario}
+        onDelete={() => setConfirm(open.id)}
+        onBack={() => setOpenId(null)}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Scenarios</h1>
+          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>A sandbox to play with what-if numbers — never touches real budgets or actuals</p>
+        </div>
+        <button onClick={() => setWizardOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+          <Plus size={16} /> New scenario
+        </button>
+      </div>
+
+      {scenarios.length === 0 ? (
+        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
+          No scenarios yet — create one to start playing with what-if numbers.
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {scenarios.map((s) => {
+            const revenue = s.lines.filter((l) => l.type === "revenue").reduce((a, l) => a + lineTotal(l), 0);
+            const expense = s.lines.filter((l) => l.type === "expense").reduce((a, l) => a + lineTotal(l), 0);
+            return (
+              <button
+                key={s.id}
+                onClick={() => setOpenId(s.id)}
+                className="text-left bg-white rounded-lg border p-4 hover:shadow-sm transition-shadow"
+                style={{ borderColor: "#E1E5DE" }}
+              >
+                <div className="font-medium" style={{ color: "#1C2624" }}>{s.title || "Untitled scenario"}</div>
+                <div className="text-xs mt-1" style={{ color: "#8A8F87" }}>{s.basedOn?.label ? `Based on ${s.basedOn.label}` : "Started blank"}</div>
+                <div className="flex items-center gap-4 mt-3 text-xs">
+                  <span style={{ color: "#2F6F53" }}>Rev {fmt(revenue)}</span>
+                  <span style={{ color: "#B5443A" }}>Exp {fmt(expense)}</span>
+                </div>
+                <div className="text-xs mt-2" style={{ color: "#8A8F87" }}>By {s.createdBy || "Unknown"}</div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {wizardOpen && (
+        <NewScenarioModal
+          grants={grants}
+          costCenters={costCenters}
+          budgets={budgets}
+          budgetGroups={budgetGroups}
+          onCreate={createScenario}
+          onClose={() => setWizardOpen(false)}
+        />
+      )}
+      {confirm && (
+        <ConfirmModal
+          message="This will permanently delete this scenario. It has no effect on any real budget or actual data."
+          onConfirm={() => deleteScenario(confirm)}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+    </div>
+  );
+}
+
 function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const [calYear, setCalYear] = useState("All");
   const [scope, setScope] = useState("all"); // all | a budget group id
@@ -3352,7 +3902,7 @@ function WhoamiModal({ current, onSave, onSkip }) {
 function ActivityLogView({ activity }) {
   const [entityFilter, setEntityFilter] = useState("All");
   const [personFilter, setPersonFilter] = useState("All");
-  const entities = ["All", "Grant", "Budget", "Cost Center", "Budget Group", "Report", "Staff", "Task", "Invoice", "Data"];
+  const entities = ["All", "Grant", "Budget", "Cost Center", "Budget Group", "Scenario", "Report", "Staff", "Task", "Invoice", "Data"];
   const people = ["All", ...new Set(activity.map((a) => a.by).filter(Boolean))];
   const visible = activity
     .filter((a) => entityFilter === "All" || a.entity === entityFilter)
@@ -3559,7 +4109,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, logActivity }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, logActivity }) {
   const [restoreError, setRestoreError] = useState("");
   const [restoreSummary, setRestoreSummary] = useState("");
   const [importError, setImportError] = useState("");
@@ -3570,16 +4120,16 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, activity };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
   const [showBackupText, setShowBackupText] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, activity };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, activity]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, activity]);
 
   const copyBackupText = async () => {
     try {
@@ -3607,9 +4157,10 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.invoices)) setInvoices(data.invoices);
         if (Array.isArray(data.costCenters)) setCostCenters(data.costCenters);
         if (Array.isArray(data.budgetGroups)) setBudgetGroups(data.budgetGroups);
+        if (Array.isArray(data.scenarios)) setScenarios(data.scenarios);
         if (Array.isArray(data.activity)) setActivity(data.activity);
         logActivity?.("Data", "Restored", `Restored from backup file "${file.name}"`);
-        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups.`);
+        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups, ${data.scenarios?.length || 0} scenarios.`);
       } catch (err) {
         setRestoreError("Couldn't read that file — make sure it's a GrantFlow backup JSON exported from this app.");
       }
@@ -3936,6 +4487,7 @@ const NAV = [
   { key: "grant-reports", label: "Grant Reports", icon: ClipboardList },
   { key: "reporting", label: "Reporting", icon: BarChart3 },
   { key: "org-budget", label: "Org Budget", icon: PieChart },
+  { key: "scenarios", label: "Scenarios", icon: FlaskConical },
   { key: "burn-rate", label: "Burn Rate", icon: TrendingUp },
   { key: "personnel", label: "Personnel", icon: Users },
   { key: "activity-log", label: "Activity Log", icon: History },
@@ -3954,6 +4506,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
   const [selectedGrantId, setSelectedGrantId] = useState("");
   const [costCenters, setCostCenters] = useState([]);
   const [budgetGroups, setBudgetGroups] = useState([]);
+  const [scenarios, setScenarios] = useState([]);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
   const [reportsGrantFilter, setReportsGrantFilter] = useState("All");
   const [loaded, setLoaded] = useState(false);
@@ -4040,6 +4593,10 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
       const bg = await withTimeout(loadData("grantflow:budgetgroups"));
       if (bg) setBudgetGroups(bg);
     } catch (e) { /* no data yet */ }
+    try {
+      const sc = await withTimeout(loadData("grantflow:scenarios"));
+      if (sc) setScenarios(sc);
+    } catch (e) { /* no data yet */ }
     setLastSyncedAt(Date.now());
     setTimeout(() => { isSyncingRef.current = false; }, 500);
   };
@@ -4118,6 +4675,11 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:budgetgroups", budgetGroups, "Budget Groups");
   }, [budgetGroups, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:scenarios", scenarios, "Scenarios");
+  }, [scenarios, loaded]);
 
   const logActivity = (entity, action, label) => {
     setActivity((prev) => [{ id: uid(), timestamp: new Date().toISOString(), entity, action, label, by: whoami || "Unknown" }, ...prev].slice(0, 150));
@@ -4275,6 +4837,12 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           />
         ) : tab === "org-budget" ? (
           <OrgBudgetView grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups} />
+        ) : tab === "scenarios" ? (
+          <ScenariosView
+            scenarios={scenarios} setScenarios={setScenarios}
+            grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups}
+            whoami={currentUserEmail || whoami} logActivity={logActivity}
+          />
         ) : tab === "burn-rate" ? (
           <BurnRateView grants={grants} budgets={budgets} />
         ) : tab === "personnel" ? (
@@ -4287,8 +4855,8 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <ActivityLogView activity={activity} />
         ) : tab === "data" ? (
           <DataView
-            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} activity={activity}
-            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setActivity={setActivity}
+            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} scenarios={scenarios} activity={activity}
+            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setActivity={setActivity}
             logActivity={logActivity}
           />
         ) : tab === "user-access" && isAdmin ? (
