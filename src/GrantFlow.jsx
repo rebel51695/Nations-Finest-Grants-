@@ -285,7 +285,7 @@ function liveComparisonForScenario(scenario, grants, budgets, costCenters) {
     const calYear = basedOn.calYear ?? "All";
     const scopedGrantIds = scope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
     const scopedCcIds = scope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
-    const scopedBudgets = scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)));
+    const scopedBudgets = (scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => b.status === "Active");
     const map = {};
     scopedBudgets.forEach((b) => {
       const cols = monthColumnsForBudget(b.periodStart);
@@ -2509,7 +2509,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
   const orgCalendarYears = useMemo(() => {
     const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
     const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
-    const scoped = orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)));
+    const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => b.status === "Active");
     const years = new Set();
     scoped.forEach((b) => monthColumnsForBudget(b.periodStart).forEach((col) => years.add(col.year)));
     return [...years].sort();
@@ -2543,7 +2543,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
       scen.periodStart = orgYear !== "All" ? `${orgYear}-01-01` : "";
       const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
       const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
-      const scoped = orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)));
+      const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => b.status === "Active");
       const map = {};
       scoped.forEach((b) => {
         const cols = monthColumnsForBudget(b.periodStart);
@@ -3010,9 +3010,10 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
     return new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
   }, [scope, costCenters]);
 
-  const scopedBudgets = scope === "all"
+  const scopedBudgets = (scope === "all"
     ? budgets
-    : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)));
+    : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
+  ).filter((b) => b.status === "Active");
 
   // Real calendar years actually touched by any in-scope budget's period, so the
   // year picker reflects reality even when grants run off the calendar year.
