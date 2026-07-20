@@ -68,6 +68,7 @@ const SITE_OPTIONS = [
 const RISKS = ["Low", "Medium", "High"];
 const CADENCES = ["Weekly", "Monthly", "Quarterly", "Semi-annual", "Annually", "End of grant"];
 const BUDGET_STATUSES = ["Draft", "Pending Approval", "Active", "Rejected", "Closed"];
+const STAFF_STATUSES = ["Active", "Inactive", "Leave of Absence"];
 const INVOICE_STATUSES = ["Draft", "Submitted", "Paid", "Rejected"];
 const PAYMENT_METHODS = ["Billable Service", "Interval Lump Sum", "Lump Sum", "Per Diem Rate", "Reimbursement"];
 
@@ -3279,10 +3280,10 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 // ---------- personnel / payroll ----------
 
 function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
-  const [form, setForm] = useState(staff || {
+  const [form, setForm] = useState(staff ? { ...staff, status: staff.status || "Active" } : {
     id: uid(), name: "", position: "", department: "", exempt: "Non-exempt",
     payType: "Salary", annualSalary: 0, hourlyRate: 0, annualHours: ANNUAL_HOURS,
-    fte: 1, allocations: [], site: "",
+    fte: 1, allocations: [], site: "", status: "Active",
   });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
@@ -3309,6 +3310,11 @@ function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
           <select className={inputCls} style={inputStyle} value={form.site} onChange={set("site")}>
             <option value="">No site set</option>
             {SITE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Status">
+          <select className={inputCls} style={inputStyle} value={form.status || "Active"} onChange={set("status")}>
+            {STAFF_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         </Field>
         <Field label="Exempt status">
@@ -3438,14 +3444,24 @@ function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffI
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
   const [siteFilter, setSiteFilter] = useState("All");
+  const [statusFilter, setStatusFilter] = useState("All");
+  const [sortBy, setSortBy] = useState("name");
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const visible = staff
     .filter((s) => deptFilter === "All" || s.department === deptFilter)
-    .filter((s) => siteFilter === "All" || s.site === siteFilter);
-  const costByGrant = personnelCostByGrant(staff);
-  const costByCostCenter = personnelCostByCostCenter(staff);
-  const totalPersonnelCost = staff.reduce((a, s) => a + staffAnnualCost(s), 0);
+    .filter((s) => siteFilter === "All" || s.site === siteFilter)
+    .filter((s) => statusFilter === "All" || (s.status || "Active") === statusFilter)
+    .slice()
+    .sort((a, b) => {
+      if (sortBy === "status") return (a.status || "Active").localeCompare(b.status || "Active") || (a.name || "").localeCompare(b.name || "");
+      if (sortBy === "department") return (a.department || "").localeCompare(b.department || "") || (a.name || "").localeCompare(b.name || "");
+      return (a.name || "").localeCompare(b.name || "");
+    });
+  const activeStaff = staff.filter((s) => (s.status || "Active") === "Active");
+  const costByGrant = personnelCostByGrant(activeStaff);
+  const costByCostCenter = personnelCostByCostCenter(activeStaff);
+  const totalPersonnelCost = activeStaff.reduce((a, s) => a + staffAnnualCost(s), 0);
 
   const saveStaff = (s) => {
     setStaff((prev) => {
@@ -3514,7 +3530,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffI
         </div>
       )}
 
-      <div className="flex gap-3">
+      <div className="flex gap-3 flex-wrap">
         <Field label="Filter by department">
           <select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
             {departments.map((d) => <option key={d}>{d}</option>)}
@@ -3524,6 +3540,19 @@ function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffI
           <select value={siteFilter} onChange={(e) => setSiteFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
             <option>All</option>
             {SITE_OPTIONS.map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Filter by status">
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 200 }}>
+            <option>All</option>
+            {STAFF_STATUSES.map((s) => <option key={s}>{s}</option>)}
+          </select>
+        </Field>
+        <Field label="Sort by">
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 200 }}>
+            <option value="name">Name</option>
+            <option value="status">Status</option>
+            <option value="department">Department</option>
           </select>
         </Field>
       </div>
@@ -3537,11 +3566,16 @@ function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffI
           {visible.map((s) => {
             const cost = staffAnnualCost(s);
             const pct = staffAllocatedTotal(s);
+            const status = s.status || "Active";
+            const statusColor = status === "Active" ? "#2F6F53" : status === "Leave of Absence" ? "#C08A2E" : "#8A8F87";
             return (
               <div key={s.id} className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
                 <div className="flex items-center justify-between">
                   <div>
-                    <div className="font-medium" style={{ color: "#1C2624" }}>{s.name}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium" style={{ color: "#1C2624" }}>{s.name}</span>
+                      <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: `${statusColor}1A`, color: statusColor }}>{status}</span>
+                    </div>
                     <div className="text-xs mt-0.5" style={{ color: "#8A8F87" }}>{s.position}{s.department ? ` · ${s.department}` : ""}{s.site ? ` · ${s.site}` : ""} · {s.exempt}</div>
                   </div>
                   <div className="text-right text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>
@@ -4685,6 +4719,17 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
   const logActivity = (entity, action, label) => {
     setActivity((prev) => [{ id: uid(), timestamp: new Date().toISOString(), entity, action, label, by: whoami || "Unknown" }, ...prev].slice(0, 150));
   };
+
+  const staffMigratedRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || staffMigratedRef.current) return;
+    staffMigratedRef.current = true;
+    const needsMigration = staff.some((s) => !s.status);
+    if (needsMigration) {
+      setStaff((prev) => prev.map((s) => (s.status ? s : { ...s, status: "Active" })));
+      logActivity?.("Staff", "Updated", "Set status to Active for all existing staff members (one-time update)");
+    }
+  }, [loaded]);
 
   const navNonceRef = useRef(0);
   const goTo = (nextTab, action, grantId, recordId) => {
