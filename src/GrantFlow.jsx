@@ -69,6 +69,7 @@ const RISKS = ["Low", "Medium", "High"];
 const CADENCES = ["Weekly", "Monthly", "Quarterly", "Semi-annual", "Annually", "End of grant"];
 const BUDGET_STATUSES = ["Draft", "Pending Approval", "Active", "Rejected", "Closed"];
 const STAFF_STATUSES = ["Active", "Inactive", "Leave of Absence"];
+const AUTO_BACKUP_RETENTION_DAYS = 30;
 const INVOICE_STATUSES = ["Draft", "Submitted", "Paid", "Rejected"];
 const PAYMENT_METHODS = ["Billable Service", "Interval Lump Sum", "Lump Sum", "Per Diem Rate", "Reimbursement"];
 
@@ -4294,6 +4295,36 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   };
 
   const [showBackupText, setShowBackupText] = useState(false);
+  const [autoBackupList, setAutoBackupList] = useState(null);
+  const [autoBackupLoading, setAutoBackupLoading] = useState(false);
+  const [autoBackupError, setAutoBackupError] = useState("");
+
+  const loadAutoBackups = async () => {
+    setAutoBackupLoading(true);
+    setAutoBackupError("");
+    try {
+      const list = await window.storage.list("grantflow:autobackup:", true);
+      const dates = (list?.keys || [])
+        .filter((k) => k !== "grantflow:autobackup:meta")
+        .map((k) => k.replace("grantflow:autobackup:", ""))
+        .sort()
+        .reverse();
+      setAutoBackupList(dates);
+    } catch (err) {
+      setAutoBackupError("Couldn't load the list of automatic backups.");
+    }
+    setAutoBackupLoading(false);
+  };
+
+  const downloadAutoBackup = async (date) => {
+    try {
+      const res = await window.storage.get(`grantflow:autobackup:${date}`, true);
+      if (!res?.value) { setAutoBackupError(`Couldn't find the backup for ${date}.`); return; }
+      downloadFile(`nations-finest-grantflow-autobackup-${date}.json`, res.value, "application/json");
+    } catch (err) {
+      setAutoBackupError(`Couldn't download the backup for ${date}.`);
+    }
+  };
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
     const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
@@ -4592,6 +4623,34 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
       </div>
 
       <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <h2 className="font-display text-base mb-1" style={{ color: "#1C2624" }}>Automatic backups</h2>
+        <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
+          A backup is taken automatically once a day, the first time anyone opens the app that day — no action needed.
+          Kept for {AUTO_BACKUP_RETENTION_DAYS} days, then cleaned up automatically.
+        </p>
+        <button onClick={loadAutoBackups} disabled={autoBackupLoading} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+          {autoBackupLoading ? "Loading…" : "Show available automatic backups"}
+        </button>
+        {autoBackupError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{autoBackupError}</p>}
+        {autoBackupList !== null && (
+          autoBackupList.length === 0 ? (
+            <p className="text-sm mt-2" style={{ color: "#8A8F87" }}>No automatic backups yet — one will appear after the app has been open on any day.</p>
+          ) : (
+            <div className="mt-3 divide-y" style={{ borderColor: "#E1E5DE" }}>
+              {autoBackupList.map((date) => (
+                <div key={date} className="py-2 flex items-center justify-between text-sm">
+                  <span style={{ color: "#1C2624" }}>{date}</span>
+                  <button onClick={() => downloadAutoBackup(date)} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+                    Download
+                  </button>
+                </div>
+              ))}
+            </div>
+          )
+        )}
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
         <h2 className="font-display text-base mb-1" style={{ color: "#1C2624" }}>Restore from backup</h2>
         <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
           <strong style={{ color: "#B5443A" }}>This replaces all current data</strong> — grants, budgets, reports, staff, tasks, and activity log — with what's in the file. Since data here is shared, this affects everyone.
@@ -4878,6 +4937,37 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
       setStaff((prev) => prev.map((s) => (s.status ? s : { ...s, status: "Active" })));
       logActivity?.("Staff", "Updated", "Set status to Active for all existing staff members (one-time update)");
     }
+  }, [loaded]);
+
+  const autoBackupRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || autoBackupRef.current) return;
+    autoBackupRef.current = true;
+    (async () => {
+      const today = new Date().toISOString().slice(0, 10);
+      const metaKey = "grantflow:autobackup:meta";
+      let meta = null;
+      try {
+        const m = await window.storage.get(metaKey, true);
+        if (m?.value) meta = JSON.parse(m.value);
+      } catch (e) { /* no meta yet */ }
+      if (meta?.lastBackupDate === today) return; // already backed up today
+      try {
+        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
+        await window.storage.set(`grantflow:autobackup:${today}`, JSON.stringify(payload), true);
+        await window.storage.set(metaKey, JSON.stringify({ lastBackupDate: today }), true);
+        const list = await window.storage.list("grantflow:autobackup:", true);
+        const cutoff = Date.now() - AUTO_BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+        for (const key of (list?.keys || [])) {
+          if (key === metaKey) continue;
+          const dateStr = key.replace("grantflow:autobackup:", "");
+          const d = new Date(dateStr);
+          if (!isNaN(d) && d.getTime() < cutoff) {
+            window.storage.delete(key, true).catch(() => {});
+          }
+        }
+      } catch (e) { /* fail silently — this should never interrupt normal use */ }
+    })();
   }, [loaded]);
 
   const navNonceRef = useRef(0);
