@@ -257,6 +257,13 @@ function personnelCostByCostCenter(staffList) {
   return map;
 }
 
+function pushTrash(setTrash, entityType, data, deletedBy, extra) {
+  setTrash((prev) => [
+    { id: uid(), entityType, data, extra: extra || null, deletedAt: new Date().toISOString(), deletedBy: deletedBy || "Unknown" },
+    ...prev,
+  ].slice(0, 500));
+}
+
 function newScenario(basedOn) {
   return {
     id: uid(), title: "", notes: "", createdBy: "", createdAt: new Date().toISOString(),
@@ -1535,7 +1542,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
   );
 }
 
-function GrantsView({ grants, budgets, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, autoOpenNew, initialExpandId, goTo, logActivity }) {
+function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, autoOpenNew, initialExpandId, goTo, logActivity }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("All");
   const [riskFilter, setRiskFilter] = useState("All");
@@ -1587,6 +1594,16 @@ function GrantsView({ grants, budgets, staff, budgetGroups, setBudgetGroups, set
 
   const deleteGrant = (id) => {
     const g = grants.find((x) => x.id === id);
+    const cascadedBudgets = budgets.filter((b) => b.grantId === id);
+    const cascadedReports = (reports || []).filter((r) => r.grantId === id);
+    const cascadedTasks = (tasks || []).filter((t) => t.grantId === id);
+    const cascadedInvoices = (invoices || []).filter((i) => i.grantId === id);
+    const cascadedAllocations = (staff || [])
+      .map((s) => ({ staffId: s.id, allocations: (s.allocations || []).filter((a) => a.grantId === id) }))
+      .filter((x) => x.allocations.length > 0);
+    pushTrash(setTrash, "grant", g, currentUserEmail, {
+      budgets: cascadedBudgets, reports: cascadedReports, tasks: cascadedTasks, invoices: cascadedInvoices, staffAllocations: cascadedAllocations,
+    });
     setGrants((prev) => prev.filter((g) => g.id !== id));
     setBudgets((prev) => prev.filter((b) => b.grantId !== id));
     setReports?.((prev) => prev.filter((r) => r.grantId !== id));
@@ -1734,7 +1751,7 @@ function GrantsView({ grants, budgets, staff, budgetGroups, setBudgetGroups, set
       {modal && <GrantModal grant={modal === "new" ? null : modal} budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} logActivity={logActivity} onSave={saveGrant} onClose={() => setModal(null)} />}
       {confirm && (
         <ConfirmModal
-          message="This will permanently delete the grant, all of its budgets, invoices, linked grant reports and tasks, and remove it from any staff allocations."
+          message="This moves the grant, all of its budgets, invoices, linked grant reports and tasks to Trash, and removes it from any staff allocations. It can be restored from Trash later if needed."
           onConfirm={() => deleteGrant(confirm)}
           onCancel={() => setConfirm(null)}
         />
@@ -1743,7 +1760,7 @@ function GrantsView({ grants, budgets, staff, budgetGroups, setBudgetGroups, set
   );
 }
 
-function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, initialOpenBudgetId, logActivity }) {
+function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, setTrash, currentUserEmail, initialOpenBudgetId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenBudgetId ? budgets.find((b) => b.id === stripNonce(initialOpenBudgetId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
@@ -1767,6 +1784,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   };
   const deleteCostCenter = (id) => {
     const cc = costCenters.find((x) => x.id === id);
+    const cascadedBudgets = budgets.filter((b) => b.costCenterId === id);
+    pushTrash(setTrash, "costCenter", cc, currentUserEmail, { budgets: cascadedBudgets });
     setCostCenters((prev) => prev.filter((x) => x.id !== id));
     setBudgets((prev) => prev.filter((b) => b.costCenterId !== id));
     logActivity?.("Cost Center", "Deleted", cc?.name || "Untitled cost center");
@@ -1784,6 +1803,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   };
   const deleteBudget = (id) => {
     const b = budgets.find((x) => x.id === id);
+    pushTrash(setTrash, "budget", b, currentUserEmail);
     setBudgets((prev) => prev.filter((b) => b.id !== id));
     logActivity?.("Budget", "Deleted", `${b?.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""}`);
     setConfirm(null);
@@ -2046,7 +2066,7 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
   );
 }
 
-function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, initialOpenReportId, logActivity }) {
+function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, setTrash, currentUserEmail, initialOpenReportId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenReportId ? reports.find((r) => r.id === stripNonce(initialOpenReportId)) || null : null));
   const [confirm, setConfirm] = useState(null);
 
@@ -2073,6 +2093,7 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
   };
   const deleteReport = (id) => {
     const r = reports.find((x) => x.id === id);
+    pushTrash(setTrash, "report", r, currentUserEmail);
     setReports((prev) => prev.filter((r) => r.id !== id));
     logActivity?.("Report", "Deleted", r?.title || "Untitled report");
     setConfirm(null);
@@ -2214,7 +2235,7 @@ function TaskModal({ task, grants, onSave, onClose, onDelete }) {
   );
 }
 
-function TasksView({ grants, tasks, setTasks, autoOpenNew, initialOpenTaskId, logActivity }) {
+function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, autoOpenNew, initialOpenTaskId, logActivity }) {
   const [modal, setModal] = useState(() => (autoOpenNew ? "new" : initialOpenTaskId ? tasks.find((t) => t.id === stripNonce(initialOpenTaskId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState("All");
@@ -2242,6 +2263,7 @@ function TasksView({ grants, tasks, setTasks, autoOpenNew, initialOpenTaskId, lo
   };
   const deleteTask = (id) => {
     const t = tasks.find((x) => x.id === id);
+    pushTrash(setTrash, "task", t, currentUserEmail);
     setTasks((prev) => prev.filter((t) => t.id !== id));
     logActivity?.("Task", "Deleted", t?.title || "Untitled task");
     setConfirm(null);
@@ -2894,7 +2916,116 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, onSave, onDele
   );
 }
 
-function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, budgetGroups, whoami, logActivity }) {
+function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, isAdmin, logActivity }) {
+  const [confirm, setConfirm] = useState(null);
+
+  const labelFor = (t) => {
+    switch (t.entityType) {
+      case "grant": return t.data?.title || "Untitled grant";
+      case "budget": return t.data?.title || "Untitled budget";
+      case "costCenter": return t.data?.name || "Untitled cost center";
+      case "report": return t.data?.title || "Untitled report";
+      case "task": return t.data?.title || "Untitled task";
+      case "invoice": return t.data?.invoiceNumber || "Untitled invoice";
+      case "staff": return t.data?.name || "Untitled staff member";
+      case "scenario": return t.data?.title || "Untitled scenario";
+      default: return "Item";
+    }
+  };
+  const typeLabel = {
+    grant: "Grant", budget: "Budget", costCenter: "Cost Center", report: "Grant Report",
+    task: "Task", invoice: "Invoice", staff: "Staff", scenario: "Scenario",
+  };
+
+  const restore = (t) => {
+    if (!t.data) return;
+    switch (t.entityType) {
+      case "grant":
+        setGrants((prev) => [...prev, t.data]);
+        if (t.extra?.budgets?.length) setBudgets((prev) => [...prev, ...t.extra.budgets]);
+        if (t.extra?.reports?.length) setReports?.((prev) => [...prev, ...t.extra.reports]);
+        if (t.extra?.tasks?.length) setTasks?.((prev) => [...prev, ...t.extra.tasks]);
+        if (t.extra?.invoices?.length) setInvoices?.((prev) => [...prev, ...t.extra.invoices]);
+        if (t.extra?.staffAllocations?.length) {
+          setStaff?.((prev) => prev.map((s) => {
+            const match = t.extra.staffAllocations.find((x) => x.staffId === s.id);
+            if (!match) return s;
+            return { ...s, allocations: [...(s.allocations || []), ...match.allocations] };
+          }));
+        }
+        break;
+      case "costCenter":
+        setCostCenters((prev) => [...prev, t.data]);
+        if (t.extra?.budgets?.length) setBudgets((prev) => [...prev, ...t.extra.budgets]);
+        break;
+      case "budget": setBudgets((prev) => [...prev, t.data]); break;
+      case "report": setReports?.((prev) => [...prev, t.data]); break;
+      case "task": setTasks?.((prev) => [...prev, t.data]); break;
+      case "invoice": setInvoices?.((prev) => [...prev, t.data]); break;
+      case "staff": setStaff?.((prev) => [...prev, t.data]); break;
+      case "scenario": setScenarios?.((prev) => [...prev, t.data]); break;
+      default: break;
+    }
+    setTrash((prev) => prev.filter((x) => x.id !== t.id));
+    logActivity?.("Data", "Restored", `Restored ${typeLabel[t.entityType] || "item"} "${labelFor(t)}" from Trash`);
+  };
+
+  const permanentlyDelete = (id) => {
+    setTrash((prev) => prev.filter((x) => x.id !== id));
+    setConfirm(null);
+  };
+
+  const sorted = [...trash].sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Trash</h1>
+        <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
+          Deleted items land here and can be restored. Items are automatically removed for good after 90 days.
+        </p>
+      </div>
+
+      {sorted.length === 0 ? (
+        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
+          Trash is empty.
+        </div>
+      ) : (
+        <div className="bg-white rounded-lg border divide-y" style={{ borderColor: "#E1E5DE" }}>
+          {sorted.map((t) => (
+            <div key={t.id} className="px-4 py-3 flex items-center justify-between text-sm">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: "#F6F7F3", color: "#5B6B66" }}>{typeLabel[t.entityType] || t.entityType}</span>
+                  <span style={{ color: "#1C2624" }}>{labelFor(t)}</span>
+                </div>
+                <div className="text-xs mt-0.5" style={{ color: "#8A8F87" }}>
+                  Deleted by {t.deletedBy || "Unknown"} · {new Date(t.deletedAt).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button onClick={() => restore(t)} className="text-xs px-3 py-1.5 rounded-md text-white" style={{ background: "#1F5C6B" }}>Restore</button>
+                {isAdmin && (
+                  <button onClick={() => setConfirm(t.id)} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Delete forever</button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {confirm && (
+        <ConfirmModal
+          message="This permanently and irreversibly deletes this item. There is no way to get it back after this."
+          onConfirm={() => permanentlyDelete(confirm)}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, budgetGroups, whoami, setTrash, logActivity }) {
   const [openId, setOpenId] = useState(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [confirm, setConfirm] = useState(null);
@@ -2914,6 +3045,7 @@ function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, 
   };
   const deleteScenario = (id) => {
     const s = scenarios.find((x) => x.id === id);
+    pushTrash(setTrash, "scenario", s, whoami);
     setScenarios((prev) => prev.filter((x) => x.id !== id));
     logActivity?.("Scenario", "Deleted", s?.title || "Untitled scenario");
     setOpenId(null);
@@ -3439,7 +3571,7 @@ function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
   );
 }
 
-function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffId, logActivity }) {
+function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, initialOpenStaffId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
@@ -3473,6 +3605,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, initialOpenStaffI
   };
   const deleteStaff = (id) => {
     const s = staff.find((x) => x.id === id);
+    pushTrash(setTrash, "staff", s, currentUserEmail);
     setStaff((prev) => prev.filter((s) => s.id !== id));
     logActivity?.("Staff", "Deleted", s?.name || "Untitled staff member");
     setConfirm(null);
@@ -3692,7 +3825,7 @@ function InvoiceModal({ invoice, grants, onSave, onClose, onDelete }) {
   );
 }
 
-function InvoicingView({ grants, invoices, setInvoices, initialOpenInvoiceId, logActivity }) {
+function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, initialOpenInvoiceId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenInvoiceId ? invoices.find((i) => i.id === stripNonce(initialOpenInvoiceId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [grantFilter, setGrantFilter] = useState("All");
@@ -3718,6 +3851,7 @@ function InvoicingView({ grants, invoices, setInvoices, initialOpenInvoiceId, lo
   };
   const deleteInvoice = (id) => {
     const inv = invoices.find((x) => x.id === id);
+    pushTrash(setTrash, "invoice", inv, currentUserEmail);
     setInvoices((prev) => prev.filter((i) => i.id !== id));
     logActivity?.("Invoice", "Deleted", inv?.invoiceNumber || "Untitled invoice");
     setConfirm(null);
@@ -4144,7 +4278,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, logActivity }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, logActivity }) {
   const [restoreError, setRestoreError] = useState("");
   const [restoreSummary, setRestoreSummary] = useState("");
   const [importError, setImportError] = useState("");
@@ -4155,16 +4289,16 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
   const [showBackupText, setShowBackupText] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, activity]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity]);
 
   const copyBackupText = async () => {
     try {
@@ -4193,6 +4327,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.costCenters)) setCostCenters(data.costCenters);
         if (Array.isArray(data.budgetGroups)) setBudgetGroups(data.budgetGroups);
         if (Array.isArray(data.scenarios)) setScenarios(data.scenarios);
+        if (Array.isArray(data.trash)) setTrash(data.trash);
         if (Array.isArray(data.activity)) setActivity(data.activity);
         logActivity?.("Data", "Restored", `Restored from backup file "${file.name}"`);
         setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups, ${data.scenarios?.length || 0} scenarios.`);
@@ -4526,6 +4661,7 @@ const NAV = [
   { key: "burn-rate", label: "Burn Rate", icon: TrendingUp },
   { key: "personnel", label: "Personnel", icon: Users },
   { key: "activity-log", label: "Activity Log", icon: History },
+  { key: "trash", label: "Trash", icon: Trash2 },
   { key: "data", label: "Data & Backup", icon: Upload },
 ];
 
@@ -4542,6 +4678,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
   const [costCenters, setCostCenters] = useState([]);
   const [budgetGroups, setBudgetGroups] = useState([]);
   const [scenarios, setScenarios] = useState([]);
+  const [trash, setTrash] = useState([]);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
   const [reportsGrantFilter, setReportsGrantFilter] = useState("All");
   const [loaded, setLoaded] = useState(false);
@@ -4632,6 +4769,13 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
       const sc = await withTimeout(loadData("grantflow:scenarios"));
       if (sc) setScenarios(sc);
     } catch (e) { /* no data yet */ }
+    try {
+      const tr = await withTimeout(loadData("grantflow:trash"));
+      if (tr) {
+        const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+        setTrash(tr.filter((t) => new Date(t.deletedAt).getTime() > cutoff));
+      }
+    } catch (e) { /* no data yet */ }
     setLastSyncedAt(Date.now());
     setTimeout(() => { isSyncingRef.current = false; }, 500);
   };
@@ -4715,6 +4859,11 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:scenarios", scenarios, "Scenarios");
   }, [scenarios, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:trash", trash, "Trash");
+  }, [trash, loaded]);
 
   const logActivity = (entity, action, label) => {
     setActivity((prev) => [{ id: uid(), timestamp: new Date().toISOString(), entity, action, label, by: whoami || "Unknown" }, ...prev].slice(0, 150));
@@ -4847,9 +4996,10 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
         ) : tab === "grants" ? (
           <GrantsView
             key={pendingNewGrant ? "grants-new" : pendingExpandGrantId ? `grants-expand-${pendingExpandGrantId}` : "grants"}
-            grants={grants} budgets={budgets} setGrants={setGrants} setBudgets={setBudgets}
+            grants={grants} budgets={budgets} reports={reports} tasks={tasks} invoices={invoices} setGrants={setGrants} setBudgets={setBudgets}
             setReports={setReports} setTasks={setTasks} setStaff={setStaff} setInvoices={setInvoices} staff={staff}
             budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
             autoOpenNew={pendingNewGrant} initialExpandId={pendingExpandGrantId} goTo={goTo} logActivity={logActivity}
           />
         ) : tab === "budgets" ? (
@@ -4860,18 +5010,21 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             costCenters={costCenters} setCostCenters={setCostCenters}
             selectedCostCenterId={selectedCostCenterId} setSelectedCostCenterId={setSelectedCostCenterId}
             budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
             initialOpenBudgetId={pendingOpenBudgetId} logActivity={logActivity}
           />
         ) : tab === "invoicing" ? (
           <InvoicingView
             key={pendingOpenInvoiceId ? `invoices-open-${pendingOpenInvoiceId}` : "invoicing"}
             grants={grants} invoices={invoices} setInvoices={setInvoices}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
             initialOpenInvoiceId={pendingOpenInvoiceId} logActivity={logActivity}
           />
         ) : tab === "tasks" ? (
           <TasksView
             key={pendingNewTask ? "tasks-new" : pendingOpenTaskId ? `tasks-open-${pendingOpenTaskId}` : "tasks"}
             grants={grants} tasks={tasks} setTasks={setTasks}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
             autoOpenNew={pendingNewTask} initialOpenTaskId={pendingOpenTaskId} logActivity={logActivity}
           />
         ) : tab === "grant-reports" ? (
@@ -4879,6 +5032,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             key={pendingOpenReportId ? `reports-open-${pendingOpenReportId}` : "grant-reports"}
             grants={grants} reports={reports} setReports={setReports} setTasks={setTasks}
             grantFilter={reportsGrantFilter} setGrantFilter={setReportsGrantFilter}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
             initialOpenReportId={pendingOpenReportId} logActivity={logActivity}
           />
         ) : tab === "org-budget" ? (
@@ -4887,7 +5041,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <ScenariosView
             scenarios={scenarios} setScenarios={setScenarios}
             grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups}
-            whoami={currentUserEmail || whoami} logActivity={logActivity}
+            whoami={currentUserEmail || whoami} setTrash={setTrash} logActivity={logActivity}
           />
         ) : tab === "burn-rate" ? (
           <BurnRateView grants={grants} budgets={budgets} />
@@ -4895,14 +5049,22 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <PersonnelView
             key={pendingOpenStaffId ? `staff-open-${pendingOpenStaffId}` : "personnel"}
             grants={grants} staff={staff} setStaff={setStaff} costCenters={costCenters}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
             initialOpenStaffId={pendingOpenStaffId} logActivity={logActivity}
           />
         ) : tab === "activity-log" ? (
           <ActivityLogView activity={activity} />
+        ) : tab === "trash" ? (
+          <TrashView
+            trash={trash} setTrash={setTrash}
+            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setTasks={setTasks}
+            setInvoices={setInvoices} setStaff={setStaff} setCostCenters={setCostCenters} setScenarios={setScenarios}
+            isAdmin={isAdmin} logActivity={logActivity}
+          />
         ) : tab === "data" ? (
           <DataView
-            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} scenarios={scenarios} activity={activity}
-            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setActivity={setActivity}
+            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} scenarios={scenarios} trash={trash} activity={activity}
+            setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setTrash={setTrash} setActivity={setActivity}
             logActivity={logActivity}
           />
         ) : tab === "user-access" && isAdmin ? (
