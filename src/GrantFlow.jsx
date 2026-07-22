@@ -1,4 +1,6 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from "react";
+import { doc, getDoc } from "firebase/firestore";
+import { db } from "./firebaseConfig";
 import * as XLSX from "xlsx";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
@@ -4831,6 +4833,8 @@ export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disable
   const [budgetGroups, setBudgetGroups] = useState([]);
   const [scenarios, setScenarios] = useState([]);
   const [trash, setTrash] = useState([]);
+  const [announcement, setAnnouncement] = useState(null);
+  const [announcementDismissed, setAnnouncementDismissed] = useState(false);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
   const [reportsGrantFilter, setReportsGrantFilter] = useState("All");
   const [loaded, setLoaded] = useState(false);
@@ -4928,6 +4932,14 @@ export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disable
         setTrash(tr.filter((t) => new Date(t.deletedAt).getTime() > cutoff));
       }
     } catch (e) { /* no data yet */ }
+    try {
+      const annSnap = await withTimeout(getDoc(doc(db, "app_config", "announcement")));
+      if (annSnap?.exists?.() && annSnap.data()?.message) {
+        setAnnouncement(annSnap.data());
+      } else {
+        setAnnouncement(null);
+      }
+    } catch (e) { /* no announcement set */ }
     setLastSyncedAt(Date.now());
     setTimeout(() => { isSyncingRef.current = false; }, 500);
   };
@@ -5171,6 +5183,18 @@ export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disable
             <GlobalSearch grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} goTo={goTo} />
           </div>
         </div>
+        {announcement && !announcementDismissed && (
+          <div className="no-print px-4 md:px-8 py-2.5 flex items-start gap-2" style={{ background: "#FFF7E6", borderBottom: "1px solid #F0B21E" }}>
+            <AlertCircle size={15} style={{ color: "#8A6D1F", marginTop: 2 }} className="shrink-0" />
+            <div className="flex-1 text-sm" style={{ color: "#5B4A0F" }}>
+              {announcement.message}
+              {announcement.setBy && <span style={{ color: "#8A8F87" }}> — {announcement.setBy}</span>}
+            </div>
+            <button onClick={() => setAnnouncementDismissed(true)} className="shrink-0 p-0.5 rounded hover:bg-black/5">
+              <X size={15} style={{ color: "#8A6D1F" }} />
+            </button>
+          </div>
+        )}
         <main className="flex-1 px-4 md:px-8 py-4 md:py-8" style={{ maxWidth: (tab === "grant-reports" || tab === "org-budget" || tab === "burn-rate") ? "100%" : "72rem" }}>
         {!loaded ? (
           <div className="text-sm" style={{ color: "#8A8F87" }}>Loading…</div>
@@ -5252,7 +5276,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disable
             logActivity={logActivity}
           />
         ) : tab === "user-access" && isAdmin ? (
-          <AdminPanel />
+          <AdminPanel currentUserEmail={currentUserEmail || whoami} />
         ) : (
           <ReportingView grants={grants} budgets={budgets} />
         )}
