@@ -6,29 +6,40 @@ import PendingScreen from "./PendingScreen.jsx";
 import GrantFlow from "./GrantFlow.jsx";
 import { isAdminEmail } from "./adminEmails";
 
-async function checkAccess(email) {
+async function fetchAccessRecord(email) {
   const id = email.trim().toLowerCase();
   const ref = doc(db, "user_access", id);
   const snap = await getDoc(ref);
   if (!snap.exists()) {
-    await setDoc(ref, { email: id, allowed: false, requestedAt: new Date().toISOString() });
-    return false;
+    const fresh = { email: id, allowed: false, role: "editor", disabledModules: [], requestedAt: new Date().toISOString() };
+    await setDoc(ref, fresh);
+    return fresh;
   }
-  return snap.data().allowed === true;
+  const data = snap.data();
+  return {
+    allowed: data.allowed === true,
+    role: data.role || "editor",
+    disabledModules: Array.isArray(data.disabledModules) ? data.disabledModules : [],
+  };
 }
 
 export default function AppGate() {
   const user = useAuthUser();
   const [accessState, setAccessState] = useState("checking"); // checking | allowed | pending
+  const [record, setRecord] = useState(null);
 
   useEffect(() => {
     if (!user) return;
     if (isAdminEmail(user.email)) {
+      setRecord({ allowed: true, role: "admin", disabledModules: [] });
       setAccessState("allowed");
       return;
     }
     setAccessState("checking");
-    checkAccess(user.email).then((allowed) => setAccessState(allowed ? "allowed" : "pending"));
+    fetchAccessRecord(user.email).then((rec) => {
+      setRecord(rec);
+      setAccessState(rec.allowed ? "allowed" : "pending");
+    });
   }, [user]);
 
   if (user === undefined) {
@@ -57,12 +68,21 @@ export default function AppGate() {
         email={user.email}
         onSignOut={signOutUser}
         onCheckAgain={async () => {
-          const allowed = await checkAccess(user.email);
-          setAccessState(allowed ? "allowed" : "pending");
+          const rec = await fetchAccessRecord(user.email);
+          setRecord(rec);
+          setAccessState(rec.allowed ? "allowed" : "pending");
         }}
       />
     );
   }
 
-  return <GrantFlow currentUserEmail={user.email} isAdmin={isAdminEmail(user.email)} onSignOut={signOutUser} />;
+  return (
+    <GrantFlow
+      currentUserEmail={user.email}
+      isAdmin={isAdminEmail(user.email)}
+      userRole={isAdminEmail(user.email) ? "admin" : (record?.role || "editor")}
+      disabledModules={isAdminEmail(user.email) ? [] : (record?.disabledModules || [])}
+      onSignOut={signOutUser}
+    />
+  );
 }

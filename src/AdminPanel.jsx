@@ -3,17 +3,35 @@ import { collection, getDocs, doc, setDoc } from "firebase/firestore";
 import { db } from "./firebaseConfig";
 import { ADMIN_EMAILS } from "./adminEmails";
 
+const MODULES = [
+  { key: "dashboard", label: "Dashboard" },
+  { key: "grants", label: "Grants" },
+  { key: "budgets", label: "Budgets" },
+  { key: "invoicing", label: "Invoicing" },
+  { key: "tasks", label: "Tasks" },
+  { key: "grant-reports", label: "Grant Reports" },
+  { key: "reporting", label: "Reporting" },
+  { key: "org-budget", label: "Org Budget" },
+  { key: "scenarios", label: "Scenarios" },
+  { key: "burn-rate", label: "Burn Rate" },
+  { key: "personnel", label: "Personnel" },
+  { key: "activity-log", label: "Activity Log" },
+  { key: "trash", label: "Trash" },
+  { key: "data", label: "Data & Backup" },
+];
+
 export default function AdminPanel() {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [expandedId, setExpandedId] = useState(null);
 
   const load = async () => {
     setLoading(true);
     setError("");
     try {
       const snap = await getDocs(collection(db, "user_access"));
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const list = snap.docs.map((d) => ({ id: d.id, role: "editor", disabledModules: [], ...d.data() }));
       list.sort((a, b) => (b.requestedAt || "").localeCompare(a.requestedAt || ""));
       setUsers(list);
     } catch (e) {
@@ -29,17 +47,30 @@ export default function AdminPanel() {
     setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, allowed } : u)));
   };
 
+  const setRole = async (id, role) => {
+    await setDoc(doc(db, "user_access", id), { role }, { merge: true });
+    setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, role } : u)));
+  };
+
+  const toggleModule = async (id, moduleKey) => {
+    const user = users.find((u) => u.id === id);
+    const current = user.disabledModules || [];
+    const next = current.includes(moduleKey) ? current.filter((k) => k !== moduleKey) : [...current, moduleKey];
+    await setDoc(doc(db, "user_access", id), { disabledModules: next }, { merge: true });
+    setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, disabledModules: next } : u)));
+  };
+
   const fmtDate = (iso) => (iso ? new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) : "—");
 
   return (
     <div className="space-y-4">
       <div>
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>User Access</h1>
-        <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Approve or deny who can sign in to the Grant Portal</p>
+        <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Approve access, set roles, and control which modules each person can see</p>
       </div>
 
       <div className="bg-white rounded-lg border p-4 text-sm" style={{ borderColor: "#E1E5DE" }}>
-        <div className="font-medium mb-1" style={{ color: "#1C2624" }}>Admins (always have full access)</div>
+        <div className="font-medium mb-1" style={{ color: "#1C2624" }}>Admins (always have full access, fixed and cannot be changed here)</div>
         <div style={{ color: "#5B6B66" }}>{ADMIN_EMAILS.join(", ")}</div>
       </div>
 
@@ -58,32 +89,68 @@ export default function AdminPanel() {
       ) : (
         <div className="bg-white rounded-lg border divide-y" style={{ borderColor: "#E1E5DE" }}>
           {users.map((u) => (
-            <div key={u.id} className="px-4 py-3 flex items-center justify-between text-sm">
-              <div>
-                <div style={{ color: "#1C2624" }}>{u.email || u.id}</div>
-                <div className="text-xs" style={{ color: "#8A8F87" }}>Requested {fmtDate(u.requestedAt)}</div>
+            <div key={u.id} className="px-4 py-3 text-sm">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <div style={{ color: "#1C2624" }}>{u.email || u.id}</div>
+                  <div className="text-xs" style={{ color: "#8A8F87" }}>Requested {fmtDate(u.requestedAt)}</div>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span
+                    className="text-xs px-2 py-0.5 rounded-full"
+                    style={{
+                      background: u.allowed ? "#EAF1EC" : "#FBEAE8",
+                      color: u.allowed ? "#2F6F53" : "#B5443A",
+                    }}
+                  >
+                    {u.allowed ? "Approved" : "Pending / Denied"}
+                  </span>
+                  {u.allowed && (
+                    <select
+                      value={u.role || "editor"}
+                      onChange={(e) => setRole(u.id, e.target.value)}
+                      className="text-xs rounded-md border px-2 py-1.5"
+                      style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+                    >
+                      <option value="editor">Editor (read + edit)</option>
+                      <option value="viewer">Viewer (read-only)</option>
+                    </select>
+                  )}
+                  {u.allowed && (
+                    <button
+                      onClick={() => setExpandedId(expandedId === u.id ? null : u.id)}
+                      className="text-xs px-3 py-1.5 rounded-md border"
+                      style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
+                    >
+                      {expandedId === u.id ? "Hide modules" : "Manage modules"}
+                      {u.disabledModules?.length > 0 ? ` (${u.disabledModules.length} hidden)` : ""}
+                    </button>
+                  )}
+                  {!u.allowed && (
+                    <button onClick={() => setAllowed(u.id, true)} className="text-xs px-3 py-1.5 rounded-md text-white" style={{ background: "#2F6F53" }}>
+                      Approve
+                    </button>
+                  )}
+                  {u.allowed && (
+                    <button onClick={() => setAllowed(u.id, false)} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>
+                      Revoke
+                    </button>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <span
-                  className="text-xs px-2 py-0.5 rounded-full"
-                  style={{
-                    background: u.allowed ? "#EAF1EC" : "#FBEAE8",
-                    color: u.allowed ? "#2F6F53" : "#B5443A",
-                  }}
-                >
-                  {u.allowed ? "Approved" : "Pending / Denied"}
-                </span>
-                {!u.allowed && (
-                  <button onClick={() => setAllowed(u.id, true)} className="text-xs px-3 py-1.5 rounded-md text-white" style={{ background: "#2F6F53" }}>
-                    Approve
-                  </button>
-                )}
-                {u.allowed && (
-                  <button onClick={() => setAllowed(u.id, false)} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>
-                    Revoke
-                  </button>
-                )}
-              </div>
+              {expandedId === u.id && u.allowed && (
+                <div className="mt-3 pt-3 border-t grid grid-cols-2 sm:grid-cols-3 gap-2" style={{ borderColor: "#E1E5DE" }}>
+                  {MODULES.map((m) => {
+                    const hidden = (u.disabledModules || []).includes(m.key);
+                    return (
+                      <label key={m.key} className="flex items-center gap-2 text-xs" style={{ color: "#1C2624" }}>
+                        <input type="checkbox" checked={!hidden} onChange={() => toggleModule(u.id, m.key)} />
+                        {m.label}
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ))}
         </div>

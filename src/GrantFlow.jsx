@@ -625,7 +625,7 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivit
   );
 }
 
-function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, onSave, onClose }) {
+function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit = true, onSave, onClose }) {
   const [form, setForm] = useState(grant || {
     id: uid(), title: "", programCode: "", funding: "", sites: [], stage: "Prospecting",
     awardAmount: 0, start: "", end: "", riskStatus: "Low", cadence: [],
@@ -659,7 +659,8 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, onSave,
   };
 
   return (
-    <Modal title={grant ? "Edit grant" : "New grant"} onClose={onClose} wide>
+    <Modal title={grant ? (canEdit ? "Edit grant" : "View grant") : "New grant"} onClose={onClose} wide>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Grant title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. SSVF Supportive Services" />
@@ -779,24 +780,27 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, onSave,
           Up for renewal
         </label>
       </div>
+      </fieldset>
       <div className="flex justify-end gap-2 mt-6">
         <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-        <button
-          onClick={() => { if (!form.title.trim()) return; onSave(form); }}
-          className="px-4 py-2 rounded-md text-sm text-white"
-          style={{ background: "#1F5C6B" }}
-        >
-          Save grant
-        </button>
+        {canEdit && (
+          <button
+            onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+            className="px-4 py-2 rounded-md text-sm text-white"
+            style={{ background: "#1F5C6B" }}
+          >
+            Save grant
+          </button>
+        )}
       </div>
-      {bgModal && <BudgetGroupModal budgetGroup={bgModal === "new" ? null : bgModal} onSave={saveBudgetGroup} onClose={() => setBgModal(null)} />}
+      {bgModal && canEdit && <BudgetGroupModal budgetGroup={bgModal === "new" ? null : bgModal} onSave={saveBudgetGroup} onClose={() => setBgModal(null)} />}
     </Modal>
   );
 }
 
 // ---------- budget form ----------
 
-function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
+function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose }) {
   const [form, setForm] = useState(budget || {
     id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
     status: "Draft", notes: "", lines: [newLine()],
@@ -871,23 +875,27 @@ function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
         {form.status === "Draft" && (
           <div className="flex items-center justify-between">
             <span className="text-sm" style={{ color: "#5B6B66" }}>This budget is a draft. Submit it for approval before it can go Active.</span>
-            <button onClick={submitForApproval} className="text-xs px-3 py-1.5 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Submit for approval</button>
+            {canEdit && (
+              <button onClick={submitForApproval} className="text-xs px-3 py-1.5 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Submit for approval</button>
+            )}
           </div>
         )}
         {form.status === "Pending Approval" && !showRejectBox && (
           <div>
             <div className="text-sm mb-2" style={{ color: "#5B6B66" }}>Awaiting approval before this budget can go Active.</div>
-            <div className="flex items-center gap-2">
-              <input
-                value={approverName} onChange={(e) => setApproverName(e.target.value)}
-                placeholder="Approver name" className="rounded-md border px-2 py-1.5 text-sm flex-1" style={inputStyle}
-              />
-              <button onClick={approveBudget} className="text-xs px-3 py-1.5 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Approve</button>
-              <button onClick={() => setShowRejectBox(true)} className="text-xs px-3 py-1.5 rounded-md border shrink-0" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Reject</button>
-            </div>
+            {canEdit && (
+              <div className="flex items-center gap-2">
+                <input
+                  value={approverName} onChange={(e) => setApproverName(e.target.value)}
+                  placeholder="Approver name" className="rounded-md border px-2 py-1.5 text-sm flex-1" style={inputStyle}
+                />
+                <button onClick={approveBudget} className="text-xs px-3 py-1.5 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Approve</button>
+                <button onClick={() => setShowRejectBox(true)} className="text-xs px-3 py-1.5 rounded-md border shrink-0" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Reject</button>
+              </div>
+            )}
           </div>
         )}
-        {form.status === "Pending Approval" && showRejectBox && (
+        {form.status === "Pending Approval" && showRejectBox && canEdit && (
           <div>
             <div className="text-sm mb-2" style={{ color: "#5B6B66" }}>Reason for rejection:</div>
             <div className="flex items-center gap-2">
@@ -905,7 +913,9 @@ function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
             <div className="text-sm" style={{ color: "#B5443A" }}>
               <strong>Rejected: </strong>{form.rejectionReason || "No reason given."}
             </div>
-            <button onClick={revise} className="text-xs px-3 py-1.5 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Revise & resubmit</button>
+            {canEdit && (
+              <button onClick={revise} className="text-xs px-3 py-1.5 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Revise & resubmit</button>
+            )}
           </div>
         )}
         {form.status === "Active" && (
@@ -919,6 +929,7 @@ function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
         )}
       </div>
 
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
         <Field label="Budget title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. FY26 Operating Budget" />
@@ -1150,16 +1161,19 @@ function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
       <Field label="Notes">
         <textarea className={inputCls} style={inputStyle} rows={2} value={form.notes} onChange={set("notes")} />
       </Field>
+      </fieldset>
 
       <div className="flex justify-end gap-2 mt-4">
         <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-        <button
-          onClick={() => { if (!form.title.trim()) return; onSave(form); }}
-          className="px-4 py-2 rounded-md text-sm text-white"
-          style={{ background: "#1F5C6B" }}
-        >
-          Save budget
-        </button>
+        {canEdit && (
+          <button
+            onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+            className="px-4 py-2 rounded-md text-sm text-white"
+            style={{ background: "#1F5C6B" }}
+          >
+            Save budget
+          </button>
+        )}
       </div>
     </Modal>
   );
@@ -1167,7 +1181,7 @@ function BudgetModal({ budget, grantId, costCenterId, onSave, onClose }) {
 
 // ---------- grant report form ----------
 
-function ReportModal({ report, grants, onSave, onClose, onDelete, onCreateTask }) {
+function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete, onCreateTask }) {
   const [taskCreated, setTaskCreated] = useState(!!report?.linkedTaskCreated);
   const [form, setForm] = useState(report || {
     id: uid(), title: "", grantId: "", assignedTo: "", status: "Not started",
@@ -1189,7 +1203,8 @@ function ReportModal({ report, grants, onSave, onClose, onDelete, onCreateTask }
   const grant = grants.find((g) => g.id === form.grantId);
 
   return (
-    <Modal title={report ? "Edit report" : "New report"} onClose={onClose} wide>
+    <Modal title={report ? (canEdit ? "Edit report" : "View report") : "New report"} onClose={onClose} wide>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="col-span-2">
           <Field label="Report title">
@@ -1302,6 +1317,7 @@ function ReportModal({ report, grants, onSave, onClose, onDelete, onCreateTask }
           <textarea className={inputCls} style={inputStyle} rows={4} value={form.notes} onChange={set("notes")} placeholder="Reporting requirements, citations, submission instructions…" />
         </Field>
       </div>
+      </fieldset>
 
       <div className="flex justify-between gap-2 mt-6">
         {onDelete ? (
@@ -1309,13 +1325,15 @@ function ReportModal({ report, grants, onSave, onClose, onDelete, onCreateTask }
         ) : <span />}
         <div className="flex gap-2">
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button
-            onClick={() => { if (!form.title.trim()) return; onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save report
-          </button>
+          {canEdit && (
+            <button
+              onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+              className="px-4 py-2 rounded-md text-sm text-white"
+              style={{ background: "#1F5C6B" }}
+            >
+              Save report
+            </button>
+          )}
         </div>
       </div>
     </Modal>
@@ -1543,7 +1561,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
   );
 }
 
-function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, autoOpenNew, initialExpandId, goTo, logActivity }) {
+function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, canEdit, autoOpenNew, initialExpandId, goTo, logActivity }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("All");
   const [riskFilter, setRiskFilter] = useState("All");
@@ -1620,9 +1638,11 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Grants</h1>
-        <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-          <Plus size={16} /> New grant
-        </button>
+        {canEdit && (
+          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+            <Plus size={16} /> New grant
+          </button>
+        )}
       </div>
 
       <div className="flex gap-3">
@@ -1734,12 +1754,16 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
                           <ExternalLink size={13} /> Current contract
                         </a>
                       )}
-                      <button onClick={() => setModal(g)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-                        <Pencil size={13} /> Edit grant
-                      </button>
-                      <button onClick={() => setConfirm(g.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
-                        <Trash2 size={13} /> Delete grant
-                      </button>
+                      {canEdit && (
+                        <>
+                          <button onClick={() => setModal(g)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+                            <Pencil size={13} /> Edit grant
+                          </button>
+                          <button onClick={() => setConfirm(g.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
+                            <Trash2 size={13} /> Delete grant
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 )}
@@ -1749,7 +1773,7 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
         </div>
       )}
 
-      {modal && <GrantModal grant={modal === "new" ? null : modal} budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} logActivity={logActivity} onSave={saveGrant} onClose={() => setModal(null)} />}
+      {modal && <GrantModal grant={modal === "new" ? null : modal} budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} logActivity={logActivity} canEdit={canEdit} onSave={saveGrant} onClose={() => setModal(null)} />}
       {confirm && (
         <ConfirmModal
           message="This moves the grant, all of its budgets, invoices, linked grant reports and tasks to Trash, and removes it from any staff allocations. It can be restored from Trash later if needed."
@@ -1761,7 +1785,7 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
   );
 }
 
-function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, setTrash, currentUserEmail, initialOpenBudgetId, logActivity }) {
+function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, setTrash, currentUserEmail, canEdit, initialOpenBudgetId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenBudgetId ? budgets.find((b) => b.id === stripNonce(initialOpenBudgetId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
@@ -1878,7 +1902,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Budgets</h1>
-        {activeSelection && (
+        {activeSelection && canEdit && (
           <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
             <Plus size={16} /> New budget
           </button>
@@ -1918,10 +1942,12 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
               <option value="">Select a cost center</option>
               {costCenters.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
-            <button onClick={() => setCcModal("new")} className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
-              <Plus size={13} /> New
-            </button>
-            {costCenter && (
+            {canEdit && (
+              <button onClick={() => setCcModal("new")} className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+                <Plus size={13} /> New
+              </button>
+            )}
+            {costCenter && canEdit && (
               <button onClick={() => setCcModal(costCenter)} className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
                 <Pencil size={13} /> Edit
               </button>
@@ -1959,9 +1985,9 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                   <div><span style={{ color: "#8A8F87" }}>Expense </span><span style={{ color: "#1C2624" }}>{fmt(t.expense)}</span></div>
                   <div><span style={{ color: "#8A8F87" }}>Net </span><span style={{ color: t.net >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(t.net)}</span></div>
                 </div>
-                <div className="flex gap-2 mt-4">
+                <div className="flex gap-2 mt-4 flex-wrap">
                   <button onClick={() => setModal(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-                    <Pencil size={13} /> Edit budget
+                    <Pencil size={13} /> {canEdit ? "Edit budget" : "View budget"}
                   </button>
                   <button onClick={() => exportCsv(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
                     <Download size={13} /> Export CSV
@@ -1969,12 +1995,16 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                   <button onClick={() => exportXlsx(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
                     <Download size={13} /> Export Excel
                   </button>
-                  <button onClick={() => duplicateBudget(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
-                    <Plus size={13} /> Duplicate to next FY
-                  </button>
-                  <button onClick={() => setConfirm(b.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
-                    <Trash2 size={13} /> Delete
-                  </button>
+                  {canEdit && (
+                    <>
+                      <button onClick={() => duplicateBudget(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+                        <Plus size={13} /> Duplicate to next FY
+                      </button>
+                      <button onClick={() => setConfirm(b.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
+                        <Trash2 size={13} /> Delete
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             );
@@ -1987,6 +2017,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           budget={modal === "new" ? null : modal}
           grantId={budgetMode === "grant" ? selectedGrantId : ""}
           costCenterId={budgetMode === "costCenter" ? selectedCostCenterId : ""}
+          canEdit={canEdit}
           onSave={saveBudget}
           onClose={() => setModal(null)}
         />
@@ -2015,7 +2046,7 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
   return (
     <div className="bg-white rounded-lg border p-3.5" style={{ borderColor: overdue ? "#B5443A" : "#E1E5DE" }}>
       <div className="flex items-start gap-2">
-        <button onClick={onToggleDone} className="mt-0.5 shrink-0">
+        <button onClick={onToggleDone} disabled={!onToggleDone} className="mt-0.5 shrink-0">
           {report.status === "Completed" ? <CheckCircle size={17} style={{ color: "#2F6F53" }} /> : <Circle size={17} style={{ color: "#8A8F87" }} />}
         </button>
         <button onClick={onEdit} className="text-left flex-1">
@@ -2056,8 +2087,9 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
 
       <select
         value={report.bucket}
-        onChange={(e) => onBucketChange(e.target.value)}
+        onChange={(e) => onBucketChange?.(e.target.value)}
         onClick={(e) => e.stopPropagation()}
+        disabled={!onBucketChange}
         className="w-full mt-2.5 rounded border px-2 py-1 text-xs"
         style={inputStyle}
       >
@@ -2067,7 +2099,7 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
   );
 }
 
-function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, setTrash, currentUserEmail, initialOpenReportId, logActivity }) {
+function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, setTrash, currentUserEmail, canEdit, initialOpenReportId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenReportId ? reports.find((r) => r.id === stripNonce(initialOpenReportId)) || null : null));
   const [confirm, setConfirm] = useState(null);
 
@@ -2113,9 +2145,11 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Grant Reports</h1>
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Track reports and deliverables due to funders</p>
         </div>
-        <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-          <Plus size={16} /> New report
-        </button>
+        {canEdit && (
+          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+            <Plus size={16} /> New report
+          </button>
+        )}
       </div>
 
       <Field label="Filter by grant">
@@ -2140,8 +2174,8 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
                       key={r.id}
                       report={r}
                       grant={grants.find((g) => g.id === r.grantId)}
-                      onToggleDone={() => toggleDone(r)}
-                      onBucketChange={(b) => changeBucket(r, b)}
+                      onToggleDone={canEdit ? () => toggleDone(r) : undefined}
+                      onBucketChange={canEdit ? (b) => changeBucket(r, b) : undefined}
                       onEdit={() => setModal(r)}
                     />
                   ))}
@@ -2156,9 +2190,10 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
         <ReportModal
           report={modal === "new" ? null : modal}
           grants={grants}
+          canEdit={canEdit}
           onSave={saveReport}
           onClose={() => setModal(null)}
-          onDelete={modal === "new" ? undefined : () => { setConfirm(modal.id); setModal(null); }}
+          onDelete={modal === "new" || !canEdit ? undefined : () => { setConfirm(modal.id); setModal(null); }}
           onCreateTask={createTaskFromReport}
         />
       )}
@@ -2171,7 +2206,7 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
 
 // ---------- tasks / reminders ----------
 
-function TaskModal({ task, grants, onSave, onClose, onDelete }) {
+function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) {
   const [form, setForm] = useState(task || {
     id: uid(), title: "", category: TASK_CATEGORIES[0], grantId: "", dueDate: "",
     priority: "Medium", status: "Not started", assignedTo: "", notes: "",
@@ -2179,7 +2214,8 @@ function TaskModal({ task, grants, onSave, onClose, onDelete }) {
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal title={task ? "Edit task" : "New task"} onClose={onClose}>
+    <Modal title={task ? (canEdit ? "Edit task" : "View task") : "New task"} onClose={onClose}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
       <div className="space-y-4">
         <Field label="Task title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. Submit LOI to funder" />
@@ -2216,6 +2252,7 @@ function TaskModal({ task, grants, onSave, onClose, onDelete }) {
           <textarea className={inputCls} style={inputStyle} rows={3} value={form.notes} onChange={set("notes")} />
         </Field>
       </div>
+      </fieldset>
 
       <div className="flex justify-between gap-2 mt-6">
         {onDelete ? (
@@ -2223,20 +2260,22 @@ function TaskModal({ task, grants, onSave, onClose, onDelete }) {
         ) : <span />}
         <div className="flex gap-2">
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button
-            onClick={() => { if (!form.title.trim()) return; onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save task
-          </button>
+          {canEdit && (
+            <button
+              onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+              className="px-4 py-2 rounded-md text-sm text-white"
+              style={{ background: "#1F5C6B" }}
+            >
+              Save task
+            </button>
+          )}
         </div>
       </div>
     </Modal>
   );
 }
 
-function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, autoOpenNew, initialOpenTaskId, logActivity }) {
+function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, canEdit, autoOpenNew, initialOpenTaskId, logActivity }) {
   const [modal, setModal] = useState(() => (autoOpenNew ? "new" : initialOpenTaskId ? tasks.find((t) => t.id === stripNonce(initialOpenTaskId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [categoryFilter, setCategoryFilter] = useState("All");
@@ -2281,9 +2320,11 @@ function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, autoOp
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Tasks</h1>
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Deadlines and to-dos beyond funder reports — site visits, renewals, approvals, and more</p>
         </div>
-        <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-          <Plus size={16} /> New task
-        </button>
+        {canEdit && (
+          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+            <Plus size={16} /> New task
+          </button>
+        )}
       </div>
 
       <div className="flex gap-3">
@@ -2309,7 +2350,7 @@ function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, autoOp
             const overdue = taskOverdue(t);
             return (
               <div key={t.id} className="px-4 py-3 flex items-start gap-3">
-                <button onClick={() => toggleDone(t)} className="mt-0.5 shrink-0">
+                <button onClick={() => toggleDone(t)} disabled={!canEdit} className="mt-0.5 shrink-0">
                   {t.status === "Done" ? <CheckCircle size={17} style={{ color: "#2F6F53" }} /> : <Circle size={17} style={{ color: "#8A8F87" }} />}
                 </button>
                 <button onClick={() => setModal(t)} className="flex-1 text-left">
@@ -2341,9 +2382,10 @@ function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, autoOp
         <TaskModal
           task={modal === "new" ? null : modal}
           grants={grants}
+          canEdit={canEdit}
           onSave={saveTask}
           onClose={() => setModal(null)}
-          onDelete={modal === "new" ? undefined : () => { setConfirm(modal.id); setModal(null); }}
+          onDelete={modal === "new" || !canEdit ? undefined : () => { setConfirm(modal.id); setModal(null); }}
         />
       )}
       {confirm && (
@@ -2676,7 +2718,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
   );
 }
 
-function ScenarioEditor({ scenario, grants, costCenters, budgets, onSave, onDelete, onBack }) {
+function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true, onSave, onDelete, onBack }) {
   const [form, setForm] = useState(scenario);
   const [showCompare, setShowCompare] = useState(true);
   const cols = monthColumnsForBudget(form.periodStart);
@@ -2729,12 +2771,17 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, onSave, onDele
           <button onClick={exportXlsx} className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
             <Download size={14} /> Export Excel
           </button>
-          <button onClick={() => onSave(form)} className="px-4 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Save scenario</button>
-          <button onClick={onDelete} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Delete</button>
+          {canEdit && (
+            <>
+              <button onClick={() => onSave(form)} className="px-4 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Save scenario</button>
+              <button onClick={onDelete} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Delete</button>
+            </>
+          )}
         </div>
       </div>
 
       <div className="bg-white rounded-lg border p-5 space-y-4" style={{ borderColor: "#E1E5DE" }}>
+        <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <Field label="Scenario name">
             <input className={inputCls} style={inputStyle} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
@@ -2869,6 +2916,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, onSave, onDele
           <div>Expense: <span style={{ color: "#B5443A", fontWeight: 600 }}>{fmt(totals.expense)}</span></div>
           <div>Net: <span style={{ fontWeight: 600 }}>{fmt(totals.net)}</span></div>
         </div>
+        </fieldset>
       </div>
 
       <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
@@ -2917,7 +2965,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, onSave, onDele
   );
 }
 
-function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, isAdmin, logActivity }) {
+function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, isAdmin, canEdit, logActivity }) {
   const [confirm, setConfirm] = useState(null);
 
   const labelFor = (t) => {
@@ -3005,7 +3053,9 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
                 </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
-                <button onClick={() => restore(t)} className="text-xs px-3 py-1.5 rounded-md text-white" style={{ background: "#1F5C6B" }}>Restore</button>
+                {canEdit && (
+                  <button onClick={() => restore(t)} className="text-xs px-3 py-1.5 rounded-md text-white" style={{ background: "#1F5C6B" }}>Restore</button>
+                )}
                 {isAdmin && (
                   <button onClick={() => setConfirm(t.id)} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Delete forever</button>
                 )}
@@ -3026,7 +3076,7 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
   );
 }
 
-function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, budgetGroups, whoami, setTrash, logActivity }) {
+function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, budgetGroups, whoami, setTrash, canEdit, logActivity }) {
   const [openId, setOpenId] = useState(null);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [confirm, setConfirm] = useState(null);
@@ -3060,8 +3110,9 @@ function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, 
         grants={grants}
         costCenters={costCenters}
         budgets={budgets}
+        canEdit={canEdit}
         onSave={saveScenario}
-        onDelete={() => setConfirm(open.id)}
+        onDelete={canEdit ? () => setConfirm(open.id) : undefined}
         onBack={() => setOpenId(null)}
       />
     );
@@ -3074,9 +3125,11 @@ function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, 
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Scenarios</h1>
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>A sandbox to play with what-if numbers — never touches real budgets or actuals</p>
         </div>
-        <button onClick={() => setWizardOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-          <Plus size={16} /> New scenario
-        </button>
+        {canEdit && (
+          <button onClick={() => setWizardOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+            <Plus size={16} /> New scenario
+          </button>
+        )}
       </div>
 
       {scenarios.length === 0 ? (
@@ -3412,7 +3465,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 
 // ---------- personnel / payroll ----------
 
-function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
+function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClose, onDelete }) {
   const [form, setForm] = useState(staff ? { ...staff, status: staff.status || "Active" } : {
     id: uid(), name: "", position: "", department: "", exempt: "Non-exempt",
     payType: "Salary", annualSalary: 0, hourlyRate: 0, annualHours: ANNUAL_HOURS,
@@ -3428,7 +3481,8 @@ function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
   const allocatedPct = staffAllocatedTotal(form);
 
   return (
-    <Modal title={staff ? "Edit staff member" : "New staff member"} onClose={onClose} wide>
+    <Modal title={staff ? (canEdit ? "Edit staff member" : "View staff member") : "New staff member"} onClose={onClose} wide>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="Last, First" />
@@ -3552,6 +3606,7 @@ function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
           <Plus size={13} /> Add allocation
         </button>
       </div>
+      </fieldset>
 
       <div className="flex justify-between gap-2 mt-6">
         {onDelete ? (
@@ -3559,20 +3614,22 @@ function StaffModal({ staff, grants, costCenters, onSave, onClose, onDelete }) {
         ) : <span />}
         <div className="flex gap-2">
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button
-            onClick={() => { if (!form.name.trim()) return; onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save staff member
-          </button>
+          {canEdit && (
+            <button
+              onClick={() => { if (!form.name.trim()) return; onSave(form); }}
+              className="px-4 py-2 rounded-md text-sm text-white"
+              style={{ background: "#1F5C6B" }}
+            >
+              Save staff member
+            </button>
+          )}
         </div>
       </div>
     </Modal>
   );
 }
 
-function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, initialOpenStaffId, logActivity }) {
+function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
@@ -3619,9 +3676,11 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Personnel & Payroll</h1>
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Staff cost and grant allocation — separate from budget line items</p>
         </div>
-        <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-          <Plus size={16} /> New staff member
-        </button>
+        {canEdit && (
+          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+            <Plus size={16} /> New staff member
+          </button>
+        )}
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -3731,11 +3790,13 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
                 )}
                 <div className="flex gap-2 mt-3">
                   <button onClick={() => setModal(s)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-                    <Pencil size={13} /> Edit
+                    <Pencil size={13} /> {canEdit ? "Edit" : "View"}
                   </button>
-                  <button onClick={() => setConfirm(s.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
-                    <Trash2 size={13} /> Delete
-                  </button>
+                  {canEdit && (
+                    <button onClick={() => setConfirm(s.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
+                      <Trash2 size={13} /> Delete
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -3748,9 +3809,10 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
           staff={modal === "new" ? null : modal}
           grants={grants}
           costCenters={costCenters}
+          canEdit={canEdit}
           onSave={saveStaff}
           onClose={() => setModal(null)}
-          onDelete={modal === "new" ? undefined : () => { setConfirm(modal.id); setModal(null); }}
+          onDelete={modal === "new" || !canEdit ? undefined : () => { setConfirm(modal.id); setModal(null); }}
         />
       )}
       {confirm && (
@@ -3762,7 +3824,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
 
 // ---------- invoicing ----------
 
-function InvoiceModal({ invoice, grants, onSave, onClose, onDelete }) {
+function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDelete }) {
   const grantDefault = grants[0]?.id || "";
   const [form, setForm] = useState(invoice || {
     id: uid(), grantId: grantDefault, invoiceNumber: "", amount: 0,
@@ -3771,7 +3833,8 @@ function InvoiceModal({ invoice, grants, onSave, onClose, onDelete }) {
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal title={invoice ? "Edit invoice" : "New invoice"} onClose={onClose}>
+    <Modal title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
       <div className="space-y-4">
         <Field label="Grant">
           <GrantPicker grants={grants} value={form.grantId} onChange={(v) => setForm({ ...form, grantId: v })} placeholder="Select a grant" />
@@ -3806,6 +3869,7 @@ function InvoiceModal({ invoice, grants, onSave, onClose, onDelete }) {
           <textarea className={inputCls} style={inputStyle} rows={3} value={form.notes} onChange={set("notes")} placeholder="Submission method, contact, follow-up notes…" />
         </Field>
       </div>
+      </fieldset>
 
       <div className="flex justify-between gap-2 mt-6">
         {onDelete ? (
@@ -3813,20 +3877,22 @@ function InvoiceModal({ invoice, grants, onSave, onClose, onDelete }) {
         ) : <span />}
         <div className="flex gap-2">
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button
-            onClick={() => { if (!form.grantId) return; onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save invoice
-          </button>
+          {canEdit && (
+            <button
+              onClick={() => { if (!form.grantId) return; onSave(form); }}
+              className="px-4 py-2 rounded-md text-sm text-white"
+              style={{ background: "#1F5C6B" }}
+            >
+              Save invoice
+            </button>
+          )}
         </div>
       </div>
     </Modal>
   );
 }
 
-function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, initialOpenInvoiceId, logActivity }) {
+function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, canEdit, initialOpenInvoiceId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenInvoiceId ? invoices.find((i) => i.id === stripNonce(initialOpenInvoiceId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [grantFilter, setGrantFilter] = useState("All");
@@ -3886,9 +3952,11 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
           <button onClick={exportCsv} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
             <Download size={15} /> Export CSV
           </button>
-          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-            <Plus size={16} /> New invoice
-          </button>
+          {canEdit && (
+            <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+              <Plus size={16} /> New invoice
+            </button>
+          )}
         </div>
       </div>
 
@@ -3943,9 +4011,11 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{i.paidDate ? fmtDate(i.paidDate) : "—"}</td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: overdue ? "#B5443A" : "#5B6B66" }}>{outstanding !== null ? `${outstanding}d` : "—"}</td>
                     <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      <button onClick={() => setConfirm(i.id)} className="p-1 rounded hover:bg-red-50">
-                        <Trash2 size={14} style={{ color: "#B5443A" }} />
-                      </button>
+                      {canEdit && (
+                        <button onClick={() => setConfirm(i.id)} className="p-1 rounded hover:bg-red-50">
+                          <Trash2 size={14} style={{ color: "#B5443A" }} />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );
@@ -3959,9 +4029,10 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
         <InvoiceModal
           invoice={modal === "new" ? null : modal}
           grants={grants}
+          canEdit={canEdit}
           onSave={saveInvoice}
           onClose={() => setModal(null)}
-          onDelete={modal === "new" ? undefined : () => { setConfirm(modal.id); setModal(null); }}
+          onDelete={modal === "new" || !canEdit ? undefined : () => { setConfirm(modal.id); setModal(null); }}
         />
       )}
       {confirm && (
@@ -4279,7 +4350,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, logActivity }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity }) {
   const [restoreError, setRestoreError] = useState("");
   const [restoreSummary, setRestoreSummary] = useState("");
   const [importError, setImportError] = useState("");
@@ -4655,10 +4726,14 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
           <strong style={{ color: "#B5443A" }}>This replaces all current data</strong> — grants, budgets, reports, staff, tasks, and activity log — with what's in the file. Since data here is shared, this affects everyone.
         </p>
-        <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-          <Upload size={15} /> Choose backup file
-          <input type="file" accept=".json" className="hidden" onChange={handleRestore} />
-        </label>
+        {canEdit ? (
+          <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> Choose backup file
+            <input type="file" accept=".json" className="hidden" onChange={handleRestore} />
+          </label>
+        ) : (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>View-only access — restoring is disabled.</p>
+        )}
         {restoreSummary && <p className="text-sm mt-2" style={{ color: "#2F6F53" }}>{restoreSummary}</p>}
         {restoreError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{restoreError}</p>}
       </div>
@@ -4668,10 +4743,14 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
           Upload a .csv or .xlsx with a header row. Recognized columns: Title (required), Program Code, Funding source, Sites, Stage, Award amount, Start, End, Risk status, Compliance owner, Finance owner, Internal owner, Operations owner, Grant POC, Notes. Anything else is ignored — new grants are added, existing ones aren't touched.
         </p>
-        <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-          <Upload size={15} /> Choose spreadsheet
-          <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportGrants} />
-        </label>
+        {canEdit ? (
+          <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> Choose spreadsheet
+            <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportGrants} />
+          </label>
+        ) : (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>View-only access — importing is disabled.</p>
+        )}
         {importSummary && <p className="text-sm mt-2" style={{ color: "#2F6F53" }}>{importSummary}</p>}
         {importError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{importError}</p>}
       </div>
@@ -4681,10 +4760,14 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
           Upload a .csv or .xlsx with one row per budget line item — the same layout as "Export all as CSV" on the Reporting tab. Columns: <strong>Grant</strong> (must match an existing grant's title or program code exactly), <strong>Budget</strong>, Fiscal Year, Period Start, Period End, Status, <strong>Category</strong> (must match a GrantFlow category), Subcategory, Type, and Jan–Dec. Rows with the same Grant + Budget are grouped into one budget with multiple line items.
         </p>
-        <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-          <Upload size={15} /> Choose spreadsheet
-          <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportBudgets} />
-        </label>
+        {canEdit ? (
+          <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> Choose spreadsheet
+            <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportBudgets} />
+          </label>
+        ) : (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>View-only access — importing is disabled.</p>
+        )}
         {budgetImportSummary && <p className="text-sm mt-2" style={{ color: "#2F6F53" }}>{budgetImportSummary}</p>}
         {budgetImportError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{budgetImportError}</p>}
       </div>
@@ -4694,10 +4777,14 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
           Upload a .csv or .xlsx with one row per report. Columns: <strong>Title</strong> (required), Grant (matches an existing grant's title or program code — left unlinked if it doesn't match), Assigned To, Status, Priority, Start Date, Due Date, Repeat, Repeat Detail, Bucket, Submission Portal URL, Notes. New reports are added; existing ones aren't touched.
         </p>
-        <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-          <Upload size={15} /> Choose spreadsheet
-          <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportReports} />
-        </label>
+        {canEdit ? (
+          <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> Choose spreadsheet
+            <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportReports} />
+          </label>
+        ) : (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>View-only access — importing is disabled.</p>
+        )}
         {reportImportSummary && <p className="text-sm mt-2" style={{ color: "#2F6F53" }}>{reportImportSummary}</p>}
         {reportImportError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{reportImportError}</p>}
       </div>
@@ -4724,8 +4811,14 @@ const NAV = [
   { key: "data", label: "Data & Backup", icon: Upload },
 ];
 
-export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {}) {
+export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disabledModules, onSignOut } = {}) {
+  const canEdit = isAdmin || userRole !== "viewer";
+  const hiddenModules = isAdmin ? [] : (disabledModules || []);
   const [tab, setTab] = useState("dashboard");
+
+  useEffect(() => {
+    if (hiddenModules.includes(tab)) setTab("dashboard");
+  }, [tab, hiddenModules]);
   const [grants, setGrants] = useState([]);
   const [budgets, setBudgets] = useState([]);
   const [reports, setReports] = useState([]);
@@ -5028,7 +5121,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           </button>
         </div>
         <nav className="px-3 space-y-1 overflow-y-auto">
-          {[...NAV, ...(isAdmin ? [{ key: "user-access", label: "User Access", icon: Shield }] : [])].map(({ key, label, icon: Icon }) => (
+          {[...NAV.filter((n) => !hiddenModules.includes(n.key)), ...(isAdmin ? [{ key: "user-access", label: "User Access", icon: Shield }] : [])].map(({ key, label, icon: Icon }) => (
             <button
               key={key}
               onClick={() => { setTab(key); setMobileNavOpen(false); }}
@@ -5089,7 +5182,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             grants={grants} budgets={budgets} reports={reports} tasks={tasks} invoices={invoices} setGrants={setGrants} setBudgets={setBudgets}
             setReports={setReports} setTasks={setTasks} setStaff={setStaff} setInvoices={setInvoices} staff={staff}
             budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
-            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             autoOpenNew={pendingNewGrant} initialExpandId={pendingExpandGrantId} goTo={goTo} logActivity={logActivity}
           />
         ) : tab === "budgets" ? (
@@ -5100,21 +5193,21 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             costCenters={costCenters} setCostCenters={setCostCenters}
             selectedCostCenterId={selectedCostCenterId} setSelectedCostCenterId={setSelectedCostCenterId}
             budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
-            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenBudgetId={pendingOpenBudgetId} logActivity={logActivity}
           />
         ) : tab === "invoicing" ? (
           <InvoicingView
             key={pendingOpenInvoiceId ? `invoices-open-${pendingOpenInvoiceId}` : "invoicing"}
             grants={grants} invoices={invoices} setInvoices={setInvoices}
-            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenInvoiceId={pendingOpenInvoiceId} logActivity={logActivity}
           />
         ) : tab === "tasks" ? (
           <TasksView
             key={pendingNewTask ? "tasks-new" : pendingOpenTaskId ? `tasks-open-${pendingOpenTaskId}` : "tasks"}
             grants={grants} tasks={tasks} setTasks={setTasks}
-            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             autoOpenNew={pendingNewTask} initialOpenTaskId={pendingOpenTaskId} logActivity={logActivity}
           />
         ) : tab === "grant-reports" ? (
@@ -5122,7 +5215,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             key={pendingOpenReportId ? `reports-open-${pendingOpenReportId}` : "grant-reports"}
             grants={grants} reports={reports} setReports={setReports} setTasks={setTasks}
             grantFilter={reportsGrantFilter} setGrantFilter={setReportsGrantFilter}
-            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenReportId={pendingOpenReportId} logActivity={logActivity}
           />
         ) : tab === "org-budget" ? (
@@ -5131,7 +5224,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <ScenariosView
             scenarios={scenarios} setScenarios={setScenarios}
             grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups}
-            whoami={currentUserEmail || whoami} setTrash={setTrash} logActivity={logActivity}
+            whoami={currentUserEmail || whoami} setTrash={setTrash} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "burn-rate" ? (
           <BurnRateView grants={grants} budgets={budgets} />
@@ -5139,7 +5232,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
           <PersonnelView
             key={pendingOpenStaffId ? `staff-open-${pendingOpenStaffId}` : "personnel"}
             grants={grants} staff={staff} setStaff={setStaff} costCenters={costCenters}
-            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami}
+            setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenStaffId={pendingOpenStaffId} logActivity={logActivity}
           />
         ) : tab === "activity-log" ? (
@@ -5149,12 +5242,13 @@ export default function GrantFlow({ currentUserEmail, isAdmin, onSignOut } = {})
             trash={trash} setTrash={setTrash}
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setTasks={setTasks}
             setInvoices={setInvoices} setStaff={setStaff} setCostCenters={setCostCenters} setScenarios={setScenarios}
-            isAdmin={isAdmin} logActivity={logActivity}
+            isAdmin={isAdmin} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "data" ? (
           <DataView
             grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} scenarios={scenarios} trash={trash} activity={activity}
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setTrash={setTrash} setActivity={setActivity}
+            canEdit={canEdit}
             logActivity={logActivity}
           />
         ) : tab === "user-access" && isAdmin ? (
