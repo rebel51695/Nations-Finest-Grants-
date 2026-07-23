@@ -87,7 +87,7 @@ const DEFAULT_BUCKETS = ["Backlog", "Upcoming", "Up next", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.1";
+const APP_VERSION = "1.1.2";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => (Number(n) || 0).toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
@@ -3650,7 +3650,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
       if (sortBy === "department") return (a.department || "").localeCompare(b.department || "") || (a.name || "").localeCompare(b.name || "");
       return (a.name || "").localeCompare(b.name || "");
     });
-  const activeStaff = staff.filter((s) => (s.status || "Active") === "Active");
+  const activeStaff = staff.filter((s) => (s.status || "Active") !== "Inactive");
   const costByGrant = personnelCostByGrant(activeStaff);
   const costByCostCenter = personnelCostByCostCenter(activeStaff);
   const totalPersonnelCost = activeStaff.reduce((a, s) => a + staffAnnualCost(s), 0);
