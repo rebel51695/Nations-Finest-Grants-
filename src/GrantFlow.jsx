@@ -3686,7 +3686,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <StatCard label="Total staff" value={staff.length} />
+        <StatCard label="Total staff" value={activeStaff.length} />
         <StatCard label="Total annual personnel cost" value={fmt(totalPersonnelCost)} />
         <StatCard label="Grants with allocated staff" value={Object.keys(costByGrant).length} />
       </div>
