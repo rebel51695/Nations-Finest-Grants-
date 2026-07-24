@@ -97,7 +97,7 @@ function newLine() {
   const c = CATEGORIES[0];
   return {
     id: uid(), category: c.name, type: c.type, categoryCustom: false,
-    subcategory: "", subcategoryCustom: false,
+    subcategory: "", subcategoryCustom: false, description: "",
     amounts: Array(12).fill(0), actuals: Array(12).fill(0),
   };
 }
@@ -998,6 +998,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             <tr style={{ background: "#F6F7F3" }}>
               <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
               <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
+              <th className="text-left px-2 py-2" style={{ minWidth: 180 }}>Description</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
               {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{col.label}</th>)}
               <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
@@ -1099,6 +1100,15 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                         <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
                       </select>
                     )}
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <input
+                      value={line.description || ""}
+                      onChange={(e) => updateLine(line.id, { description: e.target.value })}
+                      placeholder="Optional note"
+                      className="w-full rounded border px-1.5 py-1 text-xs"
+                      style={inputStyle}
+                    />
                   </td>
                   <td className="px-2 py-1.5">
                     <input
@@ -1866,9 +1876,9 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   };
   const exportCsv = (budget) => {
     const labels = monthColumnsForBudget(budget.periodStart).map((c) => c.label);
-    const rows = [["Category", "Subcategory", "Type", ...labels, "Total"]];
+    const rows = [["Category", "Subcategory", "Description", "Type", ...labels, "Total"]];
     budget.lines.forEach((l) => {
-      rows.push([l.category, l.subcategory, l.type, ...l.amounts, lineTotal(l)]);
+      rows.push([l.category, l.subcategory, l.description || "", l.type, ...l.amounts, lineTotal(l)]);
     });
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     downloadFile("nations-finest-budget-lines.csv", csv, "text/csv");
@@ -1884,15 +1894,15 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       [`${budget.title}${budget.fy ? ` (${budget.fy})` : ""}`],
       [`Period: ${fmtDate(budget.periodStart)} – ${fmtDate(budget.periodEnd)}`, `Status: ${budget.status}`],
       [],
-      ["Category", "Subcategory", "Type", ...labels, "Total"],
-      ...budget.lines.map((l) => [l.category, l.subcategory || "", l.type, ...l.amounts, lineTotal(l)]),
+      ["Category", "Subcategory", "Description", "Type", ...labels, "Total"],
+      ...budget.lines.map((l) => [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts, lineTotal(l)]),
       [],
-      ["Total Revenue", "", "", ...Array(12).fill(""), t.revenue],
-      ["Total Expense", "", "", ...Array(12).fill(""), t.expense],
-      ["Net", "", "", ...Array(12).fill(""), t.net],
+      ["Total Revenue", "", "", "", ...Array(12).fill(""), t.revenue],
+      ["Total Expense", "", "", "", ...Array(12).fill(""), t.expense],
+      ["Net", "", "", "", ...Array(12).fill(""), t.net],
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
+    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Budget");
     const safe = (s) => (s || "budget").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
@@ -2444,10 +2454,10 @@ function ReportingView({ grants, budgets }) {
 
   const exportAllCsv = () => {
     const monthCols = MONTHS.map((_, i) => `Month ${i + 1}`);
-    const rows = [["Grant", "Budget", "Period Start", "Category", "Subcategory", "Type", ...monthCols, "Total"]];
+    const rows = [["Grant", "Budget", "Period Start", "Category", "Subcategory", "Description", "Type", ...monthCols, "Total"]];
     budgets.forEach((b) => {
       const g = grants.find((x) => x.id === b.grantId);
-      b.lines.forEach((l) => rows.push([g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.type, ...l.amounts, lineTotal(l)]));
+      b.lines.forEach((l) => rows.push([g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.description || "", l.type, ...l.amounts, lineTotal(l)]));
     });
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     downloadFile("nations-finest-budget-lines.csv", csv, "text/csv");
@@ -2747,15 +2757,15 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
       [form.title],
       [`Scenario${form.basedOn?.label ? ` — based on ${form.basedOn.label}` : " — started blank"}`],
       [],
-      ["Category", "Subcategory", "Type", ...labels, "Total"],
-      ...form.lines.map((l) => [l.category, l.subcategory || "", l.type, ...l.amounts, lineTotal(l)]),
+      ["Category", "Subcategory", "Description", "Type", ...labels, "Total"],
+      ...form.lines.map((l) => [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts, lineTotal(l)]),
       [],
-      ["Total Revenue", "", "", ...Array(12).fill(""), totals.revenue],
-      ["Total Expense", "", "", ...Array(12).fill(""), totals.expense],
-      ["Net", "", "", ...Array(12).fill(""), totals.net],
+      ["Total Revenue", "", "", "", ...Array(12).fill(""), totals.revenue],
+      ["Total Expense", "", "", "", ...Array(12).fill(""), totals.expense],
+      ["Net", "", "", "", ...Array(12).fill(""), totals.net],
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
+    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Scenario");
     const safe = (s) => (s || "scenario").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
@@ -2808,6 +2818,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
               <tr style={{ background: "#F6F7F3" }}>
                 <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
                 <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
+                <th className="text-left px-2 py-2" style={{ minWidth: 180 }}>Description</th>
                 <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
                 {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{c.label}</th>)}
                 <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
@@ -2872,6 +2883,15 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
                           <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
                         </select>
                       )}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <input
+                        value={line.description || ""}
+                        onChange={(e) => updateLine(line.id, { description: e.target.value })}
+                        placeholder="Optional note"
+                        className="w-full rounded border px-1.5 py-1 text-xs"
+                        style={inputStyle}
+                      />
                     </td>
                     <td className="px-2 py-1.5">
                       <input
