@@ -510,7 +510,7 @@ function GrantPicker({ grants, value, onChange, placeholder = "Select a grant", 
 }
 
 function Modal({ title, onClose, children, wide, size }) {
-  const widthClass = size === "xl" ? "max-w-[1400px]" : wide ? "max-w-4xl" : "max-w-lg";
+  const widthClass = size === "xl" ? "w-[95vw] max-w-[1800px]" : wide ? "max-w-4xl" : "max-w-lg";
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
       <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto`}>
@@ -3210,6 +3210,11 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const [viewMode, setViewMode] = useState("monthly");
   const [dataMode, setDataMode] = useState("plan");
 
+  const deferredRevenueGroupId = useMemo(
+    () => (budgetGroups || []).find((bg) => bg.name?.trim().toLowerCase() === "deferred revenue")?.id || null,
+    [budgetGroups]
+  );
+
   const scopedGrantIds = useMemo(() => {
     if (scope === "all") return null;
     return new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
@@ -3219,8 +3224,20 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
     return new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
   }, [scope, costCenters]);
 
+  // When viewing "Whole Organization," anything tagged into the Deferred
+  // Revenue budget group is deliberately left out of the overall totals —
+  // it's still visible by selecting that group as its own scope.
+  const excludedGrantIds = useMemo(() => {
+    if (scope !== "all" || !deferredRevenueGroupId) return null;
+    return new Set(grants.filter((g) => g.budgetGroupId === deferredRevenueGroupId).map((g) => g.id));
+  }, [scope, deferredRevenueGroupId, grants]);
+  const excludedCcIds = useMemo(() => {
+    if (scope !== "all" || !deferredRevenueGroupId) return null;
+    return new Set((costCenters || []).filter((c) => c.budgetGroupId === deferredRevenueGroupId).map((c) => c.id));
+  }, [scope, deferredRevenueGroupId, costCenters]);
+
   const scopedBudgets = (scope === "all"
-    ? budgets
+    ? budgets.filter((b) => !(b.grantId && excludedGrantIds?.has(b.grantId)) && !(b.costCenterId && excludedCcIds?.has(b.costCenterId)))
     : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
   ).filter((b) => b.status === "Active");
 
@@ -3369,6 +3386,11 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
           </Field>
         )}
       </div>
+      {scope === "all" && deferredRevenueGroupId && (
+        <p className="text-xs" style={{ color: "#8A8F87" }}>
+          Grants and cost centers in the "Deferred Revenue" budget group are excluded from Whole Organization totals — select that group above to view them.
+        </p>
+      )}
 
       <div id="org-budget-print-area">
       {viewMode === "compare" ? (
