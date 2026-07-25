@@ -996,13 +996,13 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         <table className="text-xs w-full" style={{ fontFamily: "var(--mono-font)" }}>
           <thead>
             <tr style={{ background: "#F6F7F3" }}>
-              <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
-              <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
-              <th className="text-left px-2 py-2" style={{ minWidth: 180 }}>Description</th>
-              <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
-              {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{col.label}</th>)}
-              <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
-              <th className="px-2 py-2"></th>
+              <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 190 }}>Category</th>
+              <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
+              <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
+              <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
+              {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 68 }}>{col.label}</th>)}
+              <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
+              <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
             </tr>
           </thead>
           <tbody>
@@ -2816,13 +2816,13 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
           <table className="text-xs w-full" style={{ fontFamily: "var(--mono-font)" }}>
             <thead>
               <tr style={{ background: "#F6F7F3" }}>
-                <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 230 }}>Category</th>
-                <th className="text-left px-2 py-2" style={{ minWidth: 230 }}>Subcategory</th>
-                <th className="text-left px-2 py-2" style={{ minWidth: 180 }}>Description</th>
-                <th className="text-right px-2 py-2" style={{ minWidth: 110 }}>Annual total</th>
-                {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 78 }}>{c.label}</th>)}
-                <th className="text-right px-2 py-2" style={{ minWidth: 90 }}>Total</th>
-                <th className="px-2 py-2"></th>
+                <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 190 }}>Category</th>
+                <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
+                <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
+                <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
+                {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 68 }}>{c.label}</th>)}
+                <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
+                <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
               </tr>
             </thead>
             <tbody>
