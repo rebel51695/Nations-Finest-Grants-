@@ -148,6 +148,25 @@ function grantBudgetTotals(grantId, budgets) {
   }, { revenue: 0, expense: 0 });
 }
 
+// Same idea as grantBudgetTotals, but only counts budgets whose period is
+// currently active (today falls within Period Start–Period End) — avoids
+// stacking multiple budget years together for grants with several budgets.
+function grantCurrentPeriodBudgetTotals(grantId, budgets) {
+  const today = new Date();
+  const mine = budgets.filter((b) => {
+    if (b.grantId !== grantId) return false;
+    if (!b.periodStart || !b.periodEnd) return false;
+    const start = new Date(b.periodStart);
+    const end = new Date(b.periodEnd);
+    return today >= start && today <= end;
+  });
+  return mine.reduce((acc, b) => {
+    const t = budgetTotals(b);
+    acc.revenue += t.revenue; acc.expense += t.expense;
+    return acc;
+  }, { revenue: 0, expense: 0 });
+}
+
 function expenseMonthlyArray(budget) {
   const arr = Array(12).fill(0);
   budget.lines.forEach((l) => { if (l.type === "expense") l.amounts.forEach((a, i) => { arr[i] += Number(a) || 0; }); });
@@ -1360,7 +1379,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
   const activeGrants = grants.filter((g) => g.stage === "Active");
   const totalAward = activeGrants.reduce((a, g) => a + (Number(g.awardAmount) || 0), 0);
   const totalRemaining = activeGrants.reduce((a, g) => {
-    const t = grantBudgetTotals(g.id, budgets);
+    const t = grantCurrentPeriodBudgetTotals(g.id, budgets);
     return a + ((Number(g.awardAmount) || 0) - t.expense);
   }, 0);
   const activeGrantIds = new Set(activeGrants.map((g) => g.id));
@@ -1683,7 +1702,7 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
       ) : (
         <div className="space-y-3">
           {filtered.map((g) => {
-            const totals = grantBudgetTotals(g.id, budgets);
+            const totals = grantCurrentPeriodBudgetTotals(g.id, budgets);
             const remaining = (Number(g.awardAmount) || 0) - totals.expense;
             const isOpen = expanded === g.id;
             const closedWithStaff = g.stage === "Closed" ? (staff || []).filter((s) => (s.allocations || []).some((a) => a.grantId === g.id && Number(a.percent) > 0)) : [];
