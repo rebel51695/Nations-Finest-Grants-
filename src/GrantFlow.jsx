@@ -199,7 +199,12 @@ function budgetBurnInfo(budget) {
 }
 
 function grantBurn(grant, budgets) {
-  const mine = budgets.filter((b) => b.grantId === grant.id);
+  const today = new Date();
+  const mine = budgets.filter((b) => {
+    if (b.grantId !== grant.id) return false;
+    if (!b.periodStart || !b.periodEnd) return false;
+    return today >= new Date(b.periodStart) && today <= new Date(b.periodEnd);
+  });
   let totalExpense = 0, toDate = 0, actualToDate = 0, maxElapsed = 0, elapsedKnown = false;
   mine.forEach((b) => {
     const info = budgetBurnInfo(b);
@@ -529,7 +534,7 @@ function GrantPicker({ grants, value, onChange, placeholder = "Select a grant", 
 }
 
 function Modal({ title, onClose, children, wide, size }) {
-  const widthClass = size === "xl" ? "w-[95vw] max-w-[1800px]" : wide ? "max-w-4xl" : "max-w-lg";
+  const widthClass = size === "xl" ? "w-[97vw] max-w-[2000px]" : wide ? "max-w-4xl" : "max-w-lg";
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
       <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto`}>
@@ -1019,7 +1024,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
               <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
               <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
-              {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 68 }}>{col.label}</th>)}
+              {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 88 }}>{col.label}</th>)}
               <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
               <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
             </tr>
@@ -2839,7 +2844,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
                 <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
                 <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
                 <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
-                {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 68 }}>{c.label}</th>)}
+                {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 88 }}>{c.label}</th>)}
                 <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
                 <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
               </tr>
@@ -4135,7 +4140,7 @@ function BurnRateView({ grants, budgets }) {
               <tr style={{ background: "#F6F7F3" }}>
                 <th className="text-left px-3 py-2 text-xs" style={{ minWidth: 200 }}>Grant</th>
                 <th className="text-right px-3 py-2 text-xs">Award</th>
-                <th className="text-right px-3 py-2 text-xs">Budgeted (full term)</th>
+                <th className="text-right px-3 py-2 text-xs">Budgeted (current period)</th>
                 <th className="text-right px-3 py-2 text-xs">Planned to date</th>
                 <th className="text-right px-3 py-2 text-xs">Actual to date</th>
                 <th className="text-right px-3 py-2 text-xs">Variance</th>
