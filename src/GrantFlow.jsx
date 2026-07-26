@@ -5,7 +5,7 @@ import * as XLSX from "xlsx";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
   ExternalLink, Download, Search, ArrowRight, AlertCircle, CheckCircle2,
-  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical,
+  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical, Undo2,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
 import {
@@ -137,6 +137,47 @@ function budgetActualTotals(budget) {
     (line.actuals || []).forEach((a, i) => { monthly[i] += (line.type === "revenue" ? 1 : -1) * (Number(a) || 0); });
   }
   return { revenue, expense, net: revenue - expense, monthly };
+}
+
+// A drop-in replacement for useState that keeps a short undo history.
+// Rapid changes (typing, dragging a slider) get grouped into one undo step
+// after a brief pause, so "Undo" steps back through meaningful edits rather
+// than one keystroke at a time. This is purely in-memory and local to the
+// open card — it has no effect on saved data until the user clicks Save.
+function useUndoableState(initialValue) {
+  const [history, setHistory] = useState([initialValue]);
+  const [index, setIndex] = useState(0);
+  const groupingRef = useRef(false);
+  const timerRef = useRef(null);
+
+  const current = history[index];
+
+  const setValue = (updater) => {
+    const base = history[index];
+    const next = typeof updater === "function" ? updater(base) : updater;
+
+    if (groupingRef.current) {
+      // Still within the grouping window — replace this step instead of
+      // creating a new one, so continuous typing counts as one undo step.
+      setHistory((h) => {
+        const copy = h.slice(0, index + 1);
+        copy[index] = next;
+        return copy;
+      });
+    } else {
+      groupingRef.current = true;
+      setHistory((h) => [...h.slice(0, index + 1), next]);
+      setIndex((i) => i + 1);
+    }
+
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => { groupingRef.current = false; }, 800);
+  };
+
+  const undo = () => setIndex((i) => Math.max(0, i - 1));
+  const canUndo = index > 0;
+
+  return [current, setValue, undo, canUndo];
 }
 
 function grantBudgetTotals(grantId, budgets) {
@@ -652,7 +693,7 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivit
 }
 
 function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit = true, onSave, onClose }) {
-  const [form, setForm] = useState(grant || {
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(grant || {
     id: uid(), title: "", programCode: "", funding: "", sites: [], stage: "Prospecting",
     awardAmount: 0, start: "", end: "", riskStatus: "Low", cadence: [],
     complianceOwner: "", financeOwner: "", internalOwner: "", operationsOwner: "", renewal: false,
@@ -808,6 +849,11 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
       </div>
       </fieldset>
       <div className="flex justify-end gap-2 mt-6">
+        {canEdit && canUndoForm && (
+          <button onClick={undoForm} className="px-3 py-2 rounded-md text-sm border inline-flex items-center gap-1.5 mr-auto" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Undo2 size={14} /> Undo
+          </button>
+        )}
         <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
         {canEdit && (
           <button
@@ -827,7 +873,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 // ---------- budget form ----------
 
 function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose }) {
-  const [form, setForm] = useState(budget || {
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(budget || {
     id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
     status: "Draft", notes: "", lines: [newLine()],
     approvedBy: "", approvedAt: "", rejectionReason: "",
@@ -1200,6 +1246,11 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       </fieldset>
 
       <div className="flex justify-end gap-2 mt-4">
+        {canEdit && canUndoForm && (
+          <button onClick={undoForm} className="px-3 py-2 rounded-md text-sm border inline-flex items-center gap-1.5 mr-auto" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Undo2 size={14} /> Undo
+          </button>
+        )}
         <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
         {canEdit && (
           <button
@@ -1219,7 +1270,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
 
 function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete, onCreateTask }) {
   const [taskCreated, setTaskCreated] = useState(!!report?.linkedTaskCreated);
-  const [form, setForm] = useState(report || {
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(report || {
     id: uid(), title: "", grantId: "", assignedTo: "", status: "Not started",
     priority: "Medium", startDate: "", dueDate: "", repeat: "None", repeatDetail: "",
     bucket: DEFAULT_BUCKETS[0], checklist: [], notes: "", portalUrl: "", linkedTaskCreated: false,
@@ -1360,6 +1411,11 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete report</button>
         ) : <span />}
         <div className="flex gap-2">
+          {canEdit && canUndoForm && (
+            <button onClick={undoForm} className="px-3 py-2 rounded-md text-sm border inline-flex items-center gap-1.5" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Undo2 size={14} /> Undo
+            </button>
+          )}
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
@@ -2243,7 +2299,7 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
 // ---------- tasks / reminders ----------
 
 function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) {
-  const [form, setForm] = useState(task || {
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(task || {
     id: uid(), title: "", category: TASK_CATEGORIES[0], grantId: "", dueDate: "",
     priority: "Medium", status: "Not started", assignedTo: "", notes: "",
   });
@@ -2295,6 +2351,11 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete task</button>
         ) : <span />}
         <div className="flex gap-2">
+          {canEdit && canUndoForm && (
+            <button onClick={undoForm} className="px-3 py-2 rounded-md text-sm border inline-flex items-center gap-1.5" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Undo2 size={14} /> Undo
+            </button>
+          )}
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
@@ -2755,7 +2816,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
 }
 
 function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true, onSave, onDelete, onBack }) {
-  const [form, setForm] = useState(scenario);
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(scenario);
   const [showCompare, setShowCompare] = useState(true);
   const cols = monthColumnsForBudget(form.periodStart);
 
@@ -2804,6 +2865,11 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
           <ArrowRight size={14} style={{ transform: "rotate(180deg)" }} /> Back to scenarios
         </button>
         <div className="flex items-center gap-2">
+          {canEdit && canUndoForm && (
+            <button onClick={undoForm} className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Undo2 size={14} /> Undo
+            </button>
+          )}
           <button onClick={exportXlsx} className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
             <Download size={14} /> Export Excel
           </button>
@@ -3534,7 +3600,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 // ---------- personnel / payroll ----------
 
 function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClose, onDelete }) {
-  const [form, setForm] = useState(staff ? { ...staff, status: staff.status || "Active" } : {
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(staff ? { ...staff, status: staff.status || "Active" } : {
     id: uid(), name: "", position: "", department: "", exempt: "Non-exempt",
     payType: "Salary", annualSalary: 0, hourlyRate: 0, annualHours: ANNUAL_HOURS,
     fte: 1, allocations: [], site: "", status: "Active",
@@ -3681,6 +3747,11 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete staff member</button>
         ) : <span />}
         <div className="flex gap-2">
+          {canEdit && canUndoForm && (
+            <button onClick={undoForm} className="px-3 py-2 rounded-md text-sm border inline-flex items-center gap-1.5" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Undo2 size={14} /> Undo
+            </button>
+          )}
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
@@ -3894,7 +3965,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
 
 function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDelete }) {
   const grantDefault = grants[0]?.id || "";
-  const [form, setForm] = useState(invoice || {
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(invoice || {
     id: uid(), grantId: grantDefault, invoiceNumber: "", amount: 0,
     submittedDate: "", dueDate: "", paidDate: "", status: "Draft", notes: "",
   });
@@ -3944,6 +4015,11 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete invoice</button>
         ) : <span />}
         <div className="flex gap-2">
+          {canEdit && canUndoForm && (
+            <button onClick={undoForm} className="px-3 py-2 rounded-md text-sm border inline-flex items-center gap-1.5" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Undo2 size={14} /> Undo
+            </button>
+          )}
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
