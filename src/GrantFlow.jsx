@@ -21,14 +21,24 @@ const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov
 // calendar month/year each of the budget's 12 monthly slots actually falls on.
 // This lets a budget's columns be labeled correctly (e.g. "Oct 2025" instead of
 // always assuming "Jan") for grants that don't run on the calendar year.
-function monthColumnsForBudget(periodStart) {
+function monthColumnsForBudget(periodStart, periodEnd) {
   let startYear, startMonth; // startMonth is 0-indexed
   if (periodStart) {
     const d = new Date(periodStart + "T00:00:00");
     if (!isNaN(d)) { startYear = d.getFullYear(); startMonth = d.getMonth(); }
   }
   if (startYear === undefined) { startYear = new Date().getFullYear(); startMonth = 0; }
-  return Array.from({ length: 12 }, (_, i) => {
+
+  let count = 12; // default when there's no period end to measure against yet
+  if (periodEnd) {
+    const endD = new Date(periodEnd + "T00:00:00");
+    if (!isNaN(endD)) {
+      const diff = (endD.getFullYear() - startYear) * 12 + (endD.getMonth() - startMonth) + 1;
+      if (diff > 0) count = diff;
+    }
+  }
+
+  return Array.from({ length: count }, (_, i) => {
     const totalMonth = startMonth + i;
     const year = startYear + Math.floor(totalMonth / 12);
     const monthIndex = ((totalMonth % 12) + 12) % 12;
@@ -93,12 +103,12 @@ const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => (Number(n) || 0).toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 const fmtDate = (d) => (d ? new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—");
 
-function newLine() {
+function newLine(monthCount = 12) {
   const c = CATEGORIES[0];
   return {
     id: uid(), category: c.name, type: c.type, categoryCustom: false,
     subcategory: "", subcategoryCustom: false, description: "",
-    amounts: Array(12).fill(0), actuals: Array(12).fill(0),
+    amounts: Array(monthCount).fill(0), actuals: Array(monthCount).fill(0),
   };
 }
 
@@ -110,11 +120,18 @@ function lineActualTotal(line) {
   return (line.actuals || []).reduce((a, b) => a + (Number(b) || 0), 0);
 }
 
-function distributeEvenly(total) {
+function resizeMonthlyArray(arr, newLength) {
+  const a = arr || [];
+  if (a.length === newLength) return a;
+  if (a.length > newLength) return a.slice(0, newLength);
+  return [...a, ...Array(newLength - a.length).fill(0)];
+}
+
+function distributeEvenly(total, count = 12) {
   const cents = Math.round((Number(total) || 0) * 100);
-  const base = Math.floor(cents / 12);
-  const remainder = cents - base * 12;
-  return Array.from({ length: 12 }, (_, i) => (base + (i < remainder ? 1 : 0)) / 100);
+  const base = Math.floor(cents / count);
+  const remainder = cents - base * count;
+  return Array.from({ length: count }, (_, i) => (base + (i < remainder ? 1 : 0)) / 100);
 }
 
 function budgetTotals(budget) {
@@ -882,6 +899,20 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectBox, setShowRejectBox] = useState(false);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const cols = monthColumnsForBudget(form.periodStart, form.periodEnd);
+
+  useEffect(() => {
+    const needsResize = form.lines.some((l) => (l.amounts?.length || 0) !== cols.length || (l.actuals?.length || 0) !== cols.length);
+    if (!needsResize) return;
+    setForm((f) => ({
+      ...f,
+      lines: f.lines.map((l) => ({
+        ...l,
+        amounts: resizeMonthlyArray(l.amounts, cols.length),
+        actuals: resizeMonthlyArray(l.actuals, cols.length),
+      })),
+    }));
+  }, [cols.length]);
 
   const updateLine = (id, patch) => {
     setForm({ ...form, lines: form.lines.map((l) => (l.id === id ? { ...l, ...patch } : l)) });
@@ -891,13 +922,13 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       ...form,
       lines: form.lines.map((l) => {
         if (l.id !== id) return l;
-        const arr = [...(l[field] || Array(12).fill(0))];
+        const arr = [...(l[field] || Array(cols.length).fill(0))];
         arr[idx] = val === "" ? 0 : Number(val);
         return { ...l, [field]: arr };
       }),
     });
   };
-  const addLine = () => setForm({ ...form, lines: [...form.lines, newLine()] });
+  const addLine = () => setForm({ ...form, lines: [...form.lines, newLine(cols.length)] });
   const deleteLine = (id) => setForm({ ...form, lines: form.lines.filter((l) => l.id !== id) });
   const [lineSort, setLineSort] = useState("none");
   const [yearlyDraft, setYearlyDraft] = useState({});
@@ -907,7 +938,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   const applyYearlyTotal = (id) => {
     const val = yearlyDraft[id];
     if (val === undefined || val === "") return;
-    updateLine(id, { [field]: distributeEvenly(val) });
+    updateLine(id, { [field]: distributeEvenly(val, cols.length) });
   };
 
   const submitForApproval = () => setForm({ ...form, status: "Pending Approval", rejectionReason: "" });
@@ -1070,7 +1101,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
               <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
               <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
-              {monthColumnsForBudget(form.periodStart).map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 88 }}>{col.label}</th>)}
+              {cols.map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 88 }}>{col.label}</th>)}
               <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
               <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
             </tr>
@@ -1882,6 +1913,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [confirm, setConfirm] = useState(null);
   const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
   const [budgetMode, setBudgetMode] = useState("grant"); // grant | costCenter
+  const [duplicatePrompt, setDuplicatePrompt] = useState(null); // the budget being duplicated, or null
 
   const grant = grants.find((g) => g.id === selectedGrantId);
   const costCenter = costCenters.find((c) => c.id === selectedCostCenterId);
@@ -1937,7 +1969,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     d.setFullYear(d.getFullYear() + 1);
     return d.toISOString().slice(0, 10);
   };
-  const duplicateBudget = (budget) => {
+  const duplicateBudget = (budget, carryOverAmounts) => {
     const newBudget = {
       ...budget,
       id: uid(),
@@ -1947,15 +1979,18 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       status: "Draft",
       approvedBy: "", approvedAt: "", rejectionReason: "",
       lines: budget.lines.map((l) => ({
-        ...l, id: uid(), amounts: Array(12).fill(0), actuals: Array(12).fill(0),
+        ...l, id: uid(),
+        amounts: carryOverAmounts ? [...l.amounts] : Array(l.amounts.length).fill(0),
+        actuals: Array(l.amounts.length).fill(0),
       })),
     };
     setBudgets((prev) => [...prev, newBudget]);
-    logActivity?.("Budget", "Created", `${newBudget.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""} — rolled over from ${budget.fy || "prior year"}`);
+    logActivity?.("Budget", "Created", `${newBudget.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""} — rolled over from ${budget.fy || "prior year"}${carryOverAmounts ? " (carried over amounts)" : ""}`);
     setModal(newBudget);
+    setDuplicatePrompt(null);
   };
   const exportCsv = (budget) => {
-    const labels = monthColumnsForBudget(budget.periodStart).map((c) => c.label);
+    const labels = monthColumnsForBudget(budget.periodStart, budget.periodEnd).map((c) => c.label);
     const rows = [["Category", "Subcategory", "Description", "Type", ...labels, "Total"]];
     budget.lines.forEach((l) => {
       rows.push([l.category, l.subcategory, l.description || "", l.type, ...l.amounts, lineTotal(l)]);
@@ -1968,7 +2003,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     const cc = costCenters.find((x) => x.id === budget.costCenterId);
     const label = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Budget";
     const t = budgetTotals(budget);
-    const labels = monthColumnsForBudget(budget.periodStart).map((c) => c.label);
+    const cols = monthColumnsForBudget(budget.periodStart, budget.periodEnd);
+    const labels = cols.map((c) => c.label);
     const rows = [
       [label],
       [`${budget.title}${budget.fy ? ` (${budget.fy})` : ""}`],
@@ -1977,12 +2013,12 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       ["Category", "Subcategory", "Description", "Type", ...labels, "Total"],
       ...budget.lines.map((l) => [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts, lineTotal(l)]),
       [],
-      ["Total Revenue", "", "", "", ...Array(12).fill(""), t.revenue],
-      ["Total Expense", "", "", "", ...Array(12).fill(""), t.expense],
-      ["Net", "", "", "", ...Array(12).fill(""), t.net],
+      ["Total Revenue", "", "", "", ...Array(cols.length).fill(""), t.revenue],
+      ["Total Expense", "", "", "", ...Array(cols.length).fill(""), t.expense],
+      ["Net", "", "", "", ...Array(cols.length).fill(""), t.net],
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
+    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...cols.map(() => ({ wch: 12 })), { wch: 14 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Budget");
     const safe = (s) => (s || "budget").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
@@ -2089,7 +2125,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                   </button>
                   {canEdit && (
                     <>
-                      <button onClick={() => duplicateBudget(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+                      <button onClick={() => setDuplicatePrompt(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
                         <Plus size={13} /> Duplicate to next FY
                       </button>
                       <button onClick={() => setConfirm(b.id)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>
@@ -2127,6 +2163,29 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           onClose={() => setCcModal(null)}
           onDelete={ccModal === "new" ? undefined : () => deleteCostCenter(ccModal.id)}
         />
+      )}
+      {duplicatePrompt && (
+        <Modal title="Duplicate to next FY" onClose={() => setDuplicatePrompt(null)}>
+          <p className="text-sm mb-4" style={{ color: "#5B6B66" }}>
+            Should the new budget start with last year's numbers already filled in, or start blank so you can build it fresh?
+          </p>
+          <div className="flex flex-col gap-2">
+            <button
+              onClick={() => duplicateBudget(duplicatePrompt, true)}
+              className="px-4 py-3 rounded-md text-sm text-white text-left"
+              style={{ background: "#1F5C6B" }}
+            >
+              Carry over this year's numbers as a starting point
+            </button>
+            <button
+              onClick={() => duplicateBudget(duplicatePrompt, false)}
+              className="px-4 py-3 rounded-md text-sm border text-left"
+              style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+            >
+              Start blank
+            </button>
+          </div>
+        </Modal>
       )}
     </div>
   );
@@ -2538,11 +2597,15 @@ function ReportingView({ grants, budgets }) {
   }, { revenue: 0, expense: 0 });
 
   const exportAllCsv = () => {
-    const monthCols = MONTHS.map((_, i) => `Month ${i + 1}`);
+    const maxMonths = budgets.reduce((max, b) => Math.max(max, ...b.lines.map((l) => (l.amounts || []).length), 12), 12);
+    const monthCols = Array.from({ length: maxMonths }, (_, i) => `Month ${i + 1}`);
     const rows = [["Grant", "Budget", "Period Start", "Category", "Subcategory", "Description", "Type", ...monthCols, "Total"]];
     budgets.forEach((b) => {
       const g = grants.find((x) => x.id === b.grantId);
-      b.lines.forEach((l) => rows.push([g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.description || "", l.type, ...l.amounts, lineTotal(l)]));
+      b.lines.forEach((l) => {
+        const padded = resizeMonthlyArray(l.amounts, maxMonths);
+        rows.push([g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.description || "", l.type, ...padded, lineTotal(l)]);
+      });
     });
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     downloadFile("nations-finest-budget-lines.csv", csv, "text/csv");
@@ -2818,14 +2881,26 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
 function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true, onSave, onDelete, onBack }) {
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(scenario);
   const [showCompare, setShowCompare] = useState(true);
-  const cols = monthColumnsForBudget(form.periodStart);
+  const cols = monthColumnsForBudget(form.periodStart, form.periodEnd);
+
+  useEffect(() => {
+    const needsResize = form.lines.some((l) => (l.amounts?.length || 0) !== cols.length);
+    if (!needsResize) return;
+    setForm((f) => ({
+      ...f,
+      lines: f.lines.map((l) => ({
+        ...l,
+        amounts: resizeMonthlyArray(l.amounts, cols.length),
+      })),
+    }));
+  }, [cols.length]);
 
   const updateLine = (id, patch) => setForm((f) => ({ ...f, lines: f.lines.map((l) => (l.id === id ? { ...l, ...patch } : l)) }));
-  const addLine = () => setForm((f) => ({ ...f, lines: [...f.lines, newLine()] }));
+  const addLine = () => setForm((f) => ({ ...f, lines: [...f.lines, newLine(cols.length)] }));
   const removeLine = (id) => setForm((f) => ({ ...f, lines: f.lines.filter((l) => l.id !== id) }));
   const setAnnual = (id, val) => {
-    const per = Math.round((Number(val) || 0) / 12 * 100) / 100;
-    updateLine(id, { amounts: Array(12).fill(per) });
+    const per = Math.round((Number(val) || 0) / cols.length * 100) / 100;
+    updateLine(id, { amounts: Array(cols.length).fill(per) });
   };
 
   const totals = useMemo(() => {
@@ -2845,12 +2920,12 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
       ["Category", "Subcategory", "Description", "Type", ...labels, "Total"],
       ...form.lines.map((l) => [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts, lineTotal(l)]),
       [],
-      ["Total Revenue", "", "", "", ...Array(12).fill(""), totals.revenue],
-      ["Total Expense", "", "", "", ...Array(12).fill(""), totals.expense],
-      ["Net", "", "", "", ...Array(12).fill(""), totals.net],
+      ["Total Revenue", "", "", "", ...Array(cols.length).fill(""), totals.revenue],
+      ["Total Expense", "", "", "", ...Array(cols.length).fill(""), totals.expense],
+      ["Net", "", "", "", ...Array(cols.length).fill(""), totals.net],
     ];
     const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...MONTHS.map(() => ({ wch: 12 })), { wch: 14 }];
+    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...cols.map(() => ({ wch: 12 })), { wch: 14 }];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Scenario");
     const safe = (s) => (s || "scenario").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
