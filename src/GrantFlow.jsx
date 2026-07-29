@@ -3967,7 +3967,7 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
   const grantDefault = grants[0]?.id || "";
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(invoice || {
     id: uid(), grantId: grantDefault, invoiceNumber: "", amount: 0,
-    submittedDate: "", dueDate: "", paidDate: "", status: "Draft", notes: "",
+    submittedDate: "", dueDate: "", paidDate: "", status: "Draft", notes: "", supportingDocsUrl: "",
   });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
@@ -4006,6 +4006,20 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
         </div>
         <Field label="Notes">
           <textarea className={inputCls} style={inputStyle} rows={3} value={form.notes} onChange={set("notes")} placeholder="Submission method, contact, follow-up notes…" />
+        </Field>
+        <Field label="Supporting documents (SharePoint folder URL)">
+          <div className="flex items-center gap-2">
+            <input className={inputCls} style={inputStyle} value={form.supportingDocsUrl || ""} onChange={set("supportingDocsUrl")} placeholder="https://…" />
+            {form.supportingDocsUrl && (
+              <a
+                href={form.supportingDocsUrl} target="_blank" rel="noreferrer"
+                className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0"
+                style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
+              >
+                <ExternalLink size={13} /> Supporting Documents
+              </a>
+            )}
+          </div>
         </Field>
       </div>
       </fieldset>
@@ -4155,11 +4169,18 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{i.paidDate ? fmtDate(i.paidDate) : "—"}</td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: overdue ? "#B5443A" : "#5B6B66" }}>{outstanding !== null ? `${outstanding}d` : "—"}</td>
                     <td className="px-3 py-2 text-center" onClick={(e) => e.stopPropagation()}>
-                      {canEdit && (
-                        <button onClick={() => setConfirm(i.id)} className="p-1 rounded hover:bg-red-50">
-                          <Trash2 size={14} style={{ color: "#B5443A" }} />
-                        </button>
-                      )}
+                      <div className="flex items-center justify-center gap-1">
+                        {i.supportingDocsUrl && (
+                          <a href={i.supportingDocsUrl} target="_blank" rel="noreferrer" className="p-1 rounded hover:bg-stone-100" title="Supporting Documents">
+                            <ExternalLink size={14} style={{ color: "#1F5C6B" }} />
+                          </a>
+                        )}
+                        {canEdit && (
+                          <button onClick={() => setConfirm(i.id)} className="p-1 rounded hover:bg-red-50">
+                            <Trash2 size={14} style={{ color: "#B5443A" }} />
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 );
@@ -4501,6 +4522,8 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [importSummary, setImportSummary] = useState("");
   const [budgetImportError, setBudgetImportError] = useState("");
   const [budgetImportSummary, setBudgetImportSummary] = useState("");
+  const [actualsImportError, setActualsImportError] = useState("");
+  const [actualsImportSummary, setActualsImportSummary] = useState("");
   const [reportImportError, setReportImportError] = useState("");
   const [reportImportSummary, setReportImportSummary] = useState("");
 
@@ -4724,6 +4747,83 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
     e.target.value = "";
   };
 
+  const handleImportActuals = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setActualsImportError(""); setActualsImportSummary("");
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const wb = XLSX.read(reader.result, { type: "binary", cellDates: true });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" }).map(trimRowKeys);
+        if (rows.length === 0) throw new Error("No rows found");
+
+        const findGrant = (name) => {
+          const n = String(name || "").trim().toLowerCase();
+          if (!n) return null;
+          return grants.find((g) => g.title.toLowerCase() === n || (g.programCode && g.programCode.toLowerCase() === n))
+            || grants.find((g) => (g.programCode ? `${g.programCode} - ${g.title}` : g.title).toLowerCase() === n);
+        };
+
+        // Work on a deep-enough copy so multiple rows can update the same budget.
+        const updated = {}; // budgetId -> working copy of that budget
+        let rowsApplied = 0, linesUpdated = 0, linesCreated = 0, skippedNoGrant = 0, skippedNoBudget = 0, skippedNoCategory = 0;
+
+        rows.forEach((row) => {
+          const grant = findGrant(getField(row, "Grant", "grant"));
+          if (!grant) { skippedNoGrant++; return; }
+          const budgetTitle = String(getField(row, "Budget", "Budget Title", "budget") || "").trim().toLowerCase();
+          const category = String(getField(row, "Category", "category")).trim();
+          if (!category) { skippedNoCategory++; return; }
+          const subcategory = String(getField(row, "Subcategory", "subcategory")).trim();
+
+          const targetBudget = budgets.find((b) => b.grantId === grant.id && b.title.trim().toLowerCase() === budgetTitle);
+          if (!targetBudget) { skippedNoBudget++; return; }
+
+          if (!updated[targetBudget.id]) {
+            updated[targetBudget.id] = { ...targetBudget, lines: targetBudget.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(12).fill(0))] })) };
+          }
+          const workingBudget = updated[targetBudget.id];
+          const catDef = CATEGORIES.find((c) => c.name.toLowerCase() === category.toLowerCase());
+          const actuals = MONTHS.map((m) => Number(row[m] || 0) || 0);
+
+          const existingLine = workingBudget.lines.find((l) =>
+            l.category.trim().toLowerCase() === category.toLowerCase() && (l.subcategory || "").trim().toLowerCase() === subcategory.toLowerCase()
+          );
+          if (existingLine) {
+            existingLine.actuals = actuals;
+            linesUpdated++;
+          } else {
+            workingBudget.lines.push({
+              id: uid(),
+              category: catDef ? catDef.name : category,
+              type: catDef ? catDef.type : (String(getField(row, "Type", "type") || "expense").toLowerCase() === "revenue" ? "revenue" : "expense"),
+              subcategory, categoryCustom: !catDef, subcategoryCustom: !!subcategory,
+              amounts: Array(12).fill(0), actuals,
+            });
+            linesCreated++;
+          }
+          rowsApplied++;
+        });
+
+        const changedBudgets = Object.values(updated);
+        if (changedBudgets.length === 0) throw new Error("No rows matched an existing grant and budget");
+        setBudgets((prev) => prev.map((b) => updated[b.id] || b));
+        logActivity?.("Data", "Imported", `Imported actuals into ${changedBudgets.length} budget(s) from "${file.name}"`);
+        const skippedTotal = skippedNoGrant + skippedNoBudget + skippedNoCategory;
+        setActualsImportSummary(
+          `Updated ${changedBudgets.length} budget${changedBudgets.length > 1 ? "s" : ""} — ${linesUpdated} line${linesUpdated === 1 ? "" : "s"} updated, ${linesCreated} new line${linesCreated === 1 ? "" : "s"} added.` +
+          (skippedTotal > 0 ? ` Skipped ${skippedTotal} row${skippedTotal > 1 ? "s" : ""} (${skippedNoGrant} no matching grant, ${skippedNoBudget} no matching budget title, ${skippedNoCategory} missing category).` : "")
+        );
+      } catch (err) {
+        setActualsImportError("Couldn't read that file, or no rows matched an existing grant + budget. The Grant and Budget columns must exactly match an existing grant and an existing budget already created for it.");
+      }
+    };
+    reader.readAsBinaryString(file);
+    e.target.value = "";
+  };
+
   const handleImportReports = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -4914,6 +5014,23 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         )}
         {budgetImportSummary && <p className="text-sm mt-2" style={{ color: "#2F6F53" }}>{budgetImportSummary}</p>}
         {budgetImportError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{budgetImportError}</p>}
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <h2 className="font-display text-base mb-1" style={{ color: "#1C2624" }}>Bulk import budget actuals</h2>
+        <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
+          Updates the <strong>Actual</strong> figures on budgets that already exist — it never creates a new budget. Upload a .csv or .xlsx with one row per account: <strong>Grant</strong> (must match an existing grant's title or program code), <strong>Budget</strong> (must exactly match an existing budget's title already created for that grant), <strong>Category</strong>, Subcategory, Type, and Jan–Dec (actual dollar amounts). If a matching line item already exists in that budget, its Actuals are updated; if not, a new line is added with $0 Plan and the given Actuals.
+        </p>
+        {canEdit ? (
+          <label className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> Choose spreadsheet
+            <input type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportActuals} />
+          </label>
+        ) : (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>View-only access — importing is disabled.</p>
+        )}
+        {actualsImportSummary && <p className="text-sm mt-2" style={{ color: "#2F6F53" }}>{actualsImportSummary}</p>}
+        {actualsImportError && <p className="text-sm mt-2" style={{ color: "#B5443A" }}>{actualsImportError}</p>}
       </div>
 
       <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
