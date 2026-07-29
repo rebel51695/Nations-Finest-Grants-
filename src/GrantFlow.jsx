@@ -120,6 +120,16 @@ function lineActualTotal(line) {
   return (line.actuals || []).reduce((a, b) => a + (Number(b) || 0), 0);
 }
 
+function varianceInfo(plan, actual) {
+  const p = Number(plan) || 0;
+  const a = Number(actual) || 0;
+  if (p === 0 && a === 0) return { label: "—", color: "#8A8F87" };
+  if (p === 0) return { label: "New", color: "#B5443A" };
+  const pct = ((a - p) / Math.abs(p)) * 100;
+  const sign = pct >= 0 ? "+" : "";
+  return { label: `${sign}${Math.round(pct)}%`, color: pct >= 0 ? "#2F6F53" : "#B5443A" };
+}
+
 function resizeMonthlyArray(arr, newLength) {
   const a = arr || [];
   if (a.length === newLength) return a;
@@ -1101,14 +1111,20 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
               <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
               <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
               <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
-              {cols.map((col, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 88 }}>{col.label}</th>)}
+              {cols.map((col, i) => (
+                <Fragment key={i}>
+                  <th className="text-right px-2 py-2" style={{ minWidth: 88 }}>{col.label}</th>
+                  {mode === "actual" && <th className="text-right px-2 py-2" style={{ minWidth: 60, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
+                </Fragment>
+              ))}
               <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
+              {mode === "actual" && <th className="text-right px-2 py-2" style={{ minWidth: 64, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
               <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
             </tr>
           </thead>
           <tbody>
             {form.lines.length === 0 && (
-              <tr><td colSpan={16} className="text-center py-6" style={{ color: "#8A8F87" }}>No expense lines yet.</td></tr>
+              <tr><td colSpan={cols.length + 6 + (mode === "actual" ? cols.length + 1 : 0)} className="text-center py-6" style={{ color: "#8A8F87" }}>No expense lines yet.</td></tr>
             )}
             {sortedLines.map((line) => {
               const cat = CATEGORIES.find((c) => c.name === line.category);
@@ -1223,21 +1239,39 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                       style={{ ...inputStyle, fontVariantNumeric: "tabular-nums" }}
                     />
                   </td>
-                  {values.map((amt, idx) => (
-                    <td key={idx} className="px-1 py-1.5">
-                      <input
-                        type="number"
-                        value={amt === 0 ? "" : amt}
-                        placeholder="0"
-                        onChange={(e) => updateAmount(line.id, idx, e.target.value, field)}
-                        className="w-full rounded border px-1.5 py-1 text-xs text-right"
-                        style={{ ...inputStyle, fontVariantNumeric: "tabular-nums" }}
-                      />
-                    </td>
-                  ))}
+                  {values.map((amt, idx) => {
+                    const v = mode === "actual" ? varianceInfo(line.amounts?.[idx], line.actuals?.[idx]) : null;
+                    return (
+                      <Fragment key={idx}>
+                        <td className="px-1 py-1.5">
+                          <input
+                            type="number"
+                            value={amt === 0 ? "" : amt}
+                            placeholder="0"
+                            onChange={(e) => updateAmount(line.id, idx, e.target.value, field)}
+                            className="w-full rounded border px-1.5 py-1 text-xs text-right"
+                            style={{ ...inputStyle, fontVariantNumeric: "tabular-nums" }}
+                          />
+                        </td>
+                        {mode === "actual" && (
+                          <td className="px-2 py-1.5 text-right text-xs" style={{ fontVariantNumeric: "tabular-nums", color: v.color }}>
+                            {v.label}
+                          </td>
+                        )}
+                      </Fragment>
+                    );
+                  })}
                   <td className="px-2 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: line.type === "revenue" ? "#2F6F53" : "#1C2624" }}>
                     {fmt(mode === "plan" ? lineTotal(line) : lineActualTotal(line))}
                   </td>
+                  {mode === "actual" && (() => {
+                    const overall = varianceInfo(lineTotal(line), lineActualTotal(line));
+                    return (
+                      <td className="px-2 py-1.5 text-right text-xs font-medium" style={{ fontVariantNumeric: "tabular-nums", color: overall.color }}>
+                        {overall.label}
+                      </td>
+                    );
+                  })()}
                   <td className="px-2 py-1.5 text-center">
                     <button onClick={() => deleteLine(line.id)} className="p-1 rounded hover:bg-red-50">
                       <Trash2 size={14} style={{ color: "#B5443A" }} />
