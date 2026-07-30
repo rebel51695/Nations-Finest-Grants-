@@ -412,6 +412,22 @@ function daysOutstanding(inv) {
   return Math.max(0, Math.round(diff / 86400000));
 }
 
+function daysToPay(inv) {
+  if (!inv.submittedDate || !inv.paidDate) return null;
+  const diff = new Date(inv.paidDate + "T00:00:00").getTime() - new Date(inv.submittedDate + "T00:00:00").getTime();
+  return Math.max(0, Math.round(diff / 86400000));
+}
+
+function inPeriod(dateStr, period) {
+  if (!dateStr) return false;
+  if (period === "all") return true;
+  const d = new Date(dateStr + "T00:00:00");
+  const now = new Date();
+  if (period === "month") return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth();
+  if (period === "year") return d.getFullYear() === now.getFullYear();
+  return true;
+}
+
 function isInvoiceOverdue(inv) {
   return inv.status === "Submitted" && inv.dueDate && !inv.paidDate && new Date(inv.dueDate) < new Date(new Date().toDateString());
 }
@@ -4164,16 +4180,89 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
   const [confirm, setConfirm] = useState(null);
   const [grantFilter, setGrantFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [period, setPeriod] = useState("month"); // month | year | all
 
   const visible = invoices
     .filter((i) => grantFilter === "All" || i.grantId === grantFilter)
     .filter((i) => statusFilter === "All" || i.status === statusFilter)
     .sort((a, b) => new Date(b.submittedDate || 0) - new Date(a.submittedDate || 0));
 
-  const totalInvoiced = invoices.reduce((a, i) => a + (Number(i.amount) || 0), 0);
-  const totalPaid = invoices.filter((i) => i.status === "Paid").reduce((a, i) => a + (Number(i.amount) || 0), 0);
+  // "Flow" figures (Invoiced, Paid, Avg Days to Pay) are scoped to the selected period.
+  // "Stock" figures (Outstanding, Overdue, aging) always reflect right now, regardless
+  // of the period picker — money owed today doesn't stop being owed because it was
+  // invoiced outside the selected window.
+  const invoicedInPeriod = invoices.filter((i) => inPeriod(i.submittedDate, period));
+  const paidInPeriod = invoices.filter((i) => i.status === "Paid" && inPeriod(i.paidDate, period));
+  const totalInvoiced = invoicedInPeriod.reduce((a, i) => a + (Number(i.amount) || 0), 0);
+  const totalPaid = paidInPeriod.reduce((a, i) => a + (Number(i.amount) || 0), 0);
   const totalOutstanding = invoices.filter((i) => i.status === "Submitted").reduce((a, i) => a + (Number(i.amount) || 0), 0);
-  const overdueCount = invoices.filter(isInvoiceOverdue).length;
+  const overdueInvoices = invoices.filter(isInvoiceOverdue);
+  const overdueCount = overdueInvoices.length;
+
+  const payDelays = paidInPeriod.map(daysToPay).filter((d) => d !== null);
+  const avgDaysToPay = payDelays.length > 0 ? Math.round(payDelays.reduce((a, d) => a + d, 0) / payDelays.length) : null;
+
+  const agingBuckets = useMemo(() => {
+    const buckets = { "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 };
+    invoices.filter((i) => i.status === "Submitted").forEach((i) => {
+      const d = daysOutstanding(i) ?? 0;
+      const amt = Number(i.amount) || 0;
+      if (d <= 30) buckets["0-30"] += amt;
+      else if (d <= 60) buckets["31-60"] += amt;
+      else if (d <= 90) buckets["61-90"] += amt;
+      else buckets["90+"] += amt;
+    });
+    return buckets;
+  }, [invoices]);
+
+  const trendData = useMemo(() => {
+    const months = [];
+    const now = new Date();
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({ year: d.getFullYear(), month: d.getMonth(), label: `${MONTHS[d.getMonth()]} ${String(d.getFullYear()).slice(2)}`, invoiced: 0, paid: 0 });
+    }
+    invoices.forEach((inv) => {
+      if (inv.submittedDate) {
+        const d = new Date(inv.submittedDate + "T00:00:00");
+        const bucket = months.find((m) => m.year === d.getFullYear() && m.month === d.getMonth());
+        if (bucket) bucket.invoiced += Number(inv.amount) || 0;
+      }
+      if (inv.paidDate) {
+        const d = new Date(inv.paidDate + "T00:00:00");
+        const bucket = months.find((m) => m.year === d.getFullYear() && m.month === d.getMonth());
+        if (bucket) bucket.paid += Number(inv.amount) || 0;
+      }
+    });
+    return months;
+  }, [invoices]);
+
+  const [grantSort, setGrantSort] = useState({ key: "outstanding", dir: "desc" });
+  const byGrantData = useMemo(() => {
+    const map = {};
+    invoices.forEach((inv) => {
+      const key = inv.grantId || "unlinked";
+      if (!map[key]) {
+        const g = grants.find((x) => x.id === inv.grantId);
+        map[key] = { grantId: inv.grantId, title: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "No grant linked", invoiced: 0, outstanding: 0, delays: [] };
+      }
+      map[key].invoiced += Number(inv.amount) || 0;
+      if (inv.status === "Submitted") map[key].outstanding += Number(inv.amount) || 0;
+      const d = daysToPay(inv);
+      if (d !== null) map[key].delays.push(d);
+    });
+    const rows = Object.values(map).map((r) => ({
+      ...r,
+      avgDays: r.delays.length > 0 ? Math.round(r.delays.reduce((a, d) => a + d, 0) / r.delays.length) : null,
+    }));
+    rows.sort((a, b) => {
+      const dir = grantSort.dir === "asc" ? 1 : -1;
+      const av = a[grantSort.key] ?? -1, bv = b[grantSort.key] ?? -1;
+      return av < bv ? -1 * dir : av > bv ? 1 * dir : 0;
+    });
+    return rows;
+  }, [invoices, grants, grantSort]);
+  const toggleGrantSort = (key) => setGrantSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "desc" }));
 
   const saveInvoice = (inv) => {
     setInvoices((prev) => {
@@ -4227,11 +4316,87 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      <div className="flex items-center gap-2">
+        <span className="text-xs" style={{ color: "#8A8F87" }}>Show Invoiced/Paid/Avg Days to Pay for:</span>
+        <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+          {[{ key: "month", label: "This Month" }, { key: "year", label: "This Year" }, { key: "all", label: "All Time" }].map((p) => (
+            <button
+              key={p.key}
+              onClick={() => setPeriod(p.key)}
+              className="px-3 py-1.5 text-xs font-medium"
+              style={{ background: period === p.key ? "#1F5C6B" : "#FFFFFF", color: period === p.key ? "#FFFFFF" : "#5B6B66" }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
         <StatCard label="Total invoiced" value={fmt(totalInvoiced)} />
         <StatCard label="Total paid" value={fmt(totalPaid)} />
-        <StatCard label="Outstanding" value={fmt(totalOutstanding)} sub={`${invoices.filter((i) => i.status === "Submitted").length} submitted, unpaid`} />
-        <StatCard label="Overdue" value={overdueCount} sub={overdueCount > 0 ? "Past expected payment date" : "None"} />
+        <StatCard label="Avg days to pay" value={avgDaysToPay === null ? "—" : `${avgDaysToPay}d`} sub={payDelays.length > 0 ? `${payDelays.length} paid invoice${payDelays.length === 1 ? "" : "s"}` : "No paid invoices yet"} />
+        <StatCard label="Outstanding" value={fmt(totalOutstanding)} sub={`${invoices.filter((i) => i.status === "Submitted").length} submitted, unpaid — as of today`} />
+        <StatCard label="Overdue" value={overdueCount} sub={overdueCount > 0 ? fmt(overdueInvoices.reduce((a, i) => a + (Number(i.amount) || 0), 0)) + " past due" : "None"} />
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Outstanding by age</h2>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          {[["0-30", "0–30 days"], ["31-60", "31–60 days"], ["61-90", "61–90 days"], ["90+", "90+ days"]].map(([key, label]) => (
+            <div key={key}>
+              <div className="text-xs" style={{ color: "#8A8F87" }}>{label}</div>
+              <div className="text-lg font-medium" style={{ color: key === "90+" && agingBuckets[key] > 0 ? "#B5443A" : "#1C2624", fontVariantNumeric: "tabular-nums" }}>
+                {fmt(agingBuckets[key])}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Invoiced vs. paid, last 12 months</h2>
+        <ResponsiveContainer width="100%" height={260}>
+          <LineChart data={trendData}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#E1E5DE" />
+            <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+            <YAxis tickFormatter={(v) => `$${v / 1000}k`} tick={{ fontSize: 11 }} />
+            <Tooltip formatter={(v) => fmt(v)} />
+            <Legend />
+            <Line type="monotone" dataKey="invoiced" name="Invoiced" stroke="#5B7FA6" strokeWidth={2} dot={false} />
+            <Line type="monotone" dataKey="paid" name="Paid" stroke="#2F6F53" strokeWidth={2} dot={false} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>By grant — all time</h2>
+        {byGrantData.length === 0 ? (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>No invoices yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ color: "#8A8F87" }}>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("title")}>Grant</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("invoiced")}>Total invoiced</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("outstanding")}>Outstanding</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("avgDays")}>Avg days to pay</th>
+                </tr>
+              </thead>
+              <tbody>
+                {byGrantData.map((r) => (
+                  <tr key={r.grantId || "unlinked"} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                    <td className="py-1.5" style={{ color: "#1C2624" }}>{r.title}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{fmt(r.invoiced)}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: r.outstanding > 0 ? "#B5443A" : "#8A8F87" }}>{fmt(r.outstanding)}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{r.avgDays === null ? "—" : `${r.avgDays}d`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <div className="flex gap-3">
