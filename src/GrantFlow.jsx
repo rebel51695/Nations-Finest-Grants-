@@ -12,7 +12,7 @@ import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend,
 } from "recharts";
-// test
+
 // ---------- constants ----------
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -1982,6 +1982,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
   const [budgetMode, setBudgetMode] = useState("grant"); // grant | costCenter
   const [duplicatePrompt, setDuplicatePrompt] = useState(null); // the budget being duplicated, or null
+  const [overviewSearch, setOverviewSearch] = useState("");
+  const [overviewSort, setOverviewSort] = useState({ key: "title", dir: "asc" });
 
   const grant = grants.find((g) => g.id === selectedGrantId);
   const costCenter = costCenters.find((c) => c.id === selectedCostCenterId);
@@ -2094,6 +2096,49 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     downloadFile(`${safe(g?.title || cc?.name)}-${safe(budget.title)}.xlsx`, arrayBuffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   };
 
+  const allBudgetsEnriched = useMemo(() => budgets.map((b) => {
+    const g = b.grantId ? grants.find((x) => x.id === b.grantId) : null;
+    const cc = b.costCenterId ? costCenters.find((x) => x.id === b.costCenterId) : null;
+    const t = budgetTotals(b);
+    return {
+      ...b,
+      ownerName: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown",
+      ownerType: g ? "grant" : "costCenter",
+      netTotal: t.revenue - t.expense,
+    };
+  }), [budgets, grants, costCenters]);
+
+  const statusCounts = useMemo(() => {
+    const counts = {};
+    BUDGET_STATUSES.forEach((s) => { counts[s] = 0; });
+    allBudgetsEnriched.forEach((b) => { counts[b.status] = (counts[b.status] || 0) + 1; });
+    return counts;
+  }, [allBudgetsEnriched]);
+
+  const needsAttention = allBudgetsEnriched.filter((b) => b.status === "Pending Approval");
+
+  const overviewRows = useMemo(() => {
+    const q = overviewSearch.trim().toLowerCase();
+    let rows = allBudgetsEnriched.filter((b) =>
+      !q || b.title.toLowerCase().includes(q) || b.ownerName.toLowerCase().includes(q) || (b.fy || "").toLowerCase().includes(q)
+    );
+    rows = [...rows].sort((a, b) => {
+      const dir = overviewSort.dir === "asc" ? 1 : -1;
+      const av = a[overviewSort.key], bv = b[overviewSort.key];
+      if (typeof av === "string") return av.localeCompare(bv) * dir;
+      return ((av ?? 0) - (bv ?? 0)) * dir;
+    });
+    return rows;
+  }, [allBudgetsEnriched, overviewSearch, overviewSort]);
+
+  const toggleOverviewSort = (key) => setOverviewSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
+
+  const openBudget = (b) => {
+    setBudgetMode(b.ownerType === "grant" ? "grant" : "costCenter");
+    if (b.ownerType === "grant") setSelectedGrantId(b.grantId); else setSelectedCostCenterId(b.costCenterId);
+    setModal(b);
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -2102,6 +2147,80 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
             <Plus size={16} /> New budget
           </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-3 sm:grid-cols-5 gap-3">
+        <StatCard label="Total budgets" value={allBudgetsEnriched.length} />
+        <StatCard label="Draft" value={statusCounts["Draft"] || 0} />
+        <StatCard label="Pending approval" value={statusCounts["Pending Approval"] || 0} />
+        <StatCard label="Active" value={statusCounts["Active"] || 0} />
+        <StatCard label="Closed" value={statusCounts["Closed"] || 0} />
+      </div>
+
+      {needsAttention.length > 0 && (
+        <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#C08A2E" }}>
+          <h2 className="font-display text-sm mb-2" style={{ color: "#C08A2E" }}>Needs attention — {needsAttention.length} budget{needsAttention.length === 1 ? "" : "s"} awaiting approval</h2>
+          <div className="divide-y" style={{ borderColor: "#E1E5DE" }}>
+            {needsAttention.map((b) => (
+              <button
+                key={b.id}
+                onClick={() => openBudget(b)}
+                className="w-full text-left py-2 flex items-center justify-between text-sm hover:bg-stone-50"
+              >
+                <span style={{ color: "#1C2624" }}>{b.title || "Untitled budget"} <span style={{ color: "#8A8F87" }}>— {b.ownerName}</span></span>
+                <span style={{ color: "#8A8F87" }}>{b.fy}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="font-display text-sm" style={{ color: "#1C2624" }}>All budgets</h2>
+          <input
+            value={overviewSearch}
+            onChange={(e) => setOverviewSearch(e.target.value)}
+            placeholder="Search by title, grant, or FY…"
+            className={inputCls}
+            style={{ ...inputStyle, maxWidth: 280 }}
+          />
+        </div>
+        {overviewRows.length === 0 ? (
+          <p className="text-sm py-4 text-center" style={{ color: "#8A8F87" }}>No budgets match your search.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ color: "#8A8F87" }}>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("ownerName")}>Grant / Cost Center</th>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("title")}>Budget</th>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("fy")}>FY</th>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("status")}>Status</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("netTotal")}>Net</th>
+                </tr>
+              </thead>
+              <tbody>
+                {overviewRows.map((b) => (
+                  <tr
+                    key={b.id}
+                    onClick={() => openBudget(b)}
+                    className="border-t cursor-pointer hover:bg-stone-50"
+                    style={{ borderColor: "#E1E5DE" }}
+                  >
+                    <td className="py-1.5" style={{ color: "#1C2624" }}>{b.ownerName}</td>
+                    <td className="py-1.5" style={{ color: "#1C2624" }}>{b.title || "Untitled budget"}</td>
+                    <td className="py-1.5" style={{ color: "#8A8F87" }}>{b.fy}</td>
+                    <td className="py-1.5">
+                      <Badge color={b.status === "Active" ? "#2F6F53" : b.status === "Pending Approval" ? "#C08A2E" : b.status === "Rejected" ? "#B5443A" : "#8A8F87"}>{b.status}</Badge>
+                    </td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.netTotal >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(b.netTotal)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 
