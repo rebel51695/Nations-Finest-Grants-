@@ -1015,6 +1015,15 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   const [yearlyDraft, setYearlyDraft] = useState({});
   const [mode, setMode] = useState("plan");
   const field = mode === "plan" ? "amounts" : "actuals";
+  // Fixed pixel widths for every column — must stay in sync with the <th>/<td>
+  // widths below. table-layout: fixed locks columns to these exact sizes so
+  // the frozen (sticky) Category/Subcategory/Description columns never drift
+  // out of alignment with their hardcoded `left` offsets, even when a long
+  // category name would otherwise make the browser widen that column.
+  const COL_W = { category: 160, subcategory: 160, description: 120, annual: 80, month: 72, variance: 60, total: 80, totalVariance: 64, trash: 36 };
+  const tableTotalWidth = COL_W.category + COL_W.subcategory + COL_W.description + COL_W.annual
+    + cols.length * (COL_W.month + (mode === "actual" ? COL_W.variance : 0))
+    + COL_W.total + (mode === "actual" ? COL_W.totalVariance : 0) + COL_W.trash;
 
   const applyYearlyTotal = (id) => {
     const val = yearlyDraft[id];
@@ -1175,22 +1184,22 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       </div>
 
       <div className="overflow-x-auto border rounded-lg" style={{ borderColor: "#E1E5DE" }}>
-        <table className="text-xs" style={{ fontFamily: "var(--mono-font)", width: "max-content" }}>
+        <table className="text-xs" style={{ fontFamily: "var(--mono-font)", width: tableTotalWidth, tableLayout: "fixed" }}>
           <thead>
             <tr style={{ background: "#F6F7F3" }}>
-              <th className="text-left px-2 py-2 sticky left-0 z-20" style={{ background: "#F6F7F3", minWidth: 160 }}>Category</th>
-              <th className="text-left px-2 py-2 sticky z-10" style={{ left: 160, background: "#F6F7F3", minWidth: 160 }}>Subcategory</th>
-              <th className="text-left px-2 py-2 sticky z-10" style={{ left: 320, background: "#F6F7F3", minWidth: 120 }}>Description</th>
-              <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Annual total</th>
+              <th className="text-left px-2 py-2 sticky left-0 z-20" style={{ background: "#F6F7F3", width: COL_W.category }}>Category</th>
+              <th className="text-left px-2 py-2 sticky z-10" style={{ left: COL_W.category, background: "#F6F7F3", width: COL_W.subcategory }}>Subcategory</th>
+              <th className="text-left px-2 py-2 sticky z-10" style={{ left: COL_W.category + COL_W.subcategory, background: "#F6F7F3", width: COL_W.description }}>Description</th>
+              <th className="text-right px-2 py-2" style={{ width: COL_W.annual }}>Annual total</th>
               {cols.map((col, i) => (
                 <Fragment key={i}>
-                  <th className="text-right px-2 py-2" style={{ minWidth: 72 }}>{col.label}</th>
-                  {mode === "actual" && <th className="text-right px-2 py-2" style={{ minWidth: 60, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
+                  <th className="text-right px-2 py-2" style={{ width: COL_W.month }}>{col.label}</th>
+                  {mode === "actual" && <th className="text-right px-2 py-2" style={{ width: COL_W.variance, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
                 </Fragment>
               ))}
-              <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
-              {mode === "actual" && <th className="text-right px-2 py-2" style={{ minWidth: 64, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
-              <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
+              <th className="text-right px-2 py-2" style={{ width: COL_W.total }}>Total</th>
+              {mode === "actual" && <th className="text-right px-2 py-2" style={{ width: COL_W.totalVariance, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
+              <th className="px-2 py-2" style={{ width: COL_W.trash }}></th>
             </tr>
           </thead>
           <tbody>
@@ -1249,7 +1258,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                       </select>
                     )}
                   </td>
-                  <td className="px-2 py-1.5 sticky z-10 bg-white" style={{ left: 160 }}>
+                  <td className="px-2 py-1.5 sticky z-10 bg-white" style={{ left: COL_W.category }}>
                     {line.categoryCustom || line.subcategoryCustom ? (
                       <div className="flex gap-1">
                         <input
@@ -1289,7 +1298,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                       </select>
                     )}
                   </td>
-                  <td className="px-2 py-1.5 sticky z-10 bg-white" style={{ left: 320 }}>
+                  <td className="px-2 py-1.5 sticky z-10 bg-white" style={{ left: COL_W.category + COL_W.subcategory }}>
                     <input
                       value={line.description || ""}
                       onChange={(e) => updateLine(line.id, { description: e.target.value })}
@@ -1354,8 +1363,8 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             {form.lines.length > 0 && (
               <tr className="border-t-2" style={{ borderColor: "#1C2624" }}>
                 <td className="px-2 py-1.5 sticky left-0 z-20 font-medium text-xs" style={{ background: "#F6F7F3", color: "#1C2624" }}>Monthly net</td>
-                <td className="px-2 py-1.5 sticky z-10" style={{ left: 160, background: "#F6F7F3" }}></td>
-                <td className="px-2 py-1.5 sticky z-10" style={{ left: 320, background: "#F6F7F3" }}></td>
+                <td className="px-2 py-1.5 sticky z-10" style={{ left: COL_W.category, background: "#F6F7F3" }}></td>
+                <td className="px-2 py-1.5 sticky z-10" style={{ left: COL_W.category + COL_W.subcategory, background: "#F6F7F3" }}></td>
                 <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
                 {cols.map((_, i) => {
                   const net = form.lines.reduce((sum, l) => {
