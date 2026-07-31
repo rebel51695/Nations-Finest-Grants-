@@ -93,7 +93,7 @@ const REPORT_PRIORITIES = [
   { label: "Low", color: "#5B7FA6" },
 ];
 const REPORT_REPEATS = ["None", "Weekly", "Monthly", "Quarterly", "Annually"];
-const DEFAULT_BUCKETS = ["Backlog", "Upcoming", "Up next", "Overdue", "In progress", "Complete", "Submitted"];
+const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Complete", "Submitted"];
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
@@ -474,7 +474,7 @@ const isOverdue = (report) => report.dueDate && report.status !== "Completed" &&
 const isAtRisk = (report) => {
   if (!report.dueDate || report.status === "Completed") return false;
   if (isOverdue(report)) return false;
-  if (report.bucket !== "Backlog" && report.bucket !== "Upcoming") return false;
+  if (report.bucket !== "Upcoming") return false;
   const daysUntilDue = (new Date(report.dueDate) - new Date(new Date().toDateString())) / 86400000;
   return daysUntilDue >= 0 && daysUntilDue <= 14;
 };
@@ -483,7 +483,7 @@ const isAtRisk = (report) => {
 // the board is viewed, based on today's date vs. the due date. Anything moved into
 // In progress, Complete, or Submitted reflects real human progress and is never
 // overridden by this — only these four "not yet actively worked" buckets are affected.
-const PASSIVE_REPORT_BUCKETS = ["Backlog", "Upcoming", "Up next", "Overdue"];
+const PASSIVE_REPORT_BUCKETS = ["Upcoming", "Up next", "Overdue"];
 function effectiveReportBucket(report) {
   if (!PASSIVE_REPORT_BUCKETS.includes(report.bucket)) return report.bucket;
   if (!report.dueDate) return report.bucket;
