@@ -825,7 +825,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 
   return (
     <Modal title={grant ? (canEdit ? "Edit grant" : "View grant") : "New grant"} onClose={onClose} wide>
-      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Grant title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. SSVF Supportive Services" />
@@ -1113,7 +1113,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         )}
       </div>
 
-      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
         <Field label="Budget title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. FY26 Operating Budget" />
@@ -1452,7 +1452,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
 
   return (
     <Modal title={report ? (canEdit ? "Edit report" : "View report") : "New report"} onClose={onClose} wide>
-      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="col-span-2">
           <Field label="Report title">
@@ -2689,7 +2689,7 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
 
   return (
     <Modal title={task ? (canEdit ? "Edit task" : "View task") : "New task"} onClose={onClose}>
-      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
         <Field label="Task title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. Submit LOI to funder" />
@@ -3389,7 +3389,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
       </div>
 
       <div className="bg-white rounded-lg border p-5 space-y-4" style={{ borderColor: "#E1E5DE" }}>
-        <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+        <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <Field label="Scenario name">
             <input className={inputCls} style={inputStyle} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
@@ -4122,7 +4122,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
 
   return (
     <Modal title={staff ? (canEdit ? "Edit staff member" : "View staff member") : "New staff member"} onClose={onClose} wide>
-      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="Last, First" />
@@ -4479,7 +4479,7 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
 
   return (
     <Modal title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
-      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0 }}>
+      <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
         <Field label="Grant">
           <GrantPicker grants={grants} value={form.grantId} onChange={(v) => setForm({ ...form, grantId: v })} placeholder="Select a grant" />
