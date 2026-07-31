@@ -434,11 +434,50 @@ function isInvoiceOverdue(inv) {
 
 const priorityColor = (label) => (REPORT_PRIORITIES.find((p) => p.label === label) || REPORT_PRIORITIES[2]).color;
 
+function advanceDateByRepeat(dateStr, repeat) {
+  if (!dateStr) return "";
+  const d = new Date(dateStr + "T00:00:00");
+  if (repeat === "Weekly") d.setDate(d.getDate() + 7);
+  else if (repeat === "Monthly") d.setMonth(d.getMonth() + 1);
+  else if (repeat === "Quarterly") d.setMonth(d.getMonth() + 3);
+  else if (repeat === "Annually") d.setFullYear(d.getFullYear() + 1);
+  else return "";
+  return d.toISOString().slice(0, 10);
+}
+
+function spawnNextReportOccurrence(report, grant) {
+  if (!report.repeat || report.repeat === "None") return null;
+  const nextDue = advanceDateByRepeat(report.dueDate, report.repeat);
+  if (!nextDue) return null;
+  if (grant) {
+    if (grant.stage === "Closed" || grant.stage === "Rejected") return null;
+    if (grant.end && new Date(nextDue + "T00:00:00") > new Date(grant.end + "T00:00:00")) return null;
+  }
+  return {
+    ...report,
+    id: uid(),
+    dueDate: nextDue,
+    startDate: report.startDate ? advanceDateByRepeat(report.startDate, report.repeat) : "",
+    status: "Not started",
+    bucket: "Upcoming",
+    linkedTaskCreated: false,
+    checklist: (report.checklist || []).map((c) => ({ ...c, done: false })),
+    createdAt: new Date().toISOString().slice(0, 10),
+  };
+}
+
 const checklistProgress = (report) => {
   const items = report.checklist || [];
   return { done: items.filter((i) => i.done).length, total: items.length };
 };
 const isOverdue = (report) => report.dueDate && report.status !== "Completed" && new Date(report.dueDate) < new Date(new Date().toDateString());
+const isAtRisk = (report) => {
+  if (!report.dueDate || report.status === "Completed") return false;
+  if (isOverdue(report)) return false;
+  if (report.bucket !== "Backlog" && report.bucket !== "Upcoming") return false;
+  const daysUntilDue = (new Date(report.dueDate) - new Date(new Date().toDateString())) / 86400000;
+  return daysUntilDue >= 0 && daysUntilDue <= 14;
+};
 
 // ---------- shared bits ----------
 
@@ -1354,7 +1393,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(report || {
     id: uid(), title: "", grantId: "", assignedTo: "", status: "Not started",
     priority: "Medium", startDate: "", dueDate: "", repeat: "None", repeatDetail: "",
-    bucket: DEFAULT_BUCKETS[0], checklist: [], notes: "", portalUrl: "", linkedTaskCreated: false,
+    bucket: DEFAULT_BUCKETS[0], checklist: [], notes: "", portalUrl: "", supportingDocsUrl: "", linkedTaskCreated: false,
     createdAt: new Date().toISOString().slice(0, 10),
   });
   const [newStep, setNewStep] = useState("");
@@ -1417,6 +1456,9 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
         </Field>
         <Field label="Submission portal URL">
           <input className={inputCls} style={inputStyle} value={form.portalUrl} onChange={set("portalUrl")} placeholder="https://…" />
+        </Field>
+        <Field label="Supporting documents (SharePoint folder URL)">
+          <input className={inputCls} style={inputStyle} value={form.supportingDocsUrl || ""} onChange={set("supportingDocsUrl")} placeholder="https://…" />
         </Field>
 
         {form.repeat !== "None" && (
@@ -2381,8 +2423,9 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
 function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
   const progress = checklistProgress(report);
   const overdue = isOverdue(report);
+  const atRisk = isAtRisk(report);
   return (
-    <div className="bg-white rounded-lg border p-3.5" style={{ borderColor: overdue ? "#B5443A" : "#E1E5DE" }}>
+    <div className="bg-white rounded-lg border p-3.5" style={{ borderColor: overdue ? "#B5443A" : atRisk ? "#C08A2E" : "#E1E5DE" }}>
       <div className="flex items-start gap-2">
         <button onClick={onToggleDone} disabled={!onToggleDone} className="mt-0.5 shrink-0">
           {report.status === "Completed" ? <CheckCircle size={17} style={{ color: "#2F6F53" }} /> : <Circle size={17} style={{ color: "#8A8F87" }} />}
@@ -2401,6 +2444,12 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
         </div>
       )}
 
+      {atRisk && (
+        <div className="mt-2 text-xs px-2 py-1 rounded-md inline-flex items-center gap-1" style={{ background: "rgba(192,138,46,0.12)", color: "#C08A2E" }}>
+          <AlertCircle size={12} /> Due soon, not started yet
+        </div>
+      )}
+
       <div className="flex items-center justify-between mt-2.5 text-xs" style={{ color: "#8A8F87" }}>
         <span>{report.assignedTo || "Unassigned"}</span>
         <span style={{ color: overdue ? "#B5443A" : "#8A8F87", fontVariantNumeric: "tabular-nums" }}>
@@ -2412,16 +2461,28 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
         <div className="text-xs mt-1" style={{ color: "#8A8F87" }}>{progress.done}/{progress.total} checklist steps</div>
       )}
 
-      {report.portalUrl && (
-        <a
-          href={report.portalUrl} target="_blank" rel="noreferrer"
-          onClick={(e) => e.stopPropagation()}
-          className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border mt-2.5"
-          style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
-        >
-          <ExternalLink size={12} /> Submission portal
-        </a>
-      )}
+      <div className="flex flex-wrap gap-1.5 mt-2.5">
+        {report.portalUrl && (
+          <a
+            href={report.portalUrl} target="_blank" rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border"
+            style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
+          >
+            <ExternalLink size={12} /> Submission portal
+          </a>
+        )}
+        {report.supportingDocsUrl && (
+          <a
+            href={report.supportingDocsUrl} target="_blank" rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-md border"
+            style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
+          >
+            <ExternalLink size={12} /> Supporting Documents
+          </a>
+        )}
+      </div>
 
       <select
         value={report.bucket}
@@ -2440,9 +2501,13 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
 function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, setTrash, currentUserEmail, canEdit, initialOpenReportId, logActivity }) {
   const [modal, setModal] = useState(() => (initialOpenReportId ? reports.find((r) => r.id === stripNonce(initialOpenReportId)) || null : null));
   const [confirm, setConfirm] = useState(null);
+  const [assignedFilter, setAssignedFilter] = useState("All");
 
   const buckets = [...new Set([...DEFAULT_BUCKETS, ...reports.map((r) => r.bucket)])];
-  const visible = grantFilter === "All" ? reports : reports.filter((r) => r.grantId === grantFilter);
+  const assignees = [...new Set(reports.map((r) => (r.assignedTo || "").trim()).filter(Boolean))].sort();
+  const visible = reports
+    .filter((r) => grantFilter === "All" || r.grantId === grantFilter)
+    .filter((r) => assignedFilter === "All" || (r.assignedTo || "").trim() === assignedFilter);
 
   const saveReport = (r) => {
     setReports((prev) => {
@@ -2470,10 +2535,32 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
     setConfirm(null);
   };
   const toggleDone = (r) => {
-    setReports((prev) => prev.map((x) => (x.id === r.id ? { ...x, status: x.status === "Completed" ? "Not started" : "Completed" } : x)));
+    const willComplete = r.status !== "Completed";
+    setReports((prev) => {
+      let next = prev.map((x) => (x.id === r.id ? { ...x, status: willComplete ? "Completed" : "Not started" } : x));
+      if (willComplete) {
+        const spawned = spawnNextReportOccurrence(r, grants.find((g) => g.id === r.grantId));
+        if (spawned) {
+          next = [...next, spawned];
+          logActivity?.("Report", "Created", `${spawned.title || "Untitled report"} — next occurrence auto-created`);
+        }
+      }
+      return next;
+    });
   };
   const changeBucket = (r, bucket) => {
-    setReports((prev) => prev.map((x) => (x.id === r.id ? { ...x, bucket } : x)));
+    const willComplete = bucket === "Complete" && r.bucket !== "Complete";
+    setReports((prev) => {
+      let next = prev.map((x) => (x.id === r.id ? { ...x, bucket } : x));
+      if (willComplete) {
+        const spawned = spawnNextReportOccurrence(r, grants.find((g) => g.id === r.grantId));
+        if (spawned) {
+          next = [...next, spawned];
+          logActivity?.("Report", "Created", `${spawned.title || "Untitled report"} — next occurrence auto-created`);
+        }
+      }
+      return next;
+    });
   };
 
   return (
@@ -2490,9 +2577,17 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
         )}
       </div>
 
-      <Field label="Filter by grant">
-        <GrantPicker grants={grants} value={grantFilter === "All" ? "" : grantFilter} onChange={(v) => setGrantFilter(v || "All")} noneLabel="All grants" noneValue="All" wrapStyle={{ maxWidth: 320 }} />
-      </Field>
+      <div className="flex gap-3 flex-wrap">
+        <Field label="Filter by grant">
+          <GrantPicker grants={grants} value={grantFilter === "All" ? "" : grantFilter} onChange={(v) => setGrantFilter(v || "All")} noneLabel="All grants" noneValue="All" wrapStyle={{ maxWidth: 320 }} />
+        </Field>
+        <Field label="Assigned to">
+          <select value={assignedFilter} onChange={(e) => setAssignedFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 220 }}>
+            <option>All</option>
+            {assignees.map((a) => <option key={a}>{a}</option>)}
+          </select>
+        </Field>
+      </div>
 
       {visible.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
@@ -2507,7 +2602,7 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
                   {bucket} <span style={{ color: "#8A8F87", fontWeight: 400 }}>({visible.filter((r) => r.bucket === bucket).length})</span>
                 </h3>
                 <div className="space-y-3">
-                  {visible.filter((r) => r.bucket === bucket).map((r) => (
+                  {visible.filter((r) => r.bucket === bucket).sort((a, b) => new Date(a.dueDate || "9999-12-31") - new Date(b.dueDate || "9999-12-31")).map((r) => (
                     <ReportCard
                       key={r.id}
                       report={r}
