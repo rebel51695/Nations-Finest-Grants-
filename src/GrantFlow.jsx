@@ -93,7 +93,7 @@ const REPORT_PRIORITIES = [
   { label: "Low", color: "#5B7FA6" },
 ];
 const REPORT_REPEATS = ["None", "Weekly", "Monthly", "Quarterly", "Annually"];
-const DEFAULT_BUCKETS = ["Backlog", "Upcoming", "Up next", "In progress", "Complete", "Submitted"];
+const DEFAULT_BUCKETS = ["Backlog", "Upcoming", "Up next", "Overdue", "In progress", "Complete", "Submitted"];
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
@@ -478,6 +478,22 @@ const isAtRisk = (report) => {
   const daysUntilDue = (new Date(report.dueDate) - new Date(new Date().toDateString())) / 86400000;
   return daysUntilDue >= 0 && daysUntilDue <= 14;
 };
+
+// Backlog, Upcoming, Up next, and Overdue are date-driven — recomputed live every time
+// the board is viewed, based on today's date vs. the due date. Anything moved into
+// In progress, Complete, or Submitted reflects real human progress and is never
+// overridden by this — only these four "not yet actively worked" buckets are affected.
+const PASSIVE_REPORT_BUCKETS = ["Backlog", "Upcoming", "Up next", "Overdue"];
+function effectiveReportBucket(report) {
+  if (!PASSIVE_REPORT_BUCKETS.includes(report.bucket)) return report.bucket;
+  if (!report.dueDate) return report.bucket;
+  if (report.status === "Completed") return report.bucket;
+  const today = new Date(new Date().toDateString());
+  const due = new Date(report.dueDate + "T00:00:00");
+  if (due < today) return "Overdue";
+  const daysUntil = (due - today) / 86400000;
+  return daysUntil > 90 ? "Upcoming" : "Up next";
+}
 
 // ---------- shared bits ----------
 
@@ -2599,13 +2615,13 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
             {buckets.map((bucket) => (
               <div key={bucket}>
                 <h3 className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#5B6B66" }}>
-                  {bucket} <span style={{ color: "#8A8F87", fontWeight: 400 }}>({visible.filter((r) => r.bucket === bucket).length})</span>
+                  {bucket} <span style={{ color: "#8A8F87", fontWeight: 400 }}>({visible.filter((r) => effectiveReportBucket(r) === bucket).length})</span>
                 </h3>
                 <div className="space-y-3">
-                  {visible.filter((r) => r.bucket === bucket).sort((a, b) => new Date(a.dueDate || "9999-12-31") - new Date(b.dueDate || "9999-12-31")).map((r) => (
+                  {visible.filter((r) => effectiveReportBucket(r) === bucket).sort((a, b) => new Date(a.dueDate || "9999-12-31") - new Date(b.dueDate || "9999-12-31")).map((r) => (
                     <ReportCard
                       key={r.id}
-                      report={r}
+                      report={{ ...r, bucket: effectiveReportBucket(r) }}
                       grant={grants.find((g) => g.id === r.grantId)}
                       onToggleDone={canEdit ? () => toggleDone(r) : undefined}
                       onBucketChange={canEdit ? (b) => changeBucket(r, b) : undefined}
