@@ -1175,7 +1175,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       </div>
 
       <div className="overflow-x-auto border rounded-lg" style={{ borderColor: "#E1E5DE" }}>
-        <table className="text-xs w-full" style={{ fontFamily: "var(--mono-font)" }}>
+        <table className="text-xs" style={{ fontFamily: "var(--mono-font)" }}>
           <thead>
             <tr style={{ background: "#F6F7F3" }}>
               <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 190 }}>Category</th>
@@ -3409,7 +3409,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
         </p>
 
         <div className="overflow-x-auto border rounded-lg" style={{ borderColor: "#E1E5DE" }}>
-          <table className="text-xs w-full" style={{ fontFamily: "var(--mono-font)" }}>
+          <table className="text-xs" style={{ fontFamily: "var(--mono-font)" }}>
             <thead>
               <tr style={{ background: "#F6F7F3" }}>
                 <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 190 }}>Category</th>
