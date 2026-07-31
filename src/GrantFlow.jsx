@@ -1818,6 +1818,24 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
         )}
       </div>
 
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+        {STAGES.map((s) => {
+          const count = grants.filter((g) => g.stage === s).length;
+          const active = stageFilter === s;
+          return (
+            <button
+              key={s}
+              onClick={() => setStageFilter(active ? "All" : s)}
+              className="text-left bg-white rounded-lg border p-3"
+              style={{ borderColor: active ? stageColor[s] : "#E1E5DE", borderWidth: active ? 2 : 1 }}
+            >
+              <div className="text-xs" style={{ color: stageColor[s] }}>{s}</div>
+              <div className="text-xl font-medium mt-0.5" style={{ color: "#1C2624", fontVariantNumeric: "tabular-nums" }}>{count}</div>
+            </button>
+          );
+        })}
+      </div>
+
       <div className="flex gap-3">
         <div className="relative flex-1">
           <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: "#8A8F87" }} />
