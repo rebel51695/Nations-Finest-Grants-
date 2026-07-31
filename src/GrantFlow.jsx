@@ -675,8 +675,8 @@ function GrantPicker({ grants, value, onChange, placeholder = "Select a grant", 
 function Modal({ title, onClose, children, wide, size }) {
   const widthClass = size === "xl" ? "w-[97vw] max-w-[2000px]" : wide ? "max-w-4xl" : "max-w-lg";
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
-      <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto`}>
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto overflow-x-hidden py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
+      <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto overflow-x-hidden`}>
         <div className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "#E1E5DE" }}>
           <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>{title}</h2>
           <button onClick={onClose} className="p-1 rounded hover:bg-stone-100">
@@ -1351,6 +1351,31 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                 </tr>
               );
             })}
+            {form.lines.length > 0 && (
+              <tr className="border-t-2" style={{ borderColor: "#1C2624" }}>
+                <td className="px-2 py-1.5 sticky left-0 font-medium text-xs" style={{ background: "#F6F7F3", color: "#1C2624" }}>Monthly net</td>
+                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
+                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
+                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
+                {cols.map((_, i) => {
+                  const net = form.lines.reduce((sum, l) => {
+                    const v = Number((l[field] || [])[i]) || 0;
+                    return sum + (l.type === "revenue" ? v : -v);
+                  }, 0);
+                  return (
+                    <Fragment key={i}>
+                      <td className="px-2 py-1.5 text-right text-xs font-medium" style={{ fontVariantNumeric: "tabular-nums", color: net >= 0 ? "#2F6F53" : "#B5443A", background: "#F6F7F3" }}>
+                        {fmt(net)}
+                      </td>
+                      {mode === "actual" && <td style={{ background: "#F6F7F3" }}></td>}
+                    </Fragment>
+                  );
+                })}
+                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
+                {mode === "actual" && <td style={{ background: "#F6F7F3" }}></td>}
+                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -2360,7 +2385,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                 </div>
                 <div className="flex gap-2 mt-4 flex-wrap">
                   <button onClick={() => setModal(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-                    <Pencil size={13} /> {canEdit ? "Edit budget" : "View budget"}
+                    <Pencil size={13} /> {canEdit ? "View/edit budget" : "View budget"}
                   </button>
                   <button onClick={() => exportCsv(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
                     <Download size={13} /> Export CSV
