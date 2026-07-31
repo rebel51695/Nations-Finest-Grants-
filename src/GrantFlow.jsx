@@ -2849,50 +2849,110 @@ function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, canEdi
   );
 }
 
-function ReportingView({ grants, budgets }) {
-  const [scope, setScope] = useState("all");
-  const relevantBudgets = scope === "all" ? budgets : budgets.filter((b) => b.grantId === scope);
+function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices }) {
+  const [scope, setScope] = useState("all"); // all | a budget group id
+  const [calYear, setCalYear] = useState("All");
+  const [grantSort, setGrantSort] = useState({ key: "planExpense", dir: "desc" });
 
-  const byCategory = useMemo(() => {
+  const scopedGrantIds = useMemo(() => {
+    if (scope === "all") return null;
+    return new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
+  }, [scope, grants]);
+  const scopedCostCenterIds = useMemo(() => {
+    if (scope === "all") return null;
+    return new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
+  }, [scope, costCenters]);
+
+  const scopedBudgets = useMemo(() => (scope === "all"
+    ? budgets
+    : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
+  ).filter((b) => b.status === "Active"), [scope, budgets, scopedGrantIds, scopedCostCenterIds]);
+
+  const calendarYears = useMemo(() => {
+    const years = new Set();
+    scopedBudgets.forEach((b) => monthColumnsForBudget(b.periodStart, b.periodEnd).forEach((col) => years.add(col.year)));
+    return [...years].sort();
+  }, [scopedBudgets]);
+
+  // One pass across every in-scope budget line, bucketing Plan and Actual figures
+  // both by real calendar month (for the trend chart) and by grant/category (for
+  // the tables below) — respecting the selected calendar year throughout.
+  const agg = useMemo(() => {
+    const monthly = Array.from({ length: 12 }, () => ({ planRevenue: 0, planExpense: 0, actualRevenue: 0, actualExpense: 0 }));
+    const byCategory = {};
+    const byGrant = {};
+    const totals = { planRevenue: 0, planExpense: 0, actualRevenue: 0, actualExpense: 0 };
+
+    scopedBudgets.forEach((b) => {
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      const g = b.grantId ? grants.find((x) => x.id === b.grantId) : null;
+      const cc = b.costCenterId ? costCenters.find((x) => x.id === b.costCenterId) : null;
+      const ownerKey = b.grantId || b.costCenterId || "unknown";
+      const ownerName = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+      if (!byGrant[ownerKey]) byGrant[ownerKey] = { name: ownerName, planRevenue: 0, planExpense: 0, actualRevenue: 0, actualExpense: 0 };
+
+      b.lines.forEach((l) => {
+        (l.amounts || []).forEach((amt, i) => {
+          const col = cols[i];
+          if (!col || (calYear !== "All" && col.year !== calYear)) return;
+          const v = Number(amt) || 0;
+          if (l.type === "revenue") { monthly[col.monthIndex].planRevenue += v; totals.planRevenue += v; byGrant[ownerKey].planRevenue += v; }
+          else { monthly[col.monthIndex].planExpense += v; totals.planExpense += v; byGrant[ownerKey].planExpense += v; }
+          if (l.type === "expense") {
+            if (!byCategory[l.category]) byCategory[l.category] = { category: l.category, plan: 0, actual: 0 };
+            byCategory[l.category].plan += v;
+          }
+        });
+        (l.actuals || []).forEach((amt, i) => {
+          const col = cols[i];
+          if (!col || (calYear !== "All" && col.year !== calYear)) return;
+          const v = Number(amt) || 0;
+          if (l.type === "revenue") { monthly[col.monthIndex].actualRevenue += v; totals.actualRevenue += v; byGrant[ownerKey].actualRevenue += v; }
+          else { monthly[col.monthIndex].actualExpense += v; totals.actualExpense += v; byGrant[ownerKey].actualExpense += v; }
+          if (l.type === "expense") {
+            if (!byCategory[l.category]) byCategory[l.category] = { category: l.category, plan: 0, actual: 0 };
+            byCategory[l.category].actual += v;
+          }
+        });
+      });
+    });
+
+    return {
+      monthly: MONTHS.map((m, i) => ({ month: m, ...monthly[i] })),
+      byCategory: Object.values(byCategory).sort((a, b) => b.plan - a.plan),
+      byGrant: Object.entries(byGrant).map(([id, v]) => ({ id, ...v })).filter((r) => r.planRevenue || r.planExpense || r.actualRevenue || r.actualExpense),
+      totals,
+    };
+  }, [scopedBudgets, grants, costCenters, calYear]);
+
+  const sortedByGrant = useMemo(() => {
+    const dir = grantSort.dir === "asc" ? 1 : -1;
+    return [...agg.byGrant].sort((a, b) => {
+      const av = a[grantSort.key], bv = b[grantSort.key];
+      if (typeof av === "string") return av.localeCompare(bv) * dir;
+      return ((av ?? 0) - (bv ?? 0)) * dir;
+    });
+  }, [agg.byGrant, grantSort]);
+  const toggleGrantSort = (key) => setGrantSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "desc" }));
+
+  // Needs attention: grants behind pace per Burn Rate, and grants with overdue invoices.
+  const behindPaceGrants = useMemo(() => grants
+    .filter((g) => scope === "all" || scopedGrantIds?.has(g.id))
+    .map((g) => ({ grant: g, burn: grantBurn(g, budgets) }))
+    .filter((r) => r.burn.status === "Behind pace"), [grants, budgets, scope, scopedGrantIds]);
+
+  const overdueByGrant = useMemo(() => {
     const map = {};
-    relevantBudgets.forEach((b) => b.lines.forEach((l) => {
-      if (l.type !== "expense") return;
-      map[l.category] = (map[l.category] || 0) + lineTotal(l);
-    }));
-    return Object.entries(map).map(([category, total]) => ({ category, total })).sort((a, b) => b.total - a.total);
-  }, [relevantBudgets]);
-
-  const byMonth = useMemo(() => {
-    const revenue = Array(12).fill(0), expense = Array(12).fill(0);
-    relevantBudgets.forEach((b) => b.lines.forEach((l) => l.amounts.forEach((a, i) => {
-      if (l.type === "revenue") revenue[i] += Number(a) || 0; else expense[i] += Number(a) || 0;
-    })));
-    return MONTHS.map((m, i) => ({ month: m, revenue: revenue[i], expense: expense[i] }));
-  }, [relevantBudgets]);
-
-  const byGrant = useMemo(() => {
-    return grants.map((g) => {
-      const t = grantBudgetTotals(g.id, budgets);
-      return { grant: g.title, revenue: t.revenue, expense: t.expense };
-    }).filter((r) => r.revenue || r.expense);
-  }, [grants, budgets]);
-
-  const byProgram = useMemo(() => {
-    const map = {};
-    grants.forEach((g) => {
-      const t = grantBudgetTotals(g.id, budgets);
-      const key = g.programCode || "Unassigned";
-      if (!map[key]) map[key] = { program: key, revenue: 0, expense: 0 };
-      map[key].revenue += t.revenue; map[key].expense += t.expense;
+    (invoices || []).filter(isInvoiceOverdue).forEach((inv) => {
+      if (scope !== "all" && !scopedGrantIds?.has(inv.grantId)) return;
+      const g = grants.find((x) => x.id === inv.grantId);
+      const key = inv.grantId || "unlinked";
+      if (!map[key]) map[key] = { name: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "No grant linked", amount: 0, count: 0 };
+      map[key].amount += Number(inv.amount) || 0;
+      map[key].count += 1;
     });
     return Object.values(map);
-  }, [grants, budgets]);
-
-  const totals = relevantBudgets.reduce((acc, b) => {
-    const t = budgetTotals(b);
-    acc.revenue += t.revenue; acc.expense += t.expense;
-    return acc;
-  }, { revenue: 0, expense: 0 });
+  }, [invoices, grants, scope, scopedGrantIds]);
 
   const exportAllCsv = () => {
     const maxMonths = budgets.reduce((max, b) => Math.max(max, ...b.lines.map((l) => (l.amounts || []).length), 12), 12);
@@ -2918,80 +2978,128 @@ function ReportingView({ grants, budgets }) {
         </button>
       </div>
 
-      <Field label="Scope">
-        <GrantPicker grants={grants} value={scope === "all" ? "" : scope} onChange={(v) => setScope(v || "all")} noneLabel="All grants" noneValue="all" wrapStyle={{ maxWidth: 320 }} />
-      </Field>
+      <div className="flex flex-wrap gap-4">
+        <Field label="Scope">
+          <select value={scope} onChange={(e) => setScope(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
+            <option value="all">Whole Organization</option>
+            {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Calendar year">
+          <select value={calYear} onChange={(e) => setCalYear(e.target.value === "All" ? "All" : Number(e.target.value))} className={inputCls} style={{ ...inputStyle, maxWidth: 220 }}>
+            <option value="All">All years combined</option>
+            {calendarYears.map((y) => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </Field>
+      </div>
+      <p className="text-xs" style={{ color: "#8A8F87" }}>Only Active budgets are counted, matching Org Budget and Burn Rate.</p>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <StatCard label="Total revenue" value={fmt(totals.revenue)} />
-        <StatCard label="Total expense" value={fmt(totals.expense)} />
-        <StatCard label="Total net" value={fmt(totals.revenue - totals.expense)} />
+        <StatCard label="Total revenue" value={fmt(agg.totals.planRevenue)} sub={`Actual: ${fmt(agg.totals.actualRevenue)}`} />
+        <StatCard label="Total expense" value={fmt(agg.totals.planExpense)} sub={`Actual: ${fmt(agg.totals.actualExpense)}`} />
+        <StatCard label="Total net" value={fmt(agg.totals.planRevenue - agg.totals.planExpense)} sub={`Actual: ${fmt(agg.totals.actualRevenue - agg.totals.actualExpense)}`} />
       </div>
+
+      {(behindPaceGrants.length > 0 || overdueByGrant.length > 0) && (
+        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#C08A2E" }}>
+          <h2 className="font-display text-base mb-3" style={{ color: "#C08A2E" }}>Needs attention</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            {behindPaceGrants.length > 0 && (
+              <div>
+                <div className="text-xs font-medium mb-2" style={{ color: "#8A8F87" }}>Behind pace (per Burn Rate)</div>
+                <div className="space-y-1.5">
+                  {behindPaceGrants.map(({ grant, burn }) => (
+                    <div key={grant.id} className="flex items-center justify-between text-sm">
+                      <span style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</span>
+                      <span style={{ color: "#B5443A" }}>{Math.round(burn.pctBudgetUsed * 100)}% used, {Math.round((burn.pctTimeElapsed || 0) * 100)}% time elapsed</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {overdueByGrant.length > 0 && (
+              <div>
+                <div className="text-xs font-medium mb-2" style={{ color: "#8A8F87" }}>Overdue invoices</div>
+                <div className="space-y-1.5">
+                  {overdueByGrant.map((r) => (
+                    <div key={r.name} className="flex items-center justify-between text-sm">
+                      <span style={{ color: "#1C2624" }}>{r.name}</span>
+                      <span style={{ color: "#B5443A" }}>{fmt(r.amount)} ({r.count} invoice{r.count === 1 ? "" : "s"})</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
         <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Expense by category</h2>
-          {byCategory.length === 0 ? <p className="text-sm" style={{ color: "#8A8F87" }}>No monthly data yet.</p> : (
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={byCategory} layout="vertical" margin={{ left: 10 }}>
+          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Expense by category — Plan vs. Actual</h2>
+          {agg.byCategory.length === 0 ? <p className="text-sm" style={{ color: "#8A8F87" }}>No monthly data yet.</p> : (
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={agg.byCategory} layout="vertical" margin={{ left: 10 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#E1E5DE" />
                 <XAxis type="number" tickFormatter={(v) => `$${v / 1000}k`} tick={{ fontSize: 11 }} />
                 <YAxis type="category" dataKey="category" width={150} tick={{ fontSize: 10 }} />
                 <Tooltip formatter={(v) => fmt(v)} />
-                <Bar dataKey="total" fill="#B5443A" radius={[0, 3, 3, 0]} />
+                <Legend />
+                <Bar dataKey="plan" name="Plan" fill="#5B7FA6" radius={[0, 3, 3, 0]} />
+                <Bar dataKey="actual" name="Actual" fill="#B5443A" radius={[0, 3, 3, 0]} />
               </BarChart>
             </ResponsiveContainer>
           )}
         </div>
 
         <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Budget by month</h2>
-          <ResponsiveContainer width="100%" height={260}>
-            <LineChart data={byMonth}>
+          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Monthly trend — Plan vs. Actual</h2>
+          <ResponsiveContainer width="100%" height={280}>
+            <LineChart data={agg.monthly}>
               <CartesianGrid strokeDasharray="3 3" stroke="#E1E5DE" />
               <XAxis dataKey="month" tick={{ fontSize: 11 }} />
               <YAxis tickFormatter={(v) => `$${v / 1000}k`} tick={{ fontSize: 11 }} />
               <Tooltip formatter={(v) => fmt(v)} />
               <Legend />
-              <Line type="monotone" dataKey="revenue" stroke="#2F6F53" strokeWidth={2} dot={false} />
-              <Line type="monotone" dataKey="expense" stroke="#B5443A" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="planRevenue" name="Plan revenue" stroke="#2F6F53" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="planExpense" name="Plan expense" stroke="#B5443A" strokeWidth={2} dot={false} />
+              <Line type="monotone" dataKey="actualRevenue" name="Actual revenue" stroke="#2F6F53" strokeWidth={2} strokeDasharray="4 3" dot={false} />
+              <Line type="monotone" dataKey="actualExpense" name="Actual expense" stroke="#B5443A" strokeWidth={2} strokeDasharray="4 3" dot={false} />
             </LineChart>
           </ResponsiveContainer>
         </div>
+      </div>
 
-        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Budget by program</h2>
-          {byProgram.length === 0 ? <p className="text-sm" style={{ color: "#8A8F87" }}>No grant budget data yet.</p> : (
-            <ResponsiveContainer width="100%" height={240}>
-              <BarChart data={byProgram}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E1E5DE" />
-                <XAxis dataKey="program" tick={{ fontSize: 10 }} />
-                <YAxis tickFormatter={(v) => `$${v / 1000}k`} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => fmt(v)} />
-                <Legend />
-                <Bar dataKey="revenue" fill="#2F6F53" radius={[3, 3, 0, 0]} />
-                <Bar dataKey="expense" fill="#B5443A" radius={[3, 3, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-
-        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Budget by grant</h2>
-          {byGrant.length === 0 ? <p className="text-sm" style={{ color: "#8A8F87" }}>No grant budget data yet.</p> : (
-            <ResponsiveContainer width="100%" height={240}>
-              <BarChart data={byGrant}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#E1E5DE" />
-                <XAxis dataKey="grant" tick={{ fontSize: 9 }} interval={0} angle={-20} textAnchor="end" height={60} />
-                <YAxis tickFormatter={(v) => `$${v / 1000}k`} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => fmt(v)} />
-                <Legend />
-                <Bar dataKey="revenue" fill="#2F6F53" radius={[3, 3, 0, 0]} />
-                <Bar dataKey="expense" fill="#B5443A" radius={[3, 3, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>By grant / cost center</h2>
+        {sortedByGrant.length === 0 ? (
+          <p className="text-sm" style={{ color: "#8A8F87" }}>No budget data yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ color: "#8A8F87" }}>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("name")}>Grant / Cost Center</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("planRevenue")}>Plan revenue</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("actualRevenue")}>Actual revenue</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("planExpense")}>Plan expense</th>
+                  <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleGrantSort("actualExpense")}>Actual expense</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedByGrant.map((r) => (
+                  <tr key={r.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                    <td className="py-1.5" style={{ color: "#1C2624" }}>{r.name}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#2F6F53" }}>{fmt(r.planRevenue)}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#2F6F53" }}>{fmt(r.actualRevenue)}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{fmt(r.planExpense)}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{fmt(r.actualExpense)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -6059,7 +6167,7 @@ export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disable
         ) : tab === "user-access" && isAdmin ? (
           <AdminPanel currentUserEmail={currentUserEmail || whoami} />
         ) : (
-          <ReportingView grants={grants} budgets={budgets} />
+          <ReportingView grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups} invoices={invoices} />
         )}
         </main>
       </div>
