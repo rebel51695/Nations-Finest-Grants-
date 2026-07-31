@@ -676,7 +676,7 @@ function Modal({ title, onClose, children, wide, size }) {
   const widthClass = size === "xl" ? "w-[97vw] max-w-[2000px]" : wide ? "max-w-4xl" : "max-w-lg";
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto overflow-x-hidden py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
-      <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto overflow-x-hidden`}>
+      <div className={`bg-white rounded-xl shadow-xl w-full ${widthClass} my-auto`}>
         <div className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "#E1E5DE" }}>
           <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>{title}</h2>
           <button onClick={onClose} className="p-1 rounded hover:bg-stone-100">
