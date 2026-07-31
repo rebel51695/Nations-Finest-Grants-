@@ -1178,13 +1178,13 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         <table className="text-xs" style={{ fontFamily: "var(--mono-font)", width: "max-content" }}>
           <thead>
             <tr style={{ background: "#F6F7F3" }}>
-              <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 190 }}>Category</th>
-              <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
-              <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
-              <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
+              <th className="text-left px-2 py-2 sticky left-0 z-20" style={{ background: "#F6F7F3", minWidth: 160 }}>Category</th>
+              <th className="text-left px-2 py-2 sticky z-10" style={{ left: 160, background: "#F6F7F3", minWidth: 160 }}>Subcategory</th>
+              <th className="text-left px-2 py-2 sticky z-10" style={{ left: 320, background: "#F6F7F3", minWidth: 120 }}>Description</th>
+              <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Annual total</th>
               {cols.map((col, i) => (
                 <Fragment key={i}>
-                  <th className="text-right px-2 py-2" style={{ minWidth: 88 }}>{col.label}</th>
+                  <th className="text-right px-2 py-2" style={{ minWidth: 72 }}>{col.label}</th>
                   {mode === "actual" && <th className="text-right px-2 py-2" style={{ minWidth: 60, color: "#8A8F87", fontWeight: 400 }}>% var</th>}
                 </Fragment>
               ))}
@@ -1202,7 +1202,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
               const values = line[field] || Array(12).fill(0);
               return (
                 <tr key={line.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                  <td className="px-2 py-1.5 sticky left-0 bg-white">
+                  <td className="px-2 py-1.5 sticky left-0 z-20 bg-white">
                     {line.categoryCustom ? (
                       <div className="flex gap-1">
                         <input
@@ -1249,7 +1249,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                       </select>
                     )}
                   </td>
-                  <td className="px-2 py-1.5">
+                  <td className="px-2 py-1.5 sticky z-10 bg-white" style={{ left: 160 }}>
                     {line.categoryCustom || line.subcategoryCustom ? (
                       <div className="flex gap-1">
                         <input
@@ -1289,7 +1289,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                       </select>
                     )}
                   </td>
-                  <td className="px-2 py-1.5">
+                  <td className="px-2 py-1.5 sticky z-10 bg-white" style={{ left: 320 }}>
                     <input
                       value={line.description || ""}
                       onChange={(e) => updateLine(line.id, { description: e.target.value })}
@@ -1353,9 +1353,9 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             })}
             {form.lines.length > 0 && (
               <tr className="border-t-2" style={{ borderColor: "#1C2624" }}>
-                <td className="px-2 py-1.5 sticky left-0 font-medium text-xs" style={{ background: "#F6F7F3", color: "#1C2624" }}>Monthly net</td>
-                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
-                <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
+                <td className="px-2 py-1.5 sticky left-0 z-20 font-medium text-xs" style={{ background: "#F6F7F3", color: "#1C2624" }}>Monthly net</td>
+                <td className="px-2 py-1.5 sticky z-10" style={{ left: 160, background: "#F6F7F3" }}></td>
+                <td className="px-2 py-1.5 sticky z-10" style={{ left: 320, background: "#F6F7F3" }}></td>
                 <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
                 {cols.map((_, i) => {
                   const net = form.lines.reduce((sum, l) => {
