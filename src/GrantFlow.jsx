@@ -79,7 +79,11 @@ const SITE_OPTIONS = [
 ];
 const RISKS = ["Low", "Medium", "High"];
 const CADENCES = ["Weekly", "Monthly", "Quarterly", "Semi-annual", "Annually", "End of grant"];
-const BUDGET_STATUSES = ["Draft", "Pending Approval", "Active", "Rejected", "Closed"];
+const BUDGET_STATUSES = ["Draft", "Pending Approval", "Active", "Awarded", "Rejected", "Closed"];
+// "Awarded" is functionally identical to "Active" everywhere budgets are scoped,
+// totaled, or rolled up (org budget, scenarios, burn rate, dashboard counts, etc).
+// It exists as a separate status purely so it can be labeled/badged differently.
+const isActiveBudget = (status) => status === "Active" || status === "Awarded";
 const STAFF_STATUSES = ["Active", "Inactive", "Leave of Absence"];
 const AUTO_BACKUP_RETENTION_DAYS = 30;
 const INVOICE_STATUSES = ["Draft", "Submitted", "Paid", "Rejected"];
@@ -388,7 +392,7 @@ function liveComparisonForScenario(scenario, grants, budgets, costCenters) {
     const calYear = basedOn.calYear ?? "All";
     const scopedGrantIds = scope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
     const scopedCcIds = scope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
-    const scopedBudgets = (scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => b.status === "Active");
+    const scopedBudgets = (scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
     const map = {};
     scopedBudgets.forEach((b) => {
       const cols = monthColumnsForBudget(b.periodStart);
@@ -1111,10 +1115,10 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             )}
           </div>
         )}
-        {form.status === "Active" && (
+        {(form.status === "Active" || form.status === "Awarded") && (
           <div className="text-sm" style={{ color: "#2F6F53" }}>
             <CheckCircle size={13} className="inline mr-1" style={{ marginBottom: 2 }} />
-            Approved{form.approvedBy ? ` by ${form.approvedBy}` : ""}{form.approvedAt ? ` on ${fmtDate(form.approvedAt)}` : ""}
+            {form.status === "Awarded" ? "Awarded" : "Approved"}{form.approvedBy ? ` by ${form.approvedBy}` : ""}{form.approvedAt ? ` on ${fmtDate(form.approvedAt)}` : ""}
           </div>
         )}
         {form.status === "Closed" && (
@@ -1617,7 +1621,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
     return a + ((Number(g.awardAmount) || 0) - t.expense);
   }, 0);
   const activeGrantIds = new Set(activeGrants.map((g) => g.id));
-  const activeBudgets = budgets.filter((b) => b.status === "Active" && activeGrantIds.has(b.grantId)).length;
+  const activeBudgets = budgets.filter((b) => isActiveBudget(b.status) && activeGrantIds.has(b.grantId)).length;
 
   const fyYear = new Date().getFullYear();
   const fyStart = new Date(fyYear, 0, 1);
@@ -2242,11 +2246,12 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
         )}
       </div>
 
-      <div className="grid grid-cols-3 sm:grid-cols-5 gap-3">
+      <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
         <StatCard label="Total budgets" value={allBudgetsEnriched.length} />
         <StatCard label="Draft" value={statusCounts["Draft"] || 0} />
         <StatCard label="Pending approval" value={statusCounts["Pending Approval"] || 0} />
         <StatCard label="Active" value={statusCounts["Active"] || 0} />
+        <StatCard label="Awarded" value={statusCounts["Awarded"] || 0} />
         <StatCard label="Closed" value={statusCounts["Closed"] || 0} />
       </div>
 
@@ -2305,7 +2310,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                     <td className="py-1.5" style={{ color: "#1C2624" }}>{b.title || "Untitled budget"}</td>
                     <td className="py-1.5" style={{ color: "#8A8F87" }}>{b.fy}</td>
                     <td className="py-1.5">
-                      <Badge color={b.status === "Active" ? "#2F6F53" : b.status === "Pending Approval" ? "#C08A2E" : b.status === "Rejected" ? "#B5443A" : "#8A8F87"}>{b.status}</Badge>
+                      <Badge color={isActiveBudget(b.status) ? "#2F6F53" : b.status === "Pending Approval" ? "#C08A2E" : b.status === "Rejected" ? "#B5443A" : "#8A8F87"}>{b.status}</Badge>
                     </td>
                     <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.netTotal >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(b.netTotal)}</td>
                   </tr>
@@ -2385,7 +2390,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                     <div className="font-medium" style={{ color: "#1C2624" }}>{b.title}</div>
                     <div className="text-xs mt-0.5" style={{ color: "#8A8F87" }}>{b.fy} · {fmtDate(b.periodStart)} – {fmtDate(b.periodEnd)}</div>
                   </div>
-                  <Badge color={b.status === "Active" ? "#2F6F53" : b.status === "Closed" ? "#8A8F87" : b.status === "Rejected" ? "#B5443A" : b.status === "Pending Approval" ? "#C08A2E" : "#5B7FA6"}>{b.status}</Badge>
+                  <Badge color={isActiveBudget(b.status) ? "#2F6F53" : b.status === "Closed" ? "#8A8F87" : b.status === "Rejected" ? "#B5443A" : b.status === "Pending Approval" ? "#C08A2E" : "#5B7FA6"}>{b.status}</Badge>
                 </div>
                 <div className="flex gap-5 mt-3 text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>
                   <div><span style={{ color: "#8A8F87" }}>Revenue </span><span style={{ color: "#2F6F53" }}>{fmt(t.revenue)}</span></div>
@@ -2900,7 +2905,7 @@ function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices })
   const scopedBudgets = useMemo(() => (scope === "all"
     ? budgets
     : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
-  ).filter((b) => b.status === "Active"), [scope, budgets, scopedGrantIds, scopedCostCenterIds]);
+  ).filter((b) => isActiveBudget(b.status)), [scope, budgets, scopedGrantIds, scopedCostCenterIds]);
 
   const calendarYears = useMemo(() => {
     const years = new Set();
@@ -3175,7 +3180,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
   const orgCalendarYears = useMemo(() => {
     const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
     const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
-    const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => b.status === "Active");
+    const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
     const years = new Set();
     scoped.forEach((b) => monthColumnsForBudget(b.periodStart).forEach((col) => years.add(col.year)));
     return [...years].sort();
@@ -3209,7 +3214,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
       scen.periodStart = orgYear !== "All" ? `${orgYear}-01-01` : "";
       const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
       const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
-      const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => b.status === "Active");
+      const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
       const map = {};
       scoped.forEach((b) => {
         const cols = monthColumnsForBudget(b.periodStart);
@@ -3844,7 +3849,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const scopedBudgets = (scope === "all"
     ? budgets.filter((b) => !(b.grantId && excludedGrantIds?.has(b.grantId)) && !(b.costCenterId && excludedCcIds?.has(b.costCenterId)))
     : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
-  ).filter((b) => b.status === "Active");
+  ).filter((b) => isActiveBudget(b.status));
 
   // Real calendar years actually touched by any in-scope budget's period, so the
   // year picker reflects reality even when grants run off the calendar year.
