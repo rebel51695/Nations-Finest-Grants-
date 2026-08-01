@@ -1020,7 +1020,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   // the frozen (sticky) Category/Subcategory/Description columns never drift
   // out of alignment with their hardcoded `left` offsets, even when a long
   // category name would otherwise make the browser widen that column.
-  const COL_W = { category: 160, subcategory: 160, description: 120, annual: 80, month: 72, variance: 60, total: 80, totalVariance: 64, trash: 36 };
+  const COL_W = { category: 160, subcategory: 200, description: 120, annual: 80, month: 92, variance: 60, total: 80, totalVariance: 64, trash: 36 };
   const tableTotalWidth = COL_W.category + COL_W.subcategory + COL_W.description + COL_W.annual
     + cols.length * (COL_W.month + (mode === "actual" ? COL_W.variance : 0))
     + COL_W.total + (mode === "actual" ? COL_W.totalVariance : 0) + COL_W.trash;
