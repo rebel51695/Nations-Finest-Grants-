@@ -120,7 +120,19 @@ const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep",
 const APP_VERSION = "1.1.2";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
-const fmt = (n) => (Number(n) || 0).toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+const fmt = (n) => {
+  let v = Number(n) || 0;
+  // Sums of many decimal values can leave tiny float residue (e.g.
+  // -0.0000000000003) that's technically negative but should read as a
+  // clean $0, not "-$0".
+  if (Math.round(v * 100) === 0) v = 0;
+  return v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+};
+// Sums of many decimal (cents) values can leave tiny floating-point residue
+// (e.g. -0.0000000000003) that's technically negative but displays as $0
+// after fmt()'s rounding. Round to the nearest cent before deciding color so
+// a value that visibly reads as $0 never gets colored as if it were negative.
+const isNetNegative = (n) => Math.round((Number(n) || 0) * 100) < 0;
 const fmtDate = (d) => (d ? new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—");
 
 function newLine(monthCount = 12) {
@@ -1432,13 +1444,13 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
           <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>Plan</div>
           <div><span style={{ color: "#5B6B66" }}>Revenue: </span><span className="font-medium" style={{ color: "#2F6F53" }}>{fmt(totals.revenue)}</span></div>
           <div><span style={{ color: "#5B6B66" }}>Expense: </span><span className="font-medium" style={{ color: "#1C2624" }}>{fmt(totals.expense)}</span></div>
-          <div><span style={{ color: "#5B6B66" }}>Net: </span><span className="font-medium" style={{ color: totals.net >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(totals.net)}</span></div>
+          <div><span style={{ color: "#5B6B66" }}>Net: </span><span className="font-medium" style={{ color: !isNetNegative(totals.net) ? "#2F6F53" : "#B5443A" }}>{fmt(totals.net)}</span></div>
         </div>
         <div>
           <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>Actual</div>
           <div><span style={{ color: "#5B6B66" }}>Revenue: </span><span className="font-medium" style={{ color: "#2F6F53" }}>{fmt(actualTotals.revenue)}</span></div>
           <div><span style={{ color: "#5B6B66" }}>Expense: </span><span className="font-medium" style={{ color: "#1C2624" }}>{fmt(actualTotals.expense)}</span></div>
-          <div><span style={{ color: "#5B6B66" }}>Net: </span><span className="font-medium" style={{ color: actualTotals.net >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(actualTotals.net)}</span></div>
+          <div><span style={{ color: "#5B6B66" }}>Net: </span><span className="font-medium" style={{ color: !isNetNegative(actualTotals.net) ? "#2F6F53" : "#B5443A" }}>{fmt(actualTotals.net)}</span></div>
         </div>
         <div>
           <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>Variance (Actual − Plan)</div>
@@ -2346,7 +2358,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                     <td className="py-1.5">
                       <Badge color={isActiveBudget(b.status) ? "#2F6F53" : b.status === "Pending Approval" ? "#C08A2E" : b.status === "Rejected" ? "#B5443A" : "#8A8F87"}>{b.status}</Badge>
                     </td>
-                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.netTotal >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(b.netTotal)}</td>
+                    <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(b.netTotal) ? "#2F6F53" : "#B5443A" }}>{fmt(b.netTotal)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -2429,7 +2441,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                 <div className="flex gap-5 mt-3 text-sm" style={{ fontVariantNumeric: "tabular-nums" }}>
                   <div><span style={{ color: "#8A8F87" }}>Revenue </span><span style={{ color: "#2F6F53" }}>{fmt(t.revenue)}</span></div>
                   <div><span style={{ color: "#8A8F87" }}>Expense </span><span style={{ color: "#1C2624" }}>{fmt(t.expense)}</span></div>
-                  <div><span style={{ color: "#8A8F87" }}>Net </span><span style={{ color: t.net >= 0 ? "#2F6F53" : "#B5443A" }}>{fmt(t.net)}</span></div>
+                  <div><span style={{ color: "#8A8F87" }}>Net </span><span style={{ color: !isNetNegative(t.net) ? "#2F6F53" : "#B5443A" }}>{fmt(t.net)}</span></div>
                 </div>
                 <div className="flex gap-2 mt-4 flex-wrap">
                   <button onClick={() => setModal(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
@@ -4218,7 +4230,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
                 <tr className="border-t" style={{ borderColor: "#E1E5DE" }}>
                   <td className="px-3 py-1.5 text-xs font-semibold sticky left-0 bg-white">Net Total</td>
                   {yearCompare.years.map((fy) => (
-                    <td key={fy} className="px-3 py-1.5 text-xs text-right font-semibold" style={{ fontVariantNumeric: "tabular-nums", color: yearCompare.byYear[fy].net >= 0 ? "#2F6F53" : "#B5443A" }}>
+                    <td key={fy} className="px-3 py-1.5 text-xs text-right font-semibold" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(yearCompare.byYear[fy].net) ? "#2F6F53" : "#B5443A" }}>
                       {fmt(yearCompare.byYear[fy].net)}
                     </td>
                   ))}
@@ -4263,7 +4275,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
                 </Fragment>
               ))}
               <OrgBudgetRow label="Total Expense" values={totalExpense} projected={totalExpenseProjected} bold />
-              <OrgBudgetRow label="Net Total" values={net} projected={netProjected} bold color={net.reduce((a, b) => a + b, 0) >= 0 ? "#2F6F53" : "#B5443A"} />
+              <OrgBudgetRow label="Net Total" values={net} projected={netProjected} bold color={!isNetNegative(net.reduce((a, b) => a + b, 0)) ? "#2F6F53" : "#B5443A"} />
             </tbody>
           </table>
         </div>
