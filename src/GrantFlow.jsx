@@ -21,6 +21,22 @@ const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov
 // calendar month/year each of the budget's 12 monthly slots actually falls on.
 // This lets a budget's columns be labeled correctly (e.g. "Oct 2025" instead of
 // always assuming "Jan") for grants that don't run on the calendar year.
+// Parses a budget's "actuals complete through" marker (stored as "YYYY-MM")
+// into a comparable { year, monthIndex } shape. Returns null if unset.
+function parseActualsThrough(str) {
+  if (!str) return null;
+  const [y, m] = str.split("-").map(Number);
+  if (!y || !m) return null;
+  return { year: y, monthIndex: m - 1 };
+}
+// True if a month column falls on/before the marked cutoff (i.e. it's real,
+// entered data) — false if it's past the cutoff and should be projected.
+function colIsWithinCutoff(col, cutoff) {
+  if (!cutoff) return true;
+  if (col.year !== cutoff.year) return col.year < cutoff.year;
+  return col.monthIndex <= cutoff.monthIndex;
+}
+
 function monthColumnsForBudget(periodStart, periodEnd) {
   let startYear, startMonth; // startMonth is 0-indexed
   if (periodStart) {
@@ -1169,21 +1185,39 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         <p className="text-xs" style={{ color: "#8A8F87" }}>
           Enter a number in <strong>Annual total</strong> to split it evenly across all 12 months, then fine-tune any month directly.
         </p>
-        <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
-          <button
-            onClick={() => setMode("plan")}
-            className="px-3 py-1.5 text-xs font-medium"
-            style={{ background: mode === "plan" ? "#2F6F53" : "#FFFFFF", color: mode === "plan" ? "#FFFFFF" : "#5B6B66" }}
-          >
-            Plan
-          </button>
-          <button
-            onClick={() => setMode("actual")}
-            className="px-3 py-1.5 text-xs font-medium"
-            style={{ background: mode === "actual" ? "#2F6F53" : "#FFFFFF", color: mode === "actual" ? "#FFFFFF" : "#5B6B66" }}
-          >
-            Actual
-          </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {mode === "actual" && (
+            <label className="flex items-center gap-1.5 text-xs" style={{ color: "#8A8F87" }}>
+              Actuals complete through
+              <select
+                className={inputCls}
+                style={{ ...inputStyle, width: "auto", padding: "4px 8px", fontSize: 12 }}
+                value={form.actualsThrough || ""}
+                onChange={(e) => setForm({ ...form, actualsThrough: e.target.value || "" })}
+              >
+                <option value="">Not marked</option>
+                {cols.map((c, i) => (
+                  <option key={i} value={`${c.year}-${String(c.monthIndex + 1).padStart(2, "0")}`}>{c.label}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+            <button
+              onClick={() => setMode("plan")}
+              className="px-3 py-1.5 text-xs font-medium"
+              style={{ background: mode === "plan" ? "#2F6F53" : "#FFFFFF", color: mode === "plan" ? "#FFFFFF" : "#5B6B66" }}
+            >
+              Plan
+            </button>
+            <button
+              onClick={() => setMode("actual")}
+              className="px-3 py-1.5 text-xs font-medium"
+              style={{ background: mode === "actual" ? "#2F6F53" : "#FFFFFF", color: mode === "actual" ? "#FFFFFF" : "#5B6B66" }}
+            >
+              Actual
+            </button>
+          </div>
         </div>
       </div>
 
@@ -3144,18 +3178,26 @@ function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices })
   );
 }
 
-function OrgBudgetRow({ label, values, bold, indent, color, isHeader }) {
+function OrgBudgetRow({ label, values, projected, bold, indent, color, isHeader }) {
   const total = values.reduce((a, b) => a + b, 0);
   return (
     <tr className={isHeader ? "" : "border-t"} style={{ borderColor: "#E1E5DE", background: isHeader ? "#F6F7F3" : "transparent" }}>
       <td className={`px-3 py-1.5 text-xs sticky left-0 ${isHeader ? "" : "bg-white"}`} style={{ background: isHeader ? "#F6F7F3" : undefined, paddingLeft: indent ? 28 : 12, fontWeight: bold ? 600 : 400, color: color || "#1C2624" }}>
         {label}
       </td>
-      {values.map((v, i) => (
-        <td key={i} className="px-2 py-1.5 text-right text-xs" style={{ fontVariantNumeric: "tabular-nums", fontWeight: bold ? 600 : 400, color: color || "#1C2624" }}>
-          {v ? fmt(v) : "—"}
-        </td>
-      ))}
+      {values.map((v, i) => {
+        const isProj = !!(projected && projected[i]);
+        return (
+          <td
+            key={i}
+            className="px-2 py-1.5 text-right text-xs"
+            style={{ fontVariantNumeric: "tabular-nums", fontWeight: bold ? 600 : 400, color: isProj ? "#8A8F87" : (color || "#1C2624"), fontStyle: isProj ? "italic" : "normal" }}
+            title={isProj ? "Projected from this line's average actuals so far — not entered data" : undefined}
+          >
+            {v ? fmt(v) : "—"}
+          </td>
+        );
+      })}
       <td className="px-3 py-1.5 text-right text-xs" style={{ fontVariantNumeric: "tabular-nums", fontWeight: bold ? 700 : 500, color: color || "#1C2624" }}>
         {fmt(total)}
       </td>
@@ -3868,28 +3910,51 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 
   const grouped = useMemo(() => {
     const map = {};
-    CATEGORIES.forEach((c) => { map[c.name] = { type: c.type, monthly: Array(12).fill(0), subs: {} }; });
+    CATEGORIES.forEach((c) => { map[c.name] = { type: c.type, monthly: Array(12).fill(0), monthlyProjected: Array(12).fill(false), subs: {} }; });
     scopedBudgets.forEach((b) => {
       const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      // Only actuals ever get projected — plan figures are what you entered,
+      // there's nothing to run a rate off of. A budget only projects once its
+      // "actuals complete through" marker is set (see BudgetModal); otherwise
+      // it behaves exactly as before.
+      const cutoff = dataMode === "actual" ? parseActualsThrough(b.actualsThrough) : null;
       b.lines.forEach((l) => {
-        if (!map[l.category]) map[l.category] = { type: l.type, monthly: Array(12).fill(0), subs: {} };
+        if (!map[l.category]) map[l.category] = { type: l.type, monthly: Array(12).fill(0), monthlyProjected: Array(12).fill(false), subs: {} };
         const bucket = map[l.category];
         const vals = l[amountsField] || Array(12).fill(0);
-        vals.forEach((a, i) => {
-          const col = cols[i];
+        let avg = 0;
+        if (cutoff) {
+          const actualVals = cols
+            .map((col, i) => (colIsWithinCutoff(col, cutoff) ? Number(vals[i]) || 0 : null))
+            .filter((v) => v !== null);
+          avg = actualVals.length ? actualVals.reduce((a, x) => a + x, 0) / actualVals.length : 0;
+        }
+        cols.forEach((col, i) => {
           if (!col) return;
           if (calYear !== "All" && col.year !== calYear) return;
-          const slot = calYear === "All" ? col.monthIndex : col.monthIndex;
-          bucket.monthly[slot] += Number(a) || 0;
+          const isProjected = cutoff ? !colIsWithinCutoff(col, cutoff) : false;
+          const a = isProjected ? avg : (Number(vals[i]) || 0);
+          const slot = col.monthIndex;
+          bucket.monthly[slot] += a;
+          if (isProjected) bucket.monthlyProjected[slot] = true;
           if (l.subcategory) {
-            if (!bucket.subs[l.subcategory]) bucket.subs[l.subcategory] = Array(12).fill(0);
-            bucket.subs[l.subcategory][slot] += Number(a) || 0;
+            if (!bucket.subs[l.subcategory]) bucket.subs[l.subcategory] = { values: Array(12).fill(0), projected: Array(12).fill(false) };
+            bucket.subs[l.subcategory].values[slot] += a;
+            if (isProjected) bucket.subs[l.subcategory].projected[slot] = true;
           }
         });
       });
     });
     return map;
-  }, [scopedBudgets, amountsField, calYear]);
+  }, [scopedBudgets, amountsField, calYear, dataMode]);
+
+  // For Total Revenue / Total Expense / Net rows, a month is "projected" if
+  // any contributing category had projected data in it.
+  const combineProjected = (cats) => {
+    const arr = Array(12).fill(false);
+    cats.forEach((c) => grouped[c.name].monthlyProjected.forEach((p, i) => { if (p) arr[i] = true; }));
+    return arr;
+  };
 
   const yearCompare = useMemo(() => {
     const years = [...new Set(scopedBudgets.map((b) => b.fy || "Unspecified"))].sort();
@@ -3913,15 +3978,21 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const totalRevenue = sumRows(revenueCats.map((c) => grouped[c.name].monthly));
   const totalExpense = sumRows(expenseCats.map((c) => grouped[c.name].monthly));
   const net = totalRevenue.map((v, i) => v - totalExpense[i]);
+  const totalRevenueProjected = combineProjected(revenueCats);
+  const totalExpenseProjected = combineProjected(expenseCats);
+  const netProjected = totalRevenueProjected.map((p, i) => p || totalExpenseProjected[i]);
+  const anyProjected = dataMode === "actual" && scopedBudgets.some((b) => parseActualsThrough(b.actualsThrough));
 
   const exportCsv = () => {
     const monthLabels = MONTHS.map((m) => (calYear === "All" ? m : `${m} ${calYear}`));
-    const rows = [["Category", "Subcategory", ...monthLabels, "Total"]];
+    const rows = [];
+    if (anyProjected) rows.push(["Note: months after each budget's marked \"actuals complete through\" date are run-rate projections, not entered data."]);
+    rows.push(["Category", "Subcategory", ...monthLabels, "Total"]);
     const pushSection = (cats) => cats.forEach((c) => {
       const bucket = grouped[c.name];
       rows.push([c.name, "", ...bucket.monthly, bucket.monthly.reduce((a, b) => a + b, 0)]);
-      Object.entries(bucket.subs).forEach(([sub, vals]) => {
-        rows.push([c.name, sub, ...vals, vals.reduce((a, b) => a + b, 0)]);
+      Object.entries(bucket.subs).forEach(([sub, subData]) => {
+        rows.push([c.name, sub, ...subData.values, subData.values.reduce((a, b) => a + b, 0)]);
       });
     });
     pushSection(revenueCats);
@@ -4001,6 +4072,11 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
       {scope === "all" && deferredRevenueGroupId && (
         <p className="text-xs" style={{ color: "#8A8F87" }}>
           Grants and cost centers in the "Deferred Revenue" budget group are excluded from Whole Organization totals — select that group above to view them.
+        </p>
+      )}
+      {viewMode === "monthly" && anyProjected && (
+        <p className="text-xs flex items-center gap-1.5" style={{ color: "#8A8F87" }}>
+          <span style={{ fontStyle: "italic" }}>Italic, muted figures</span> are projected from each budget's average actuals so far — not entered data. Set "Actuals complete through" on a budget to turn this on.
         </p>
       )}
 
@@ -4091,25 +4167,25 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
               <OrgBudgetRow label="Revenue" values={Array(12).fill(0)} isHeader bold />
               {revenueCats.map((c) => (
                 <Fragment key={c.name}>
-                  <OrgBudgetRow label={c.name} values={grouped[c.name].monthly} indent color="#2F6F53" />
-                  {Object.entries(grouped[c.name].subs).map(([sub, vals]) => (
-                    <OrgBudgetRow key={c.name + sub} label={sub} values={vals} indent color="#5B6B66" />
+                  <OrgBudgetRow label={c.name} values={grouped[c.name].monthly} projected={grouped[c.name].monthlyProjected} indent color="#2F6F53" />
+                  {Object.entries(grouped[c.name].subs).map(([sub, subData]) => (
+                    <OrgBudgetRow key={c.name + sub} label={sub} values={subData.values} projected={subData.projected} indent color="#5B6B66" />
                   ))}
                 </Fragment>
               ))}
-              <OrgBudgetRow label="Total Revenue" values={totalRevenue} bold color="#2F6F53" />
+              <OrgBudgetRow label="Total Revenue" values={totalRevenue} projected={totalRevenueProjected} bold color="#2F6F53" />
 
               <OrgBudgetRow label="Expense" values={Array(12).fill(0)} isHeader bold />
               {expenseCats.map((c) => (
                 <Fragment key={c.name}>
-                  <OrgBudgetRow label={c.name} values={grouped[c.name].monthly} indent />
-                  {Object.entries(grouped[c.name].subs).map(([sub, vals]) => (
-                    <OrgBudgetRow key={c.name + sub} label={sub} values={vals} indent color="#5B6B66" />
+                  <OrgBudgetRow label={c.name} values={grouped[c.name].monthly} projected={grouped[c.name].monthlyProjected} indent />
+                  {Object.entries(grouped[c.name].subs).map(([sub, subData]) => (
+                    <OrgBudgetRow key={c.name + sub} label={sub} values={subData.values} projected={subData.projected} indent color="#5B6B66" />
                   ))}
                 </Fragment>
               ))}
-              <OrgBudgetRow label="Total Expense" values={totalExpense} bold />
-              <OrgBudgetRow label="Net Total" values={net} bold color={net.reduce((a, b) => a + b, 0) >= 0 ? "#2F6F53" : "#B5443A"} />
+              <OrgBudgetRow label="Total Expense" values={totalExpense} projected={totalExpenseProjected} bold />
+              <OrgBudgetRow label="Net Total" values={net} projected={netProjected} bold color={net.reduce((a, b) => a + b, 0) >= 0 ? "#2F6F53" : "#B5443A"} />
             </tbody>
           </table>
         </div>
