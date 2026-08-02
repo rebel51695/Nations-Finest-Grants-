@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, Fragment } from "react";
+import { useState, useEffect, useMemo, useRef, Fragment, Component } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "./firebaseConfig";
 import * as XLSX from "xlsx";
@@ -829,7 +829,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
     complianceOwner: "", financeOwner: "", internalOwner: "", operationsOwner: "", renewal: false,
     doclibUrl: "", contractUrl: "", notes: "",
     budgetPeriodStart: "", budgetPeriodEnd: "", obligatedFunds: 0, obligatedFundsRemaining: 0, paymentMethod: PAYMENT_METHODS[0],
-    beds: "", bedRate: 0, grantPoc: "", awardAmountRemaining: 0, budgetGroupId: "",
+    beds: "", bedRate: 0, grantPoc: "", awardAmountRemaining: 0, budgetGroupId: "", indirectRate: 0,
   });
   const [bgModal, setBgModal] = useState(null);
   const saveBudgetGroup = (bg) => {
@@ -895,6 +895,9 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
         </Field>
         <Field label="Award amount remaining">
           <input type="number" className={inputCls} style={inputStyle} value={form.awardAmountRemaining} onChange={set("awardAmountRemaining")} />
+        </Field>
+        <Field label="Indirect cost rate (%)">
+          <input type="number" step="0.01" className={inputCls} style={inputStyle} value={form.indirectRate} onChange={set("indirectRate")} placeholder="e.g. 15" />
         </Field>
         <div className="col-span-2">
           <Field label={`Reporting cadence${form.cadence.length ? ` (${form.cadence.length} selected)` : ""}`}>
@@ -1002,7 +1005,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 
 // ---------- budget form ----------
 
-function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail }) {
+function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [] }) {
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(budget || {
     id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
     status: "Draft", notes: "", lines: [newLine()],
@@ -1055,7 +1058,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   // the frozen (sticky) Category/Subcategory/Description columns never drift
   // out of alignment with their hardcoded `left` offsets, even when a long
   // category name would otherwise make the browser widen that column.
-  const COL_W = { category: 160, subcategory: 200, description: 120, annual: 80, month: 92, variance: 60, total: 80, totalVariance: 64, trash: 36 };
+  const COL_W = { category: 160, subcategory: 200, description: 120, annual: 96, month: 92, variance: 60, total: 80, totalVariance: 64, trash: 36 };
   const tableTotalWidth = COL_W.category + COL_W.subcategory + COL_W.description + COL_W.annual
     + cols.length * (COL_W.month + (mode === "actual" ? COL_W.variance : 0))
     + COL_W.total + (mode === "actual" ? COL_W.totalVariance : 0) + COL_W.trash;
@@ -1064,6 +1067,23 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
     const val = yearlyDraft[id];
     if (val === undefined || val === "") return;
     updateLine(id, { [field]: distributeEvenly(val, cols.length) });
+  };
+
+  // If this grant has a negotiated indirect cost rate on file, a line whose
+  // category is some flavor of "Indirect Billing" can be auto-calculated as
+  // that rate applied to its matching direct-revenue sibling line, instead of
+  // hand-computing the percentage every renewal year.
+  const grant = grants.find((g) => g.id === form.grantId);
+  const calcIndirect = (lineId) => {
+    const line = form.lines.find((l) => l.id === lineId);
+    if (!line || !grant?.indirectRate) return;
+    const baseCategory = line.category.replace(/\s*Indirect Billing\s*$/i, "").trim();
+    const directLine = form.lines.find((l) => l.id !== lineId && l.category.trim() === baseCategory);
+    if (!directLine) return;
+    const directTotal = mode === "plan" ? lineTotal(directLine) : lineActualTotal(directLine);
+    const indirectTotal = Math.round(directTotal * (Number(grant.indirectRate) / 100) * 100) / 100;
+    updateLine(lineId, { [field]: distributeEvenly(indirectTotal, cols.length) });
+    setYearlyDraft((d) => ({ ...d, [lineId]: "" }));
   };
 
   const submitForApproval = () => setForm({ ...form, status: "Pending Approval", rejectionReason: "" });
@@ -1389,16 +1409,29 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                     />
                   </td>
                   <td className="px-2 py-1.5">
-                    <input
-                      type="number"
-                      value={yearlyDraft[line.id] ?? ""}
-                      placeholder={fmt(mode === "plan" ? lineTotal(line) : lineActualTotal(line)).replace("$", "")}
-                      onChange={(e) => setYearlyDraft({ ...yearlyDraft, [line.id]: e.target.value })}
-                      onBlur={() => applyYearlyTotal(line.id)}
-                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); applyYearlyTotal(line.id); } }}
-                      className="w-full rounded border px-1.5 py-1 text-xs text-right"
-                      style={{ ...inputStyle, fontVariantNumeric: "tabular-nums" }}
-                    />
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        value={yearlyDraft[line.id] ?? ""}
+                        placeholder={fmt(mode === "plan" ? lineTotal(line) : lineActualTotal(line)).replace("$", "")}
+                        onChange={(e) => setYearlyDraft({ ...yearlyDraft, [line.id]: e.target.value })}
+                        onBlur={() => applyYearlyTotal(line.id)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); applyYearlyTotal(line.id); } }}
+                        className="w-full rounded border px-1.5 py-1 text-xs text-right"
+                        style={{ ...inputStyle, fontVariantNumeric: "tabular-nums" }}
+                      />
+                      {grant?.indirectRate > 0 && /indirect/i.test(line.category) && (
+                        <button
+                          type="button"
+                          onClick={() => calcIndirect(line.id)}
+                          title={`Calculate as ${grant.indirectRate}% of the matching direct revenue line`}
+                          className="shrink-0"
+                          style={{ color: "#1F5C6B" }}
+                        >
+                          <RefreshCw size={11} />
+                        </button>
+                      )}
+                    </div>
                   </td>
                   {values.map((amt, idx) => {
                     const v = mode === "actual" ? varianceInfo(line.amounts?.[idx], line.actuals?.[idx]) : null;
@@ -2510,6 +2543,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           onSave={saveBudget}
           onClose={() => setModal(null)}
           currentUserEmail={currentUserEmail}
+          grants={grants}
         />
       )}
       {confirm && (
@@ -5385,6 +5419,83 @@ function pickCadences(val) {
 }
 
 function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity }) {
+  const [showHealthCheck, setShowHealthCheck] = useState(false);
+
+  // Runs the same categories of checks we've done manually against backup
+  // exports in the past — orphaned records, format drift, missing links,
+  // overdue compliance items — directly against live data, on demand.
+  const healthIssues = useMemo(() => {
+    const issues = [];
+    const grantById = {};
+    grants.forEach((g) => { grantById[g.id] = g; });
+    const ccIds = new Set((costCenters || []).map((c) => c.id));
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    budgets.forEach((b) => {
+      if (b.grantId && !grantById[b.grantId]) issues.push({ level: "error", area: "Budgets", text: `"${b.title}" references a grant that no longer exists.` });
+      if (b.costCenterId && !ccIds.has(b.costCenterId)) issues.push({ level: "error", area: "Budgets", text: `"${b.title}" references a cost center that no longer exists.` });
+      if (!b.grantId && !b.costCenterId) issues.push({ level: "error", area: "Budgets", text: `"${b.title}" isn't linked to a grant or cost center.` });
+      if (b.fy && !/^\d{4}$/.test(String(b.fy))) issues.push({ level: "warn", area: "Budgets", text: `"${b.title}" has a non-standard fiscal year value ("${b.fy}") — expected a plain 4-digit year.` });
+
+      if (!b.periodStart || !b.periodEnd) {
+        issues.push({ level: "error", area: "Budgets", text: `"${b.title}" is missing a period start or end date.` });
+        return;
+      }
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      (b.lines || []).forEach((l) => {
+        const amtLen = (l.amounts || []).length;
+        if (amtLen > 0 && amtLen < cols.length) {
+          issues.push({ level: "warn", area: "Budgets", text: `"${b.title}" — line "${l.category}${l.subcategory ? "/" + l.subcategory : ""}" has fewer months of data (${amtLen}) than its period (${cols.length}).` });
+        }
+        (l.actuals || []).forEach((v, i) => {
+          if (Number(v) < 0) issues.push({ level: "info", area: "Budgets", text: `"${b.title}" — "${l.category}${l.subcategory ? "/" + l.subcategory : ""}" has a negative actual in ${cols[i]?.label || `month ${i + 1}`}.` });
+        });
+      });
+      const cutoff = parseActualsThrough(b.actualsThrough);
+      if (cutoff) {
+        if (cutoff.year > today.getFullYear() || (cutoff.year === today.getFullYear() && cutoff.monthIndex > today.getMonth())) {
+          issues.push({ level: "error", area: "Budgets", text: `"${b.title}" has "Actuals complete through" set to a future month.` });
+        }
+        if (!cols.some((c) => c.year === cutoff.year && c.monthIndex === cutoff.monthIndex)) {
+          issues.push({ level: "warn", area: "Budgets", text: `"${b.title}"'s "Actuals complete through" date falls outside its own budget period.` });
+        }
+      }
+      if ((b.status === "Active" || b.status === "Awarded") && (!b.approvedBy || !b.approvedAt)) {
+        issues.push({ level: "info", area: "Budgets", text: `"${b.title}" is ${b.status} but has no recorded approver or approval date.` });
+      }
+    });
+
+    const grantIdsWithBudgets = new Set(budgets.map((b) => b.grantId).filter(Boolean));
+    grants.forEach((g) => {
+      if ((g.stage === "Active" || g.stage === "Awarded") && !grantIdsWithBudgets.has(g.id)) {
+        issues.push({ level: "warn", area: "Grants", text: `"${g.programCode ? g.programCode + " - " : ""}${g.title}" is ${g.stage} but has no budget yet.` });
+      }
+    });
+
+    (reports || []).forEach((r) => {
+      if (!r.grantId) issues.push({ level: "info", area: "Reports", text: `"${r.title}" isn't linked to a grant.` });
+      if (r.dueDate && !["Submitted", "Complete", "Completed", "Done"].includes(r.status)) {
+        const d = new Date(r.dueDate + "T00:00:00");
+        if (d < today) issues.push({ level: "warn", area: "Reports", text: `"${r.title}" was due ${r.dueDate} and is still "${r.status}".` });
+      }
+    });
+
+    (tasks || []).forEach((t) => {
+      if (t.dueDate && !["Done", "Completed", "Closed"].includes(t.status)) {
+        const d = new Date(t.dueDate + "T00:00:00");
+        if (d < today) issues.push({ level: "warn", area: "Tasks", text: `"${t.title}" was due ${t.dueDate} and is still "${t.status}".` });
+      }
+    });
+
+    return issues;
+  }, [grants, budgets, reports, tasks, costCenters]);
+
+  const issueCounts = { error: 0, warn: 0, info: 0 };
+  healthIssues.forEach((i) => { issueCounts[i.level] = (issueCounts[i.level] || 0) + 1; });
+  const levelColor = { error: "#B5443A", warn: "#C08A2E", info: "#5B7FA6" };
+  const levelLabel = { error: "Needs fixing", warn: "Worth a look", info: "FYI" };
+
   const [restoreError, setRestoreError] = useState("");
   const [restoreSummary, setRestoreSummary] = useState("");
   const [importError, setImportError] = useState("");
@@ -5767,6 +5878,47 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
       </div>
 
       <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <div className="flex items-center justify-between mb-1">
+          <h2 className="font-display text-base" style={{ color: "#1C2624" }}>Data health check</h2>
+          <button
+            onClick={() => setShowHealthCheck((v) => !v)}
+            className="text-xs px-3 py-1.5 rounded-md border shrink-0"
+            style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+          >
+            {showHealthCheck ? "Hide" : "Run health check"}
+          </button>
+        </div>
+        <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>
+          Scans budgets, grants, reports, and tasks for the kinds of issues that are easy to miss — orphaned links, format drift, missing approvals, overdue compliance items.
+        </p>
+        {showHealthCheck && (
+          healthIssues.length === 0 ? (
+            <div className="flex items-center gap-2 text-sm rounded-md px-3 py-2" style={{ background: "#F0F5F2", color: "#2F6F53" }}>
+              <CheckCircle size={15} /> All clear — nothing found.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex items-center gap-3 text-xs" style={{ color: "#8A8F87" }}>
+                {issueCounts.error > 0 && <span style={{ color: levelColor.error }}>{issueCounts.error} needs fixing</span>}
+                {issueCounts.warn > 0 && <span style={{ color: levelColor.warn }}>{issueCounts.warn} worth a look</span>}
+                {issueCounts.info > 0 && <span style={{ color: levelColor.info }}>{issueCounts.info} FYI</span>}
+              </div>
+              <div className="rounded-md border divide-y max-h-96 overflow-y-auto" style={{ borderColor: "#E1E5DE" }}>
+                {["error", "warn", "info"].flatMap((level) => healthIssues.filter((i) => i.level === level)).map((issue, i) => (
+                  <div key={i} className="flex items-start gap-2 px-3 py-2 text-sm">
+                    <span className="shrink-0 mt-0.5 text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded" style={{ background: `${levelColor[issue.level]}1A`, color: levelColor[issue.level] }}>
+                      {issue.area}
+                    </span>
+                    <span style={{ color: "#1C2624" }}>{issue.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )
+        )}
+      </div>
+
+      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
         <h2 className="font-display text-base mb-1" style={{ color: "#1C2624" }}>Download backup</h2>
         <p className="text-sm mb-3" style={{ color: "#5B6B66" }}>Saves everything — grants, budgets, reports, staff, tasks, and the activity log — to one JSON file you can keep as a safety copy.</p>
         <div className="flex flex-wrap items-center gap-2">
@@ -5941,7 +6093,7 @@ const NAV = [
   { key: "data", label: "Data & Backup", icon: Upload },
 ];
 
-export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disabledModules, onSignOut } = {}) {
+function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, onSignOut } = {}) {
   const canEdit = isAdmin || userRole !== "viewer";
   const hiddenModules = isAdmin ? [] : (disabledModules || []);
   const [tab, setTab] = useState("dashboard");
@@ -6421,6 +6573,59 @@ export default function GrantFlow({ currentUserEmail, isAdmin, userRole, disable
         v{APP_VERSION}
       </div>
     </div>
+  );
+}
+
+// Catches uncaught render errors anywhere in the app. Without this, a single
+// thrown error (e.g. from unexpected/malformed data) unmounts the entire
+// React tree and leaves a blank screen — the only recovery being a hard
+// refresh. This shows a plain-language message and the actual error instead,
+// so a real bug is visible and reportable rather than silently blanking out.
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error("GrantFlow crashed:", error, info?.componentStack);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0B0F0D", padding: 24 }}>
+          <div style={{ maxWidth: 520, textAlign: "center", color: "#E7E9E5" }}>
+            <AlertCircle size={28} style={{ color: "#B5443A", margin: "0 auto 12px" }} />
+            <h1 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8 }}>Something went wrong</h1>
+            <p style={{ fontSize: 13, color: "#8A8F87", marginBottom: 16 }}>
+              GrantFlow hit an unexpected error and couldn't continue. Your data is unaffected — everything already saved is still there. Reloading the page should fix it.
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="text-sm px-4 py-2 rounded-md text-white"
+              style={{ background: "#1F5C6B" }}
+            >
+              Reload page
+            </button>
+            <details style={{ marginTop: 20, textAlign: "left", fontSize: 11, color: "#8A8F87" }}>
+              <summary style={{ cursor: "pointer" }}>Technical details</summary>
+              <pre style={{ whiteSpace: "pre-wrap", marginTop: 8 }}>{String(this.state.error?.stack || this.state.error)}</pre>
+            </details>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function GrantFlow(props) {
+  return (
+    <ErrorBoundary>
+      <GrantFlowApp {...props} />
+    </ErrorBoundary>
   );
 }
 
