@@ -3911,40 +3911,118 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const grouped = useMemo(() => {
     const map = {};
     CATEGORIES.forEach((c) => { map[c.name] = { type: c.type, monthly: Array(12).fill(0), monthlyProjected: Array(12).fill(false), subs: {} }; });
-    scopedBudgets.forEach((b) => {
-      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-      // Only actuals ever get projected — plan figures are what you entered,
-      // there's nothing to run a rate off of. A budget only projects once its
-      // "actuals complete through" marker is set (see BudgetModal); otherwise
-      // it behaves exactly as before.
-      const cutoff = dataMode === "actual" ? parseActualsThrough(b.actualsThrough) : null;
-      b.lines.forEach((l) => {
-        if (!map[l.category]) map[l.category] = { type: l.type, monthly: Array(12).fill(0), monthlyProjected: Array(12).fill(false), subs: {} };
-        const bucket = map[l.category];
-        const vals = l[amountsField] || Array(12).fill(0);
-        let avg = 0;
-        if (cutoff) {
-          const actualVals = cols
-            .map((col, i) => (colIsWithinCutoff(col, cutoff) ? Number(vals[i]) || 0 : null))
+    const addToBucket = (category, subcategory, type, monthIndex, value, isProjected) => {
+      if (!map[category]) map[category] = { type, monthly: Array(12).fill(0), monthlyProjected: Array(12).fill(false), subs: {} };
+      const bucket = map[category];
+      bucket.monthly[monthIndex] += value;
+      if (isProjected) bucket.monthlyProjected[monthIndex] = true;
+      if (subcategory) {
+        if (!bucket.subs[subcategory]) bucket.subs[subcategory] = { values: Array(12).fill(0), projected: Array(12).fill(false) };
+        bucket.subs[subcategory].values[monthIndex] += value;
+        if (isProjected) bucket.subs[subcategory].projected[monthIndex] = true;
+      }
+    };
+
+    if (dataMode !== "actual") {
+      // Plan mode: no projection concept applies — figures are exactly what
+      // was entered, per budget, same as before this feature existed.
+      scopedBudgets.forEach((b) => {
+        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+        b.lines.forEach((l) => {
+          const vals = l.amounts || Array(12).fill(0);
+          cols.forEach((col, i) => {
+            if (!col) return;
+            if (calYear !== "All" && col.year !== calYear) return;
+            addToBucket(l.category, l.subcategory, l.type, col.monthIndex, Number(vals[i]) || 0, false);
+          });
+        });
+      });
+      return map;
+    }
+
+    // Actual mode: chain each grant/cost center's budgets together so a
+    // projection can carry forward across a fiscal-year boundary into the
+    // next budget, instead of stopping dead at the marked budget's own
+    // periodEnd. A newer budget's own marked cutoff always takes priority
+    // over an inherited average the moment it's reached.
+    const ownerKey = (b) => b.grantId || b.costCenterId || `__standalone_${b.id}`;
+    const byOwner = {};
+    scopedBudgets.forEach((b) => { (byOwner[ownerKey(b)] = byOwner[ownerKey(b)] || []).push(b); });
+
+    Object.values(byOwner).forEach((ownerBudgets) => {
+      ownerBudgets.sort((a, b) => new Date(a.periodStart) - new Date(b.periodStart));
+
+      // Every distinct category+subcategory line seen anywhere for this owner.
+      const lineMeta = {};
+      ownerBudgets.forEach((b) => b.lines.forEach((l) => {
+        const key = `${l.category}|||${l.subcategory || ""}`;
+        if (!lineMeta[key]) lineMeta[key] = { category: l.category, subcategory: l.subcategory || "", type: l.type };
+      }));
+
+      // Each budget's own run-rate average per line, computed once (only for
+      // budgets that have a marked cutoff).
+      const budgetLineAvg = {}; // `${budgetId}|||${lineKey}` -> average
+      ownerBudgets.forEach((b) => {
+        const cutoff = parseActualsThrough(b.actualsThrough);
+        if (!cutoff) return;
+        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+        b.lines.forEach((l) => {
+          const key = `${l.category}|||${l.subcategory || ""}`;
+          const actuals = l.actuals || Array(cols.length).fill(0);
+          const vals = cols
+            .map((col, i) => (colIsWithinCutoff(col, cutoff) ? Number(actuals[i]) || 0 : null))
             .filter((v) => v !== null);
-          avg = actualVals.length ? actualVals.reduce((a, x) => a + x, 0) / actualVals.length : 0;
-        }
-        cols.forEach((col, i) => {
-          if (!col) return;
-          if (calYear !== "All" && col.year !== calYear) return;
-          const isProjected = cutoff ? !colIsWithinCutoff(col, cutoff) : false;
-          const a = isProjected ? avg : (Number(vals[i]) || 0);
-          const slot = col.monthIndex;
-          bucket.monthly[slot] += a;
-          if (isProjected) bucket.monthlyProjected[slot] = true;
-          if (l.subcategory) {
-            if (!bucket.subs[l.subcategory]) bucket.subs[l.subcategory] = { values: Array(12).fill(0), projected: Array(12).fill(false) };
-            bucket.subs[l.subcategory].values[slot] += a;
-            if (isProjected) bucket.subs[l.subcategory].projected[slot] = true;
+          budgetLineAvg[`${b.id}|||${key}`] = vals.length ? vals.reduce((a, x) => a + x, 0) / vals.length : 0;
+        });
+      });
+
+      Object.keys(lineMeta).forEach((key) => {
+        const meta = lineMeta[key];
+        // Flatten this line's data across every owner budget into one
+        // chronological timeline of calendar months.
+        const timeline = [];
+        ownerBudgets.forEach((b) => {
+          const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+          const line = b.lines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
+          const cutoff = parseActualsThrough(b.actualsThrough);
+          const actuals = line ? (line.actuals || Array(cols.length).fill(0)) : null;
+          cols.forEach((col, i) => {
+            timeline.push({
+              year: col.year,
+              monthIndex: col.monthIndex,
+              isRealEntry: !!(line && cutoff && colIsWithinCutoff(col, cutoff)),
+              rawValue: line ? (Number(actuals[i]) || 0) : 0,
+              budgetId: b.id,
+              cutoff,
+              atOrAfterCutoff: cutoff ? !colIsWithinCutoff(col, cutoff) : false,
+            });
+          });
+        });
+        timeline.sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
+
+        let basis = null; // most recently established run-rate average for this line
+        timeline.forEach((t) => {
+          const avgKey = `${t.budgetId}|||${key}`;
+          if (t.atOrAfterCutoff && budgetLineAvg[avgKey] !== undefined) basis = budgetLineAvg[avgKey];
+
+          let value, isProjected;
+          if (t.isRealEntry) {
+            value = t.rawValue;
+            isProjected = false;
+          } else if (basis !== null) {
+            value = basis;
+            isProjected = true;
+          } else {
+            value = t.rawValue; // no basis established anywhere yet — behaves as before this feature existed
+            isProjected = false;
           }
+
+          if (calYear !== "All" && t.year !== calYear) return;
+          addToBucket(meta.category, meta.subcategory, meta.type, t.monthIndex, value, isProjected);
         });
       });
     });
+
     return map;
   }, [scopedBudgets, amountsField, calYear, dataMode]);
 
@@ -4076,7 +4154,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
       )}
       {viewMode === "monthly" && anyProjected && (
         <p className="text-xs flex items-center gap-1.5" style={{ color: "#8A8F87" }}>
-          <span style={{ fontStyle: "italic" }}>Italic, muted figures</span> are projected from each budget's average actuals so far — not entered data. Set "Actuals complete through" on a budget to turn this on.
+          <span style={{ fontStyle: "italic" }}>Italic, muted figures</span> are projected from a grant's average actuals so far — carried forward across fiscal-year boundaries until real or newly-marked data takes over. Set "Actuals complete through" on a budget to turn this on.
         </p>
       )}
 
