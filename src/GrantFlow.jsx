@@ -395,7 +395,7 @@ function liveComparisonForScenario(scenario, grants, budgets, costCenters) {
     const scopedBudgets = (scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
     const map = {};
     scopedBudgets.forEach((b) => {
-      const cols = monthColumnsForBudget(b.periodStart);
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
       b.lines.forEach((l) => {
         if (!map[l.category]) map[l.category] = Array(12).fill(0);
         (l.amounts || Array(12).fill(0)).forEach((a, i) => {
@@ -3182,7 +3182,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
     const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
     const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
     const years = new Set();
-    scoped.forEach((b) => monthColumnsForBudget(b.periodStart).forEach((col) => years.add(col.year)));
+    scoped.forEach((b) => monthColumnsForBudget(b.periodStart, b.periodEnd).forEach((col) => years.add(col.year)));
     return [...years].sort();
   }, [orgScope, grants, costCenters, budgets]);
 
@@ -3217,7 +3217,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
       const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
       const map = {};
       scoped.forEach((b) => {
-        const cols = monthColumnsForBudget(b.periodStart);
+        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
         b.lines.forEach((l) => {
           const key = l.category;
           if (!map[key]) {
@@ -3226,6 +3226,7 @@ function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate
           }
           (l.amounts || Array(12).fill(0)).forEach((a, i) => {
             const col = cols[i];
+            if (!col) return;
             if (orgYear !== "All" && col.year !== orgYear) return;
             map[key].amounts[col.monthIndex] += Number(a) || 0;
           });
@@ -3855,7 +3856,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   // year picker reflects reality even when grants run off the calendar year.
   const calendarYears = useMemo(() => {
     const years = new Set();
-    scopedBudgets.forEach((b) => monthColumnsForBudget(b.periodStart).forEach((col) => years.add(col.year)));
+    scopedBudgets.forEach((b) => monthColumnsForBudget(b.periodStart, b.periodEnd).forEach((col) => years.add(col.year)));
     return [...years].sort();
   }, [scopedBudgets]);
 
@@ -3869,13 +3870,14 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
     const map = {};
     CATEGORIES.forEach((c) => { map[c.name] = { type: c.type, monthly: Array(12).fill(0), subs: {} }; });
     scopedBudgets.forEach((b) => {
-      const cols = monthColumnsForBudget(b.periodStart);
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
       b.lines.forEach((l) => {
         if (!map[l.category]) map[l.category] = { type: l.type, monthly: Array(12).fill(0), subs: {} };
         const bucket = map[l.category];
         const vals = l[amountsField] || Array(12).fill(0);
         vals.forEach((a, i) => {
           const col = cols[i];
+          if (!col) return;
           if (calYear !== "All" && col.year !== calYear) return;
           const slot = calYear === "All" ? col.monthIndex : col.monthIndex;
           bucket.monthly[slot] += Number(a) || 0;
