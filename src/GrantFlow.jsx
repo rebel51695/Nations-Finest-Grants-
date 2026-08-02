@@ -1002,7 +1002,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 
 // ---------- budget form ----------
 
-function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose }) {
+function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail }) {
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(budget || {
     id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
     status: "Draft", notes: "", lines: [newLine()],
@@ -1013,6 +1013,9 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   const [showRejectBox, setShowRejectBox] = useState(false);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const cols = monthColumnsForBudget(form.periodStart, form.periodEnd);
+  // Plain 4-digit years only (e.g. "2026", never "FY26") — keeps every budget's
+  // fy field in a consistent, comparable format for year-based filtering.
+  const fyYearOptions = Array.from({ length: 8 }, (_, i) => new Date().getFullYear() - 2 + i);
 
   useEffect(() => {
     const needsResize = form.lines.some((l) => (l.amounts?.length || 0) !== cols.length || (l.actuals?.length || 0) !== cols.length);
@@ -1160,10 +1163,33 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. FY26 Operating Budget" />
         </Field>
         <Field label="Fiscal year">
-          <input className={inputCls} style={inputStyle} value={form.fy} onChange={set("fy")} placeholder="e.g. FY26" />
+          <select className={inputCls} style={inputStyle} value={form.fy} onChange={set("fy")}>
+            <option value="">Select year</option>
+            {fyYearOptions.map((y) => <option key={y} value={String(y)}>{y}</option>)}
+            {form.fy && !fyYearOptions.includes(Number(form.fy)) && (
+              <option value={form.fy}>{form.fy} (non-standard — re-select to fix)</option>
+            )}
+          </select>
         </Field>
         <Field label="Status">
-          <select className={inputCls} style={inputStyle} value={form.status} onChange={set("status")}>
+          <select
+            className={inputCls}
+            style={inputStyle}
+            value={form.status}
+            onChange={(e) => {
+              const newStatus = e.target.value;
+              // Most budgets get their status set directly here rather than
+              // through the formal Submit/Approve flow above. Capture who
+              // approved it and when the moment it goes Active/Awarded,
+              // unless it's already been formally approved — never overwrite
+              // an existing approval record.
+              if ((newStatus === "Active" || newStatus === "Awarded") && !form.approvedBy) {
+                setForm({ ...form, status: newStatus, approvedBy: currentUserEmail || "Unknown", approvedAt: new Date().toISOString().slice(0, 10) });
+              } else {
+                setForm({ ...form, status: newStatus });
+              }
+            }}
+          >
             {BUDGET_STATUSES.map((s) => <option key={s}>{s}</option>)}
           </select>
         </Field>
@@ -1208,9 +1234,14 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                 onChange={(e) => setForm({ ...form, actualsThrough: e.target.value || "" })}
               >
                 <option value="">Not marked</option>
-                {cols.map((c, i) => (
-                  <option key={i} value={`${c.year}-${String(c.monthIndex + 1).padStart(2, "0")}`}>{c.label}</option>
-                ))}
+                {cols
+                  .filter((c) => {
+                    const now = new Date();
+                    return c.year < now.getFullYear() || (c.year === now.getFullYear() && c.monthIndex <= now.getMonth());
+                  })
+                  .map((c, i) => (
+                    <option key={i} value={`${c.year}-${String(c.monthIndex + 1).padStart(2, "0")}`}>{c.label}</option>
+                  ))}
               </select>
             </label>
           )}
@@ -2478,6 +2509,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           canEdit={canEdit}
           onSave={saveBudget}
           onClose={() => setModal(null)}
+          currentUserEmail={currentUserEmail}
         />
       )}
       {confirm && (
