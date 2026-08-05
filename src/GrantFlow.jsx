@@ -4037,18 +4037,28 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
         if (!lineMeta[key]) lineMeta[key] = { category: l.category, subcategory: l.subcategory || "", type: l.type };
       }));
 
-      // Each budget's own run-rate average per line, computed once (only for
-      // budgets that have a marked cutoff).
+      // Each budget's own run-rate average per line — summed across EVERY
+      // line that shares that category+subcategory. A single budget can have
+      // many individually-entered lines under the same category (e.g. one
+      // payroll line per staff position, all filed under "Wages and
+      // Benefits"), so matching only the first line found would silently
+      // drop the rest.
       const budgetLineAvg = {}; // `${budgetId}|||${lineKey}` -> average
+      const budgetLineActuals = {}; // `${budgetId}|||${lineKey}` -> combined actuals array
       ownerBudgets.forEach((b) => {
-        const cutoff = parseActualsThrough(b.actualsThrough);
-        if (!cutoff) return;
         const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-        b.lines.forEach((l) => {
-          const key = `${l.category}|||${l.subcategory || ""}`;
-          const actuals = l.actuals || Array(cols.length).fill(0);
+        Object.keys(lineMeta).forEach((key) => {
+          const matching = b.lines.filter((l) => `${l.category}|||${l.subcategory || ""}` === key);
+          if (matching.length === 0) return;
+          const combined = Array(cols.length).fill(0);
+          matching.forEach((l) => {
+            (l.actuals || []).forEach((v, i) => { if (i < combined.length) combined[i] += Number(v) || 0; });
+          });
+          budgetLineActuals[`${b.id}|||${key}`] = combined;
+          const cutoff = parseActualsThrough(b.actualsThrough);
+          if (!cutoff) return;
           const vals = cols
-            .map((col, i) => (colIsWithinCutoff(col, cutoff) ? Number(actuals[i]) || 0 : null))
+            .map((col, i) => (colIsWithinCutoff(col, cutoff) ? combined[i] : null))
             .filter((v) => v !== null);
           budgetLineAvg[`${b.id}|||${key}`] = vals.length ? vals.reduce((a, x) => a + x, 0) / vals.length : 0;
         });
@@ -4061,15 +4071,14 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
         const timeline = [];
         ownerBudgets.forEach((b) => {
           const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-          const line = b.lines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
+          const combined = budgetLineActuals[`${b.id}|||${key}`]; // undefined if this budget has no matching lines
           const cutoff = parseActualsThrough(b.actualsThrough);
-          const actuals = line ? (line.actuals || Array(cols.length).fill(0)) : null;
           cols.forEach((col, i) => {
             timeline.push({
               year: col.year,
               monthIndex: col.monthIndex,
-              isRealEntry: !!(line && cutoff && colIsWithinCutoff(col, cutoff)),
-              rawValue: line ? (Number(actuals[i]) || 0) : 0,
+              isRealEntry: !!(combined && cutoff && colIsWithinCutoff(col, cutoff)),
+              rawValue: combined ? (Number(combined[i]) || 0) : 0,
               budgetId: b.id,
               cutoff,
               atOrAfterCutoff: cutoff ? !colIsWithinCutoff(col, cutoff) : false,
