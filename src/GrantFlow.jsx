@@ -4717,13 +4717,71 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
 
 // ---------- invoicing ----------
 
-function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDelete }) {
+function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit = true, onSave, onClose, onDelete }) {
   const grantDefault = grants[0]?.id || "";
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(invoice || {
     id: uid(), grantId: grantDefault, invoiceNumber: "", amount: 0,
     submittedDate: "", dueDate: "", paidDate: "", status: "Draft", notes: "", supportingDocsUrl: "",
+    periodStart: "", periodEnd: "",
+    verification: {
+      expectedChecks: {}, vendors: [], glTotal: "", plTotal: "", docsUrl: "",
+      discrepancies: [], signedOff: false, signedOffBy: "", signedOffAt: "",
+    },
   });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  const verification = form.verification || { expectedChecks: {}, vendors: [], glTotal: "", plTotal: "", docsUrl: "", discrepancies: [], signedOff: false };
+  const setV = (patch) => setForm({ ...form, verification: { ...verification, ...patch } });
+
+  // Every category/subcategory with planned activity in this invoice's period,
+  // pulled from the grant's own budget — so Larry isn't retyping what he
+  // expects to see each time, and the checklist can't drift out of sync with
+  // what's actually budgeted.
+  const ymNum = (y, m) => y * 12 + m;
+  const toYM = (dateStr) => { const [y, m] = dateStr.split("-").map(Number); return ymNum(y, m - 1); };
+  const expectedCategories = useMemo(() => {
+    if (!form.grantId || !form.periodStart || !form.periodEnd) return [];
+    const startYM = toYM(form.periodStart);
+    const endYM = toYM(form.periodEnd);
+    const relevant = budgets.filter((b) => b.grantId === form.grantId && (b.status === "Active" || b.status === "Awarded"));
+    const seen = new Set();
+    const result = [];
+    relevant.forEach((b) => {
+      if (!b.periodStart || !b.periodEnd) return;
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      (b.lines || []).forEach((l) => {
+        const key = `${l.category}|||${l.subcategory || ""}`;
+        if (seen.has(key)) return;
+        const amounts = l.amounts || [];
+        const hasActivity = cols.some((col, i) => {
+          const colYM = ymNum(col.year, col.monthIndex);
+          return colYM >= startYM && colYM <= endYM && (Number(amounts[i]) || 0) > 0;
+        });
+        if (hasActivity) { seen.add(key); result.push({ key, category: l.category, subcategory: l.subcategory }); }
+      });
+    });
+    return result;
+  }, [form.grantId, form.periodStart, form.periodEnd, budgets]);
+
+  const addVendor = () => setV({ vendors: [...verification.vendors, { id: uid(), name: "", expectedAmount: "", found: "pending" }] });
+  const updateVendor = (id, patch) => setV({ vendors: verification.vendors.map((v) => (v.id === id ? { ...v, ...patch } : v)) });
+  const removeVendor = (id) => setV({ vendors: verification.vendors.filter((v) => v.id !== id) });
+
+  const [newDiscrepancy, setNewDiscrepancy] = useState("");
+  const addDiscrepancy = () => {
+    if (!newDiscrepancy.trim()) return;
+    setV({ discrepancies: [...verification.discrepancies, { id: uid(), text: newDiscrepancy.trim(), status: "open", createdAt: new Date().toISOString().slice(0, 10) }] });
+    setNewDiscrepancy("");
+  };
+  const toggleDiscrepancy = (id) => setV({
+    discrepancies: verification.discrepancies.map((d) => (d.id === id
+      ? { ...d, status: d.status === "resolved" ? "open" : "resolved", resolvedAt: d.status === "resolved" ? "" : new Date().toISOString().slice(0, 10) }
+      : d)),
+  });
+
+  const glTotal = Number(verification.glTotal) || 0;
+  const plTotal = Number(verification.plTotal) || 0;
+  const variance = glTotal - plTotal;
+  const hasOpenDiscrepancy = verification.discrepancies.some((d) => d.status !== "resolved");
 
   return (
     <Modal title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
@@ -4738,6 +4796,14 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
           </Field>
           <Field label="Amount">
             <input type="number" className={inputCls} style={inputStyle} value={form.amount} onChange={set("amount")} />
+          </Field>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="Period start">
+            <input type="date" className={inputCls} style={inputStyle} value={form.periodStart} onChange={set("periodStart")} />
+          </Field>
+          <Field label="Period end">
+            <input type="date" className={inputCls} style={inputStyle} value={form.periodEnd} onChange={set("periodEnd")} />
           </Field>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -4775,6 +4841,152 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
             )}
           </div>
         </Field>
+
+        <div className="border-t pt-4 mt-2" style={{ borderColor: "#E1E5DE" }}>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-display text-sm" style={{ color: "#1C2624" }}>Pre-invoice verification</h3>
+            {hasOpenDiscrepancy && (
+              <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-md" style={{ background: "#FBEAE8", color: "#B5443A" }}>
+                <AlertCircle size={12} /> Unresolved discrepancy
+              </span>
+            )}
+          </div>
+
+          <div className="mb-4">
+            <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>Expected activity this period</p>
+            {!form.grantId || !form.periodStart || !form.periodEnd ? (
+              <p className="text-xs" style={{ color: "#8A8F87" }}>Set the grant and invoice period above to pull expected budget categories.</p>
+            ) : expectedCategories.length === 0 ? (
+              <p className="text-xs" style={{ color: "#8A8F87" }}>No budgeted activity found for this grant in this period.</p>
+            ) : (
+              <div className="space-y-1">
+                {expectedCategories.map((c) => (
+                  <label key={c.key} className="flex items-center gap-2 text-sm" style={{ color: "#1C2624" }}>
+                    <input
+                      type="checkbox"
+                      checked={!!verification.expectedChecks[c.key]}
+                      onChange={(e) => setV({ expectedChecks: { ...verification.expectedChecks, [c.key]: e.target.checked } })}
+                    />
+                    {c.category}{c.subcategory ? ` / ${c.subcategory}` : ""}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="mb-4">
+            <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>Vendor / subcontractor match to GL</p>
+            <div className="space-y-2">
+              {verification.vendors.map((v) => (
+                <div key={v.id} className="flex items-center gap-2">
+                  <input
+                    className={inputCls} style={{ ...inputStyle, flex: 2 }}
+                    value={v.name} onChange={(e) => updateVendor(v.id, { name: e.target.value })}
+                    placeholder="Vendor name"
+                  />
+                  <input
+                    type="number" className={inputCls} style={{ ...inputStyle, flex: 1 }}
+                    value={v.expectedAmount} onChange={(e) => updateVendor(v.id, { expectedAmount: e.target.value })}
+                    placeholder="Amount"
+                  />
+                  <select
+                    className={inputCls} style={{ ...inputStyle, flex: 1 }}
+                    value={v.found} onChange={(e) => updateVendor(v.id, { found: e.target.value })}
+                  >
+                    <option value="pending">Pending</option>
+                    <option value="matched">Matched</option>
+                    <option value="notfound">Not found</option>
+                  </select>
+                  <button onClick={() => removeVendor(v.id)} className="p-1.5 rounded hover:bg-red-50 shrink-0">
+                    <X size={14} style={{ color: "#B5443A" }} />
+                  </button>
+                </div>
+              ))}
+              <button onClick={addVendor} className="text-xs inline-flex items-center gap-1" style={{ color: "#1F5C6B" }}>
+                <Plus size={13} /> Add vendor / subcontractor
+              </button>
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>GL vs P/L comparison</p>
+            <div className="grid grid-cols-3 gap-3 mb-3">
+              <Field label="GL detail total">
+                <input type="number" className={inputCls} style={inputStyle} value={verification.glTotal} onChange={(e) => setV({ glTotal: e.target.value })} />
+              </Field>
+              <Field label="P/L total">
+                <input type="number" className={inputCls} style={inputStyle} value={verification.plTotal} onChange={(e) => setV({ plTotal: e.target.value })} />
+              </Field>
+              <Field label="Variance">
+                <div className="px-3 py-2 rounded-md border text-sm" style={{ borderColor: "#E1E5DE", color: variance !== 0 ? "#B5443A" : "#2F6F53", fontVariantNumeric: "tabular-nums" }}>
+                  {fmt(variance)}
+                </div>
+              </Field>
+            </div>
+            <Field label="Verification documents (Sage GL/P&L export folder)">
+              <div className="flex items-center gap-2">
+                <input className={inputCls} style={inputStyle} value={verification.docsUrl} onChange={(e) => setV({ docsUrl: e.target.value })} placeholder="https://…" />
+                {verification.docsUrl && (
+                  <a
+                    href={verification.docsUrl} target="_blank" rel="noreferrer"
+                    className="inline-flex items-center gap-1 text-xs px-3 py-2 rounded-md border shrink-0"
+                    style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
+                  >
+                    <ExternalLink size={13} /> Open
+                  </a>
+                )}
+              </div>
+            </Field>
+          </div>
+
+          <div className="mb-4">
+            <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>Discrepancy log</p>
+            <div className="space-y-2 mb-2">
+              {verification.discrepancies.map((d) => (
+                <div
+                  key={d.id}
+                  className="flex items-start gap-2 text-xs px-3 py-2 rounded-md"
+                  style={{ background: d.status === "resolved" ? "#F0F5F2" : "#FBEAE8", color: d.status === "resolved" ? "#2F6F53" : "#8A392F" }}
+                >
+                  <button onClick={() => toggleDiscrepancy(d.id)} className="shrink-0 mt-0.5">
+                    {d.status === "resolved" ? <CheckCircle size={13} /> : <Circle size={13} />}
+                  </button>
+                  <div className="flex-1">
+                    <div>{d.text}</div>
+                    <div style={{ opacity: 0.75 }}>
+                      Flagged {fmtDate(d.createdAt)}{d.status === "resolved" && d.resolvedAt ? ` · Resolved ${fmtDate(d.resolvedAt)}` : ""}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                className={inputCls} style={{ ...inputStyle, flex: 1 }}
+                value={newDiscrepancy} onChange={(e) => setNewDiscrepancy(e.target.value)}
+                placeholder="Describe what's missing or doesn't match…"
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addDiscrepancy(); } }}
+              />
+              <button onClick={addDiscrepancy} className="text-xs px-3 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+                Add
+              </button>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 text-sm" style={{ color: "#1C2624" }}>
+            <input
+              type="checkbox"
+              checked={!!verification.signedOff}
+              onChange={(e) => setV(e.target.checked
+                ? { signedOff: true, signedOffBy: currentUserEmail || "Unknown", signedOffAt: new Date().toISOString().slice(0, 10) }
+                : { signedOff: false, signedOffBy: "", signedOffAt: "" })}
+            />
+            All flagged items resolved or documented — ready to invoice
+          </label>
+          {verification.signedOff && verification.signedOffBy && (
+            <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>Signed off by {verification.signedOffBy} on {fmtDate(verification.signedOffAt)}</p>
+          )}
+        </div>
       </div>
       </fieldset>
 
@@ -4804,7 +5016,7 @@ function InvoiceModal({ invoice, grants, canEdit = true, onSave, onClose, onDele
   );
 }
 
-function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, canEdit, initialOpenInvoiceId, logActivity }) {
+function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, canEdit, initialOpenInvoiceId, logActivity, budgets = [] }) {
   const [modal, setModal] = useState(() => (initialOpenInvoiceId ? invoices.find((i) => i.id === stripNonce(initialOpenInvoiceId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [grantFilter, setGrantFilter] = useState("All");
@@ -5061,10 +5273,20 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
                 const g = grants.find((x) => x.id === i.grantId);
                 const overdue = isInvoiceOverdue(i);
                 const outstanding = daysOutstanding(i);
+                const flagged = i.verification?.discrepancies?.some((d) => d.status !== "resolved");
                 return (
                   <tr key={i.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: overdue ? "#B5443A" : "#E1E5DE" }} onClick={() => setModal(i)}>
                     <td className="px-3 py-2" style={{ color: "#1C2624" }}>{g?.title || "Unknown grant"}</td>
-                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{i.invoiceNumber || "—"}</td>
+                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>
+                      <div className="flex items-center gap-1.5">
+                        {i.invoiceNumber || "—"}
+                        {flagged && (
+                          <span title="Unresolved verification discrepancy">
+                            <AlertCircle size={13} style={{ color: "#B5443A" }} />
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(i.amount)}</td>
                     <td className="px-3 py-2"><Badge color={statusColor[i.status]}>{i.status}</Badge></td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{fmtDate(i.submittedDate)}</td>
@@ -5097,6 +5319,8 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
         <InvoiceModal
           invoice={modal === "new" ? null : modal}
           grants={grants}
+          budgets={budgets}
+          currentUserEmail={currentUserEmail}
           canEdit={canEdit}
           onSave={saveInvoice}
           onClose={() => setModal(null)}
@@ -6503,7 +6727,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
         ) : tab === "invoicing" ? (
           <InvoicingView
             key={pendingOpenInvoiceId ? `invoices-open-${pendingOpenInvoiceId}` : "invoicing"}
-            grants={grants} invoices={invoices} setInvoices={setInvoices}
+            grants={grants} invoices={invoices} setInvoices={setInvoices} budgets={budgets}
             setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenInvoiceId={pendingOpenInvoiceId} logActivity={logActivity}
           />
