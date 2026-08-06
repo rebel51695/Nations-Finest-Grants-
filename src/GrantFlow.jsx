@@ -356,6 +356,26 @@ function staffAnnualCost(staff) {
   return (Number(staff.annualSalary) || 0) * fte;
 }
 
+// Base salary/wages plus bonus, benefits, and employer payroll tax — the
+// "fully loaded" cost of an employee, used for generating budget lines from
+// Personnel. Deliberately separate from staffAnnualCost() above: that
+// function is base pay only and is what every existing Personnel-cost
+// figure has already been validated against, so it's left untouched.
+function staffFullyLoadedCost(staff) {
+  const fte = Number(staff.fte) || 0;
+  const base = staffAnnualCost(staff);
+  const bonus = (Number(staff.bonus) || 0) * fte;
+  const benefits = (Number(staff.benefits) || 0) * fte;
+  const taxableWages = base + bonus;
+  const payrollTax = taxableWages * ((Number(staff.payrollTaxRate) || 0) / 100);
+  return {
+    base, bonus, benefits, payrollTax,
+    wagesTotal: base + bonus, // maps to the "5000 - Salary and Wages" budget subcategory
+    taxAndBenefitsTotal: benefits + payrollTax, // maps to "5900 - Payroll taxes and benefits"
+    total: base + bonus + benefits + payrollTax,
+  };
+}
+
 function staffAllocatedTotal(staff) {
   return (staff.allocations || []).reduce((a, al) => a + (Number(al.percent) || 0), 0);
 }
@@ -4367,6 +4387,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
     id: uid(), name: "", position: "", department: "", exempt: "Non-exempt",
     payType: "Salary", annualSalary: 0, hourlyRate: 0, annualHours: ANNUAL_HOURS,
     fte: 1, allocations: [], site: "", status: "Active",
+    bonus: 0, benefits: 0, payrollTaxRate: 0, raiseDate: "", raisePercent: 0,
   });
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
@@ -4375,6 +4396,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
   const removeAlloc = (id) => setForm({ ...form, allocations: form.allocations.filter((a) => a.id !== id) });
 
   const cost = staffAnnualCost(form);
+  const loaded = staffFullyLoadedCost(form);
   const allocatedPct = staffAllocatedTotal(form);
 
   return (
@@ -4432,9 +4454,39 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
         )}
       </div>
 
-      <div className="mt-3 text-sm">
-        <span style={{ color: "#8A8F87" }}>Computed annual cost: </span>
-        <span className="font-medium" style={{ color: "#1C2624" }}>{fmt(cost)}</span>
+      <div className="mt-5">
+        <h3 className="font-display text-sm mb-2" style={{ color: "#1C2624" }}>Compensation details</h3>
+        <p className="text-xs mb-2" style={{ color: "#8A8F87" }}>
+          Used to generate budget lines directly from Personnel — separate from base pay above.
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Field label="Annual bonus">
+            <input type="number" className={inputCls} style={inputStyle} value={form.bonus} onChange={set("bonus")} />
+          </Field>
+          <Field label="Annual benefits ($)">
+            <input type="number" className={inputCls} style={inputStyle} value={form.benefits} onChange={set("benefits")} placeholder="Health, dental, retirement, etc." />
+          </Field>
+          <Field label="Payroll tax rate (%)">
+            <input type="number" step="0.01" className={inputCls} style={inputStyle} value={form.payrollTaxRate} onChange={set("payrollTaxRate")} placeholder="e.g. 9.5" />
+          </Field>
+          <Field label="Next raise/anniversary date">
+            <input type="date" className={inputCls} style={inputStyle} value={form.raiseDate || ""} onChange={set("raiseDate")} />
+          </Field>
+          <Field label="Expected raise (%)">
+            <input type="number" step="0.01" className={inputCls} style={inputStyle} value={form.raisePercent} onChange={set("raisePercent")} placeholder="e.g. 3" />
+          </Field>
+        </div>
+        <p className="text-xs mt-2" style={{ color: "#8A8F87" }}>
+          Raise date/% are captured for future use but don't yet affect generated budget lines — those still generate a flat annual figure.
+        </p>
+      </div>
+
+      <div className="mt-3 text-sm space-y-0.5">
+        <div><span style={{ color: "#8A8F87" }}>Base annual cost: </span><span className="font-medium" style={{ color: "#1C2624" }}>{fmt(cost)}</span></div>
+        <div><span style={{ color: "#8A8F87" }}>Fully loaded annual cost: </span><span className="font-medium" style={{ color: "#1C2624" }}>{fmt(loaded.total)}</span></div>
+        <div className="text-xs" style={{ color: "#8A8F87" }}>
+          Wages: {fmt(loaded.wagesTotal)} · Taxes &amp; benefits: {fmt(loaded.taxAndBenefitsTotal)}
+        </div>
       </div>
 
       <div className="mt-5">
