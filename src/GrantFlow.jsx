@@ -37,6 +37,49 @@ function colIsWithinCutoff(col, cutoff) {
   return col.monthIndex <= cutoff.monthIndex;
 }
 
+// Copies actuals from a Template budget's lines onto its linked Operational
+// budget, matching by category+subcategory and by actual calendar month —
+// not array position — since the two budgets' periods can start on
+// different dates. If the Operational side doesn't already have a matching
+// line, one is created (Plan left at $0) so no data is silently dropped.
+// One-way only: Operational edits never flow back to the Template.
+function syncActualsToLinkedBudget(templateBudget, allBudgets) {
+  if (templateBudget.budgetType !== "Template" || !templateBudget.linkedBudgetId) return null;
+  const target = allBudgets.find((b) => b.id === templateBudget.linkedBudgetId);
+  if (!target || !templateBudget.periodStart || !templateBudget.periodEnd || !target.periodStart || !target.periodEnd) return null;
+
+  const templateCols = monthColumnsForBudget(templateBudget.periodStart, templateBudget.periodEnd);
+  const targetCols = monthColumnsForBudget(target.periodStart, target.periodEnd);
+  const targetColIndexByYM = {};
+  targetCols.forEach((c, j) => { targetColIndexByYM[`${c.year}-${c.monthIndex}`] = j; });
+
+  let changed = false;
+  const newLines = target.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(targetCols.length).fill(0))] }));
+
+  templateBudget.lines.forEach((tl) => {
+    const key = `${tl.category}|||${tl.subcategory || ""}`;
+    let targetLine = newLines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
+    if (!targetLine) {
+      targetLine = { ...newLine(), category: tl.category, subcategory: tl.subcategory, type: tl.type, amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
+      newLines.push(targetLine);
+      changed = true;
+    }
+    (tl.actuals || []).forEach((v, i) => {
+      const col = templateCols[i];
+      if (!col) return;
+      const j = targetColIndexByYM[`${col.year}-${col.monthIndex}`];
+      if (j === undefined) return;
+      const numVal = Number(v) || 0;
+      if ((Number(targetLine.actuals[j]) || 0) !== numVal) {
+        targetLine.actuals[j] = numVal;
+        changed = true;
+      }
+    });
+  });
+
+  return changed ? { ...target, lines: newLines } : null;
+}
+
 function monthColumnsForBudget(periodStart, periodEnd) {
   let startYear, startMonth; // startMonth is 0-indexed
   if (periodStart) {
@@ -96,6 +139,11 @@ const SITE_OPTIONS = [
 const RISKS = ["Low", "Medium", "High"];
 const CADENCES = ["Weekly", "Monthly", "Quarterly", "Semi-annual", "Annually", "End of grant"];
 const BUDGET_STATUSES = ["Draft", "Pending Approval", "Active", "Awarded", "Rejected", "Closed"];
+// "Operational" is what actually goes to the grantor. "Template" is Nation's
+// Finest's own internal version of the same budget, used to roll up into the
+// org-wide Org Budget view — the two can differ (internal cost allocation,
+// admin categorization, etc.) without one distorting the other.
+const BUDGET_TYPES = ["Operational", "Template"];
 // "Awarded" is functionally identical to "Active" everywhere budgets are scoped,
 // totaled, or rolled up (org budget, scenarios, burn rate, dashboard counts, etc).
 // It exists as a separate status purely so it can be labeled/badged differently.
@@ -1025,10 +1073,10 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 
 // ---------- budget form ----------
 
-function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [] }) {
+function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [], budgets = [] }) {
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(budget || {
     id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
-    status: "Draft", notes: "", lines: [newLine()],
+    status: "Draft", notes: "", lines: [newLine()], budgetType: "", linkedBudgetId: "",
     approvedBy: "", approvedAt: "", rejectionReason: "",
   });
   const [approverName, setApproverName] = useState("");
@@ -1198,7 +1246,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       </div>
 
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-4">
         <Field label="Budget title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. FY26 Operating Budget" />
         </Field>
@@ -1209,6 +1257,12 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             {form.fy && !fyYearOptions.includes(Number(form.fy)) && (
               <option value={form.fy}>{form.fy} (non-standard — re-select to fix)</option>
             )}
+          </select>
+        </Field>
+        <Field label="Budget type">
+          <select className={inputCls} style={inputStyle} value={form.budgetType || ""} onChange={set("budgetType")}>
+            <option value="">Select type</option>
+            {BUDGET_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
           </select>
         </Field>
         <Field label="Status">
@@ -1242,6 +1296,22 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
           </Field>
         </div>
       </div>
+
+      {form.budgetType === "Template" && (
+        <div className="mb-4">
+          <Field label="Linked Operational budget">
+            <select className={inputCls} style={inputStyle} value={form.linkedBudgetId || ""} onChange={set("linkedBudgetId")}>
+              <option value="">Not linked</option>
+              {budgets
+                .filter((b) => b.id !== form.id && (b.grantId === form.grantId || b.costCenterId === form.costCenterId) && (form.grantId || form.costCenterId))
+                .map((b) => <option key={b.id} value={b.id}>{b.title || "Untitled budget"} ({b.fy}{b.budgetType ? `, ${b.budgetType}` : ""})</option>)}
+            </select>
+          </Field>
+          <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
+            Whenever this Template budget is saved, its actuals are copied onto the linked budget for the matching calendar months — matched by category/subcategory, not row order. One-way only; editing the linked budget directly won't flow back here.
+          </p>
+        </div>
+      )}
 
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-sm font-medium" style={{ color: "#1C2624" }}>Budget line items</h3>
@@ -2242,7 +2312,13 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     setBudgets((prev) => {
       const exists = prev.some((x) => x.id === b.id);
       logActivity?.("Budget", exists ? "Updated" : "Created", `${b.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""}`);
-      return exists ? prev.map((x) => (x.id === b.id ? b : x)) : [...prev, b];
+      let next = exists ? prev.map((x) => (x.id === b.id ? b : x)) : [...prev, b];
+      const synced = syncActualsToLinkedBudget(b, next);
+      if (synced) {
+        logActivity?.("Budget", "Updated", `${synced.title || "Untitled budget"} (actuals synced from "${b.title || "Untitled budget"}")`);
+        next = next.map((x) => (x.id === synced.id ? synced : x));
+      }
+      return next;
     });
     setModal(null);
   };
@@ -2425,6 +2501,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                   <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("title")}>Budget</th>
                   <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("fy")}>FY</th>
                   <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("status")}>Status</th>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("budgetType")}>Type</th>
                   <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("netTotal")}>Net</th>
                 </tr>
               </thead>
@@ -2441,6 +2518,13 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                     <td className="py-1.5" style={{ color: "#8A8F87" }}>{b.fy}</td>
                     <td className="py-1.5">
                       <Badge color={isActiveBudget(b.status) ? "#2F6F53" : b.status === "Pending Approval" ? "#C08A2E" : b.status === "Rejected" ? "#B5443A" : "#8A8F87"}>{b.status}</Badge>
+                    </td>
+                    <td className="py-1.5">
+                      {b.budgetType ? (
+                        <Badge color={b.budgetType === "Template" ? "#5B7FA6" : "#8A8F87"}>{b.budgetType}</Badge>
+                      ) : (
+                        <span className="text-xs" style={{ color: "#C08A2E" }}>Not set</span>
+                      )}
                     </td>
                     <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(b.netTotal) ? "#2F6F53" : "#B5443A" }}>{fmt(b.netTotal)}</td>
                   </tr>
@@ -2564,6 +2648,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           onClose={() => setModal(null)}
           currentUserEmail={currentUserEmail}
           grants={grants}
+          budgets={budgets}
         />
       )}
       {confirm && (
@@ -3990,7 +4075,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const scopedBudgets = (scope === "all"
     ? budgets.filter((b) => !(b.grantId && excludedGrantIds?.has(b.grantId)) && !(b.costCenterId && excludedCcIds?.has(b.costCenterId)))
     : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
-  ).filter((b) => isActiveBudget(b.status));
+  ).filter((b) => isActiveBudget(b.status) && b.budgetType === "Template");
 
   // Real calendar years actually touched by any in-scope budget's period, so the
   // year picker reflects reality even when grants run off the calendar year.
@@ -4254,6 +4339,9 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
           </Field>
         )}
       </div>
+      <p className="text-xs" style={{ color: "#8A8F87" }}>
+        Only budgets marked as budget type "Template" are included here — the "Operational" version sent to a grantor doesn't affect this rollup.
+      </p>
       {scope === "all" && deferredRevenueGroupId && (
         <p className="text-xs" style={{ color: "#8A8F87" }}>
           Grants and cost centers in the "Deferred Revenue" budget group are excluded from Whole Organization totals — select that group above to view them.
