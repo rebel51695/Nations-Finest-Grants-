@@ -651,6 +651,70 @@ function Field({ label, children }) {
 const inputCls = "w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2";
 const inputStyle = { borderColor: "#E1E5DE", color: "#1C2624" };
 
+// Closed-by-default multi-select with a search box — used wherever a picklist
+// could grow unbounded over time (e.g. linking budgets) and an always-open
+// checkbox list would become unwieldy.
+function MultiSelectDropdown({ options, selectedIds, onChange, placeholder = "Select…", renderLabel }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const filtered = options.filter((o) => renderLabel(o).toLowerCase().includes(search.toLowerCase()));
+  const toggle = (id) => onChange(selectedIds.includes(id) ? selectedIds.filter((x) => x !== id) : [...selectedIds, id]);
+  const selectedOptions = options.filter((o) => selectedIds.includes(o.id));
+
+  const summary = selectedIds.length === 0
+    ? placeholder
+    : selectedIds.length <= 2
+      ? selectedOptions.map(renderLabel).join(", ")
+      : `${selectedIds.length} selected`;
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={inputCls}
+        style={{ ...inputStyle, textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}
+      >
+        <span className="truncate" style={{ color: selectedIds.length === 0 ? "#8A8F87" : "#1C2624" }}>{summary}</span>
+        <span style={{ color: "#8A8F87", flexShrink: 0 }}>▾</span>
+      </button>
+      {open && (
+        <div className="absolute z-30 mt-1 w-full rounded-md border bg-white shadow-lg" style={{ borderColor: "#E1E5DE" }}>
+          <div className="p-2 border-b" style={{ borderColor: "#E1E5DE" }}>
+            <input
+              autoFocus
+              className={inputCls}
+              style={inputStyle}
+              placeholder="Search…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </div>
+          <div className="max-h-52 overflow-y-auto p-1">
+            {filtered.length === 0 ? (
+              <p className="text-xs px-2 py-2" style={{ color: "#8A8F87" }}>No matches.</p>
+            ) : filtered.map((o) => (
+              <label key={o.id} className="flex items-center gap-2 text-sm px-2 py-1.5 rounded hover:bg-stone-50 cursor-pointer" style={{ color: "#1C2624" }}>
+                <input type="checkbox" checked={selectedIds.includes(o.id)} onChange={() => toggle(o.id)} />
+                {renderLabel(o)}
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function grantLabel(g) {
   return g.programCode ? `${g.programCode} - ${g.title}` : g.title;
 }
@@ -1323,31 +1387,24 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
 
       {form.budgetType === "Template" && (
         <div className="mb-4">
-          <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>Linked Operational budgets</p>
-          <p className="text-xs mb-2" style={{ color: "#8A8F87" }}>
-            A calendar-year Template can span more than one Operational fiscal year — check every budget this one should feed. Each linked budget only receives whichever months actually fall within its own period.
+          <Field label="Linked Operational budgets">
+            <MultiSelectDropdown
+              options={budgets.filter((b) => {
+                if (b.id === form.id || (!form.grantId && !form.costCenterId)) return false;
+                if (!(b.grantId === form.grantId || b.costCenterId === form.costCenterId)) return false;
+                const isDraftOrActive = b.status === "Draft" || b.status === "Active";
+                const alreadyLinked = (form.linkedBudgetIds || []).includes(b.id);
+                return isDraftOrActive || alreadyLinked; // keep a since-changed link visible so it can still be unlinked
+              })}
+              selectedIds={form.linkedBudgetIds || []}
+              onChange={(ids) => setForm({ ...form, linkedBudgetIds: ids })}
+              placeholder="Select budgets to link…"
+              renderLabel={(b) => `${b.title || "Untitled budget"} (${b.fy}${b.budgetType ? `, ${b.budgetType}` : ""})`}
+            />
+          </Field>
+          <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
+            A calendar-year Template can span more than one Operational fiscal year — link every budget this one should feed. Only Draft and Active budgets are offered here. Each linked budget only receives whichever months actually fall within its own period.
           </p>
-          {(() => {
-            const candidates = budgets.filter((b) => b.id !== form.id && (form.grantId || form.costCenterId) && (b.grantId === form.grantId || b.costCenterId === form.costCenterId));
-            const linkedIds = form.linkedBudgetIds || [];
-            const toggle = (id) => setForm({
-              ...form,
-              linkedBudgetIds: linkedIds.includes(id) ? linkedIds.filter((x) => x !== id) : [...linkedIds, id],
-            });
-            if (candidates.length === 0) {
-              return <p className="text-xs" style={{ color: "#8A8F87" }}>No other budgets found for this grant/cost center yet.</p>;
-            }
-            return (
-              <div className="space-y-1 rounded-md border p-2" style={{ borderColor: "#E1E5DE" }}>
-                {candidates.map((b) => (
-                  <label key={b.id} className="flex items-center gap-2 text-sm" style={{ color: "#1C2624" }}>
-                    <input type="checkbox" checked={linkedIds.includes(b.id)} onChange={() => toggle(b.id)} />
-                    {b.title || "Untitled budget"} ({b.fy}{b.budgetType ? `, ${b.budgetType}` : ""})
-                  </label>
-                ))}
-              </div>
-            );
-          })()}
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
             Whenever this Template budget is saved, its actuals are copied onto every linked budget for the matching calendar months — matched by category/subcategory, not row order. One-way only; editing a linked budget directly won't flow back here.
           </p>
