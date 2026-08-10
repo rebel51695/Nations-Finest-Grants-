@@ -413,6 +413,39 @@ const stageColor = {
 };
 const ANNUAL_HOURS = 1768;
 
+// Column classification for Paylocity's "Labor Distribution Percentages"
+// report (grouped by Worked Program), verified against real export data:
+// summing WAGE + the true employer BENEFIT columns for one employee equals
+// more than "Total Earnings" alone — "Total Earnings" itself is exactly
+// WAGE columns (regular/OT/PTO/GTL imputed income), which is what
+// distinguishes real employer benefit cost from taxable wages.
+const PAYLOCITY_WAGE_COLS = ["E - REG Amt", "E - FQOT Amt", "E - OT Amt", "E - BIRTH Amt", "E - BRVMT Amt", "E - SICK Amt", "E - VAC Amt", "E - VOLUN Amt", "E - RETRO Amt", "E - GTL Amt"];
+const PAYLOCITY_BENEFIT_COLS = ["E - 401ER Amt", "E - 401PS Amt", "E - ERCBU Amt", "E - ERCIG Amt", "E - ERDEN Amt", "E - ERKBU Amt", "E - ERKSR Amt", "E - ERLIF Amt", "E - ERWSH Amt", "E - HSAER Amt"];
+const PAYLOCITY_EMPLOYER_TAX_COLS = ["R - MED-R Amt", "R - SS-R Amt", "R - AZSUI Amt", "R - CAETT Amt", "R - CASUI Amt", "R - FLSUI Amt", "R - LASUI Amt", "R - NVCLA Amt", "R - NVSUI Amt", "R - OHSUI Amt", "R - ORSUI Amt", "R - ORWC Amt", "R - SCAST Amt", "R - SCSUI Amt", "R - TNSUI Amt", "R - TXAST Amt", "R - TXETT Amt", "R - TXSUI Amt", "R - VASUI Amt", "R - WACLA Amt", "R - WASUI Amt", "R - OR-LAN1 Amt"];
+const PAYLOCITY_FFCRA_CREDIT_COLS = ["R - FFCRAMC Amt", "R - FFCRAMPC Amt", "R - FFCRASC Amt", "R - FFCRAWC Amt"];
+
+const sumCols = (row, cols) => cols.reduce((a, c) => a + (Number(row[c]) || 0), 0);
+const daysBetweenInclusive = (start, end) => Math.round((new Date(end + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000) + 1;
+// Splits a lump sum earned over [periodStart, periodEnd] across the calendar
+// months it spans, proportional to how many days of the period fall in each
+// month — used for writing real dollars into the right Actuals columns
+// rather than annualizing (annualizing is only for the Personnel card).
+function splitAmountAcrossMonths(amount, periodStart, periodEnd) {
+  const totalDays = daysBetweenInclusive(periodStart, periodEnd);
+  if (totalDays <= 0) return [];
+  const start = new Date(periodStart + "T00:00:00");
+  const end = new Date(periodEnd + "T00:00:00");
+  const byMonth = {};
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const key = `${d.getFullYear()}-${d.getMonth()}`;
+    byMonth[key] = (byMonth[key] || 0) + 1;
+  }
+  return Object.entries(byMonth).map(([key, days]) => {
+    const [year, monthIndex] = key.split("-").map(Number);
+    return { year, monthIndex, amount: amount * (days / totalDays) };
+  });
+}
+
 function newAllocation() {
   return { id: uid(), type: "grant", grantId: "", costCenterId: "", percent: 0 };
 }
@@ -980,7 +1013,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
     id: uid(), title: "", programCode: "", funding: "", sites: [], stage: "Prospecting",
     awardAmount: 0, start: "", end: "", riskStatus: "Low", cadence: [],
     complianceOwner: "", financeOwner: "", internalOwner: "", operationsOwner: "", renewal: false,
-    doclibUrl: "", contractUrl: "", notes: "",
+    doclibUrl: "", contractUrl: "", coverPageUrl: "", notes: "",
     budgetPeriodStart: "", budgetPeriodEnd: "", obligatedFunds: 0, obligatedFundsRemaining: 0, paymentMethod: PAYMENT_METHODS[0],
     beds: "", bedRate: 0, grantPoc: "", awardAmountRemaining: 0, budgetGroupId: "", indirectRate: 0,
   });
@@ -1096,6 +1129,9 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
         </Field>
         <Field label="Contract URL (SharePoint)">
           <input className={inputCls} style={inputStyle} value={form.contractUrl} onChange={set("contractUrl")} placeholder="https://…sharepoint.com/…" />
+        </Field>
+        <Field label="Grant cover page URL (SharePoint)">
+          <input className={inputCls} style={inputStyle} value={form.coverPageUrl} onChange={set("coverPageUrl")} placeholder="https://…sharepoint.com/…" />
         </Field>
         <Field label="Budget period start">
           <input type="date" className={inputCls} style={inputStyle} value={form.budgetPeriodStart} onChange={set("budgetPeriodStart")} />
@@ -2337,6 +2373,11 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
                       {g.contractUrl && (
                         <a href={g.contractUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
                           <ExternalLink size={13} /> Current contract
+                        </a>
+                      )}
+                      {g.coverPageUrl && (
+                        <a href={g.coverPageUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
+                          <ExternalLink size={13} /> Grant cover page
                         </a>
                       )}
                       {canEdit && (
@@ -4569,12 +4610,15 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 // ---------- personnel / payroll ----------
 
 function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClose, onDelete }) {
-  const [form, setForm, undoForm, canUndoForm] = useUndoableState(staff ? { ...staff, status: staff.status || "Active" } : {
+  const defaultStaff = {
     id: uid(), name: "", position: "", department: "", exempt: "Non-exempt",
     payType: "Salary", annualSalary: 0, hourlyRate: 0, annualHours: ANNUAL_HOURS,
     fte: 1, allocations: [], site: "", status: "Active",
-    bonus: 0, benefits: 0, payrollTaxRate: 0, raiseDate: "", raisePercent: 0,
-  });
+    bonus: 0, benefits: 0, payrollTaxRate: 0, raiseDate: "", raisePercent: 0, paylocityId: "",
+  };
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(
+    staff ? { ...defaultStaff, ...staff, status: staff.status || "Active" } : defaultStaff
+  );
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   const addAlloc = () => setForm({ ...form, allocations: [...form.allocations, newAllocation()] });
@@ -4592,6 +4636,11 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="Last, First" />
         </Field>
+        <Field label="Paylocity ID">
+          <input className={inputCls} style={inputStyle} value={form.paylocityId} onChange={set("paylocityId")} placeholder="e.g. BARTK" />
+        </Field>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
         <Field label="Position">
           <input className={inputCls} style={inputStyle} value={form.position} onChange={set("position")} />
         </Field>
@@ -4641,7 +4690,14 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
       </div>
 
       <div className="mt-5">
-        <h3 className="font-display text-sm mb-2" style={{ color: "#1C2624" }}>Compensation details</h3>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-display text-sm" style={{ color: "#1C2624" }}>Compensation details</h3>
+          {form.lastPaylocitySync && (
+            <span className="text-xs" style={{ color: "#2F6F53" }}>
+              Synced from Paylocity — {fmtDate(form.lastPaylocitySync.periodStart)}–{fmtDate(form.lastPaylocitySync.periodEnd)}
+            </span>
+          )}
+        </div>
         <p className="text-xs mb-2" style={{ color: "#8A8F87" }}>
           Used to generate budget lines directly from Personnel — separate from base pay above.
         </p>
@@ -4678,7 +4734,9 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
       <div className="mt-5">
         <div className="flex items-center justify-between mb-2">
           <h3 className="text-sm font-medium" style={{ color: "#1C2624" }}>Allocations</h3>
-          <span className="text-xs" style={{ color: allocatedPct > 100 ? "#B5443A" : "#8A8F87" }}>{allocatedPct}% allocated</span>
+          <span className="text-xs" style={{ color: allocatedPct > 100 ? "#B5443A" : "#8A8F87" }}>
+            {allocatedPct}% allocated{form.lastPaylocitySync ? <> · <span style={{ color: "#2F6F53" }}>synced {fmtDate(form.lastPaylocitySync.periodStart)}–{fmtDate(form.lastPaylocitySync.periodEnd)}</span></> : ""}
+          </span>
         </div>
         <div className="space-y-2">
           {form.allocations.map((a) => {
@@ -4769,13 +4827,14 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
   );
 }
 
-function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity }) {
+function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity, budgets = [], setBudgets, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport }) {
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
   const [siteFilter, setSiteFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
   const [sortBy, setSortBy] = useState("name");
+  const [showImport, setShowImport] = useState(false);
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const visible = staff
@@ -4815,11 +4874,21 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
         <div>
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Personnel & Payroll</h1>
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Staff cost and grant allocation — separate from budget line items</p>
+          {paylocityLastImport && (
+            <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
+              Last synced from Paylocity: covering {fmtDate(paylocityLastImport.periodStart)}–{fmtDate(paylocityLastImport.periodEnd)}, imported {fmtDate(paylocityLastImport.importedAt)}
+            </p>
+          )}
         </div>
         {canEdit && (
-          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-            <Plus size={16} /> New staff member
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={() => setShowImport(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Upload size={16} /> Import from Paylocity
+            </button>
+            <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+              <Plus size={16} /> New staff member
+            </button>
+          </div>
         )}
       </div>
 
@@ -4958,7 +5027,428 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
       {confirm && (
         <ConfirmModal message="This will permanently delete this staff member and their allocations." onConfirm={() => deleteStaff(confirm)} onCancel={() => setConfirm(null)} />
       )}
+      {showImport && (
+        <PaylocityImportModal
+          staff={staff}
+          setStaff={setStaff}
+          grants={grants}
+          costCenters={costCenters}
+          budgets={budgets}
+          setBudgets={setBudgets}
+          paylocityProgramMap={paylocityProgramMap}
+          setPaylocityProgramMap={setPaylocityProgramMap}
+          paylocityLastImport={paylocityLastImport}
+          setPaylocityLastImport={setPaylocityLastImport}
+          logActivity={logActivity}
+          onClose={() => setShowImport(false)}
+          onOpenStaff={(s) => { setShowImport(false); setModal(s); }}
+        />
+      )}
     </div>
+  );
+}
+
+function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, setBudgets, paylocityProgramMap, setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, logActivity, onClose, onOpenStaff }) {
+  const [step, setStep] = useState("upload"); // upload -> crosswalk -> review -> done
+  const [periodStart, setPeriodStart] = useState(paylocityLastImport ? "" : "2026-01-01");
+  const [periodEnd, setPeriodEnd] = useState("");
+  const [error, setError] = useState("");
+  const [rows, setRows] = useState(null);
+  const [crosswalkDraft, setCrosswalkDraft] = useState({}); // code -> { grantId, costCenterId, ignore }
+  const [result, setResult] = useState(null);
+
+  const parseFile = async (file) => {
+    setError("");
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+      const headerRow = aoa[1];
+      if (!headerRow || !headerRow.includes("ID") || !headerRow.includes("Worked Program")) {
+        setError("This doesn't look like a Paylocity Labor Distribution Percentages export grouped by Worked Program. Double-check the file.");
+        return;
+      }
+      const parsed = aoa.slice(2)
+        .filter((r) => r && r[headerRow.indexOf("ID")])
+        .map((r) => {
+          const obj = {};
+          headerRow.forEach((h, i) => { if (h) obj[h] = r[i]; });
+          return obj;
+        });
+      setRows(parsed);
+    } catch (e) {
+      setError("Couldn't read that file — make sure it's the .xlsx Paylocity export.");
+    }
+  };
+
+  const distinctCodes = useMemo(() => {
+    if (!rows) return [];
+    const seen = new Map();
+    rows.forEach((r) => {
+      const label = r["Worked Program"];
+      if (!label) return;
+      const code = String(label).split(":")[0].trim();
+      if (!seen.has(code)) seen.set(code, label);
+    });
+    return [...seen.entries()].map(([code, label]) => ({ code, label }));
+  }, [rows]);
+
+  const unmappedCodes = useMemo(() => {
+    const mappedCodes = new Set(paylocityProgramMap.map((m) => m.code));
+    return distinctCodes.filter((c) => !mappedCodes.has(c.code));
+  }, [distinctCodes, paylocityProgramMap]);
+
+  const goToCrosswalkOrReview = () => {
+    if (!periodStart || !periodEnd) { setError("Enter the date range this report covers."); return; }
+    if (!rows || rows.length === 0) { setError("Upload a file first."); return; }
+    setError("");
+    if (unmappedCodes.length > 0) {
+      const draft = {};
+      unmappedCodes.forEach((c) => { draft[c.code] = { grantId: "", costCenterId: "", ignore: false }; });
+      setCrosswalkDraft(draft);
+      setStep("crosswalk");
+    } else {
+      buildReview();
+    }
+  };
+
+  const confirmCrosswalk = () => {
+    const unresolved = unmappedCodes.filter((c) => {
+      const d = crosswalkDraft[c.code];
+      return !d || (!d.ignore && !d.grantId && !d.costCenterId);
+    });
+    if (unresolved.length > 0) { setError("Map or ignore every listed program code before continuing."); return; }
+    setError("");
+    const additions = unmappedCodes.map((c) => ({ code: c.code, label: c.label, ...crosswalkDraft[c.code] }));
+    setPaylocityProgramMap((prev) => [...prev, ...additions]);
+    buildReview(additions);
+  };
+
+  const buildReview = (freshMappings = []) => {
+    const fullMap = [...paylocityProgramMap, ...freshMappings];
+    const codeToTarget = {};
+    fullMap.forEach((m) => { codeToTarget[m.code] = m; });
+
+    const byEmployee = {};
+    rows.forEach((r) => {
+      const id = r["ID"];
+      if (!id) return;
+      (byEmployee[id] = byEmployee[id] || []).push(r);
+    });
+
+    const staffByPaylocityId = {};
+    staff.forEach((s) => { if (s.paylocityId) staffByPaylocityId[s.paylocityId] = s; });
+
+    const totalDays = daysBetweenInclusive(periodStart, periodEnd);
+    const factor = totalDays > 0 ? 365 / totalDays : 0;
+
+    const matchedUpdates = []; // { staffId, patch }
+    const newEmployees = []; // { paylocityId, name }
+    const grantMonthlyTotals = {}; // grantId -> { wage: {year-month: $}, benefitAndTax: {year-month: $} }
+
+    Object.entries(byEmployee).forEach(([paylocityId, employeeRows]) => {
+      const existingStaff = staffByPaylocityId[paylocityId];
+      const totalWage = employeeRows.reduce((a, r) => a + sumCols(r, PAYLOCITY_WAGE_COLS), 0);
+      const totalBenefit = employeeRows.reduce((a, r) => a + sumCols(r, PAYLOCITY_BENEFIT_COLS), 0);
+      const totalEmployerTax = employeeRows.reduce((a, r) => a + sumCols(r, PAYLOCITY_EMPLOYER_TAX_COLS) - sumCols(r, PAYLOCITY_FFCRA_CREDIT_COLS), 0);
+
+      // Every program row for this employee must resolve to a grant/cost
+      // center (or an explicit "ignore") before we touch their record —
+      // a partial picture is worse than flagging it for next time.
+      const targets = employeeRows.map((r) => {
+        const label = r["Worked Program"];
+        const code = label ? String(label).split(":")[0].trim() : "";
+        return { row: r, target: codeToTarget[code] };
+      });
+
+      if (!existingStaff) {
+        newEmployees.push({ paylocityId, name: employeeRows[0]["Employee Name"] || paylocityId });
+        return;
+      }
+
+      const fte = Number(existingStaff.fte) || 1;
+      const annualWage = totalWage * factor;
+      const annualBenefit = totalBenefit * factor;
+      const annualEmployerTax = totalEmployerTax * factor;
+      const payrollTaxRate = annualWage > 0 ? (annualEmployerTax / annualWage) * 100 : 0;
+
+      const patch = {
+        benefits: fte > 0 ? annualBenefit / fte : annualBenefit,
+        payrollTaxRate,
+        paylocityId,
+        lastPaylocitySync: { periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) },
+      };
+      if (existingStaff.payType === "Hourly") {
+        const hours = Number(existingStaff.annualHours) || ANNUAL_HOURS;
+        patch.hourlyRate = fte > 0 && hours > 0 ? annualWage / (hours * fte) : 0;
+      } else {
+        patch.annualSalary = fte > 0 ? annualWage / fte : annualWage;
+      }
+
+      // Allocations replace entirely, from this import's Labor % breakdown —
+      // rows with an "ignore" target simply don't contribute an allocation.
+      const newAllocations = [];
+      targets.forEach(({ row, target }) => {
+        if (!target || target.ignore) return;
+        const pct = (Number(row["Labor %"]) || 0) * 100;
+        if (target.grantId) newAllocations.push({ id: uid(), type: "grant", grantId: target.grantId, costCenterId: "", percent: Math.round(pct * 100) / 100 });
+        else if (target.costCenterId) newAllocations.push({ id: uid(), type: "costCenter", grantId: "", costCenterId: target.costCenterId, percent: Math.round(pct * 100) / 100 });
+      });
+      patch.allocations = newAllocations;
+
+      matchedUpdates.push({ staffId: existingStaff.id, patch });
+
+      // Real dollars for this specific period, split by calendar month, into
+      // whichever grant each program row maps to — this is what feeds the
+      // Template budget's Actuals.
+      targets.forEach(({ row, target }) => {
+        if (!target || target.ignore || !target.grantId) return; // budget actuals only make sense for grant-linked budgets
+        const rowWage = sumCols(row, PAYLOCITY_WAGE_COLS);
+        const rowBenefitAndTax = sumCols(row, PAYLOCITY_BENEFIT_COLS) + sumCols(row, PAYLOCITY_EMPLOYER_TAX_COLS) - sumCols(row, PAYLOCITY_FFCRA_CREDIT_COLS);
+        if (!grantMonthlyTotals[target.grantId]) grantMonthlyTotals[target.grantId] = { wage: {}, benefitAndTax: {} };
+        splitAmountAcrossMonths(rowWage, periodStart, periodEnd).forEach(({ year, monthIndex, amount }) => {
+          const key = `${year}-${monthIndex}`;
+          grantMonthlyTotals[target.grantId].wage[key] = (grantMonthlyTotals[target.grantId].wage[key] || 0) + amount;
+        });
+        splitAmountAcrossMonths(rowBenefitAndTax, periodStart, periodEnd).forEach(({ year, monthIndex, amount }) => {
+          const key = `${year}-${monthIndex}`;
+          grantMonthlyTotals[target.grantId].benefitAndTax[key] = (grantMonthlyTotals[target.grantId].benefitAndTax[key] || 0) + amount;
+        });
+      });
+    });
+
+    const matchedIds = new Set(Object.keys(byEmployee).map((pid) => staffByPaylocityId[pid]?.id).filter(Boolean));
+    const missingStaff = staff.filter((s) => s.paylocityId && !matchedIds.has(s.id) && (s.status || "Active") !== "Inactive");
+
+    // Find, for each grant with $ activity, its Template budget(s) and which
+    // months couldn't be placed anywhere.
+    const budgetTargets = []; // { budgetId, lineUpdates: [{col, wage, benefitAndTax}] }
+    const unplacedMonths = []; // { grantTitle, year, monthIndex }
+    Object.entries(grantMonthlyTotals).forEach(([grantId, totals]) => {
+      const g = grants.find((x) => x.id === grantId);
+      const templateBudgets = budgets.filter((b) => b.grantId === grantId && b.budgetType === "Template" && (b.status === "Active" || b.status === "Awarded"));
+      const allKeys = new Set([...Object.keys(totals.wage), ...Object.keys(totals.benefitAndTax)]);
+      allKeys.forEach((key) => {
+        const [year, monthIndex] = key.split("-").map(Number);
+        const owner = templateBudgets.find((b) => {
+          const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+          return cols.some((c) => c.year === year && c.monthIndex === monthIndex);
+        });
+        if (!owner) {
+          unplacedMonths.push({ grantTitle: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : grantId, year, monthIndex });
+          return;
+        }
+        let entry = budgetTargets.find((t) => t.budgetId === owner.id);
+        if (!entry) { entry = { budgetId: owner.id, months: {} }; budgetTargets.push(entry); }
+        entry.months[key] = { wage: totals.wage[key] || 0, benefitAndTax: totals.benefitAndTax[key] || 0 };
+      });
+    });
+
+    setResult({ matchedUpdates, newEmployees, missingStaff, budgetTargets, unplacedMonths, matchedCount: matchedUpdates.length });
+    setStep("review");
+  };
+
+  const applyImport = () => {
+    const { matchedUpdates, budgetTargets } = result;
+    const patchById = {};
+    matchedUpdates.forEach((u) => { patchById[u.staffId] = u.patch; });
+    setStaff((prev) => prev.map((s) => (patchById[s.id] ? { ...s, ...patchById[s.id] } : s)));
+
+    setBudgets((prev) => {
+      let next = prev.map((b) => {
+        const target = budgetTargets.find((t) => t.budgetId === b.id);
+        if (!target) return b;
+        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+        const colIndexByYM = {};
+        cols.forEach((c, i) => { colIndexByYM[`${c.year}-${c.monthIndex}`] = i; });
+
+        let lines = b.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(cols.length).fill(0))] }));
+        const findOrCreate = (category, subcategory, type) => {
+          let line = lines.find((l) => l.category === category && l.subcategory === subcategory);
+          if (!line) {
+            line = { ...newLine(), category, subcategory, type, amounts: Array(cols.length).fill(0), actuals: Array(cols.length).fill(0) };
+            lines.push(line);
+          }
+          return line;
+        };
+        const wageLine = findOrCreate("Wages and Benefits", "5000 - Salary and Wages", "expense");
+        const taxLine = findOrCreate("Wages and Benefits", "5900 - Payroll taxes and benefits", "expense");
+
+        Object.entries(target.months).forEach(([key, amounts]) => {
+          const i = colIndexByYM[key];
+          if (i === undefined) return;
+          wageLine.actuals[i] = amounts.wage;
+          taxLine.actuals[i] = amounts.benefitAndTax;
+        });
+
+        // Advance the cutoff to the end of this import's period, but never
+        // backward — a re-upload of an earlier range shouldn't undo a
+        // marker that's already more current.
+        const newCutoff = periodEnd.slice(0, 7); // "YYYY-MM"
+        const cutoff = !b.actualsThrough || newCutoff > b.actualsThrough ? newCutoff : b.actualsThrough;
+
+        return { ...b, lines, actualsThrough: cutoff };
+      });
+
+      // Re-run the existing Template -> Operational sync for every budget we
+      // just touched, so linked budgets and Org Budget pick this up
+      // immediately without a separate save step.
+      budgetTargets.forEach((t) => {
+        const b = next.find((x) => x.id === t.budgetId);
+        if (!b) return;
+        const synced = syncActualsToLinkedBudgets(b, next);
+        synced.forEach((s) => { next = next.map((x) => (x.id === s.id ? s : x)); });
+      });
+
+      return next;
+    });
+
+    setPaylocityLastImport({ periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) });
+    logActivity?.("Personnel", "Updated", `Paylocity import applied — ${matchedUpdates.length} staff updated (${fmtDate(periodStart)}–${fmtDate(periodEnd)})`);
+    setStep("done");
+  };
+
+  return (
+    <Modal title="Import from Paylocity" onClose={onClose} wide>
+      {step === "upload" && (
+        <div className="space-y-4">
+          <p className="text-sm" style={{ color: "#5B6B66" }}>
+            Upload the "Labor Distribution Percentages" export grouped by Worked Program (.xlsx). Wages, benefits, payroll tax, and grant allocations are all read from this one file.
+          </p>
+          {paylocityLastImport && (
+            <p className="text-xs" style={{ color: "#8A8F87" }}>
+              Last import covered {fmtDate(paylocityLastImport.periodStart)}–{fmtDate(paylocityLastImport.periodEnd)}. Start this report's date range right after that.
+            </p>
+          )}
+          <div className="grid grid-cols-2 gap-4">
+            <Field label="Report period start">
+              <input type="date" className={inputCls} style={inputStyle} value={periodStart} onChange={(e) => setPeriodStart(e.target.value)} />
+            </Field>
+            <Field label="Report period end">
+              <input type="date" className={inputCls} style={inputStyle} value={periodEnd} onChange={(e) => setPeriodEnd(e.target.value)} />
+            </Field>
+          </div>
+          <Field label="Paylocity export (.xlsx)">
+            <input type="file" accept=".xlsx" className={inputCls} style={inputStyle} onChange={(e) => e.target.files[0] && parseFile(e.target.files[0])} />
+          </Field>
+          {rows && <p className="text-xs" style={{ color: "#2F6F53" }}>{rows.length} rows read, covering {distinctCodes.length} program codes.</p>}
+          {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={onClose} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+            <button onClick={goToCrosswalkOrReview} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
+          </div>
+        </div>
+      )}
+
+      {step === "crosswalk" && (
+        <div className="space-y-4">
+          <p className="text-sm" style={{ color: "#5B6B66" }}>
+            These program codes haven't been mapped to a grant or cost center yet. This only needs to happen once per code — future imports will remember it.
+          </p>
+          <div className="space-y-2 max-h-96 overflow-y-auto">
+            {unmappedCodes.map((c) => (
+              <div key={c.code} className="flex items-center gap-2 p-2 rounded-md border" style={{ borderColor: "#E1E5DE" }}>
+                <div className="text-sm flex-1" style={{ color: "#1C2624" }}>{c.label}</div>
+                <select
+                  className={inputCls} style={{ ...inputStyle, flex: 2 }}
+                  value={crosswalkDraft[c.code]?.ignore ? "__ignore__" : (crosswalkDraft[c.code]?.grantId ? `g:${crosswalkDraft[c.code].grantId}` : crosswalkDraft[c.code]?.costCenterId ? `c:${crosswalkDraft[c.code].costCenterId}` : "")}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    let next = { grantId: "", costCenterId: "", ignore: false };
+                    if (v === "__ignore__") next.ignore = true;
+                    else if (v.startsWith("g:")) next.grantId = v.slice(2);
+                    else if (v.startsWith("c:")) next.costCenterId = v.slice(2);
+                    setCrosswalkDraft((d) => ({ ...d, [c.code]: next }));
+                  }}
+                >
+                  <option value="">Select a grant or cost center…</option>
+                  {grants.map((g) => <option key={g.id} value={`g:${g.id}`}>{g.programCode ? `${g.programCode} - ${g.title}` : g.title}</option>)}
+                  {costCenters.map((cc) => <option key={cc.id} value={`c:${cc.id}`}>{cc.name}</option>)}
+                  <option value="__ignore__">Ignore this program code</option>
+                </select>
+              </div>
+            ))}
+          </div>
+          {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={() => setStep("upload")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
+            <button onClick={confirmCrosswalk} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
+          </div>
+        </div>
+      )}
+
+      {step === "review" && result && (
+        <div className="space-y-4">
+          <div className="flex items-center gap-3 text-xs">
+            <span className="px-2 py-1 rounded-md" style={{ background: "#F0F5F2", color: "#2F6F53" }}>{result.matchedCount} matched and will be updated</span>
+            {result.newEmployees.length > 0 && <span className="px-2 py-1 rounded-md" style={{ background: "#FBF3E4", color: "#8A5A0B" }}>{result.newEmployees.length} new, unmatched</span>}
+            {result.missingStaff.length > 0 && <span className="px-2 py-1 rounded-md" style={{ background: "#FBEAE8", color: "#B5443A" }}>{result.missingStaff.length} not found in this import</span>}
+          </div>
+
+          {result.newEmployees.length > 0 && (
+            <div>
+              <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>New in file — no matching staff record</p>
+              <div className="rounded-md border divide-y" style={{ borderColor: "#E1E5DE" }}>
+                {result.newEmployees.map((e) => (
+                  <div key={e.paylocityId} className="flex items-center justify-between px-3 py-2 text-sm">
+                    <span style={{ color: "#1C2624" }}>{e.name} — Paylocity ID <span style={{ fontFamily: "var(--mono-font)", color: "#8A8F87" }}>{e.paylocityId}</span></span>
+                    <button
+                      onClick={() => onOpenStaff({ id: uid(), name: e.name, paylocityId: e.paylocityId, allocations: [], status: "Active" })}
+                      className="text-xs px-3 py-1.5 rounded-md border"
+                      style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}
+                    >
+                      Add as staff
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {result.missingStaff.length > 0 && (
+            <div>
+              <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>In the portal but not found in this import</p>
+              <div className="rounded-md border divide-y" style={{ borderColor: "#E1E5DE" }}>
+                {result.missingStaff.map((s) => (
+                  <div key={s.id} className="flex items-center justify-between px-3 py-2 text-sm">
+                    <span style={{ color: "#1C2624" }}>{s.name}</span>
+                    <button onClick={() => onOpenStaff(s)} className="text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
+                      Review staff record
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>Nothing changes automatically — check each before updating their status.</p>
+            </div>
+          )}
+
+          {result.unplacedMonths.length > 0 && (
+            <div>
+              <p className="text-xs font-medium mb-1.5" style={{ color: "#B5443A" }}>No Template budget found to receive these months</p>
+              <div className="rounded-md border divide-y text-xs" style={{ borderColor: "#E1E5DE" }}>
+                {result.unplacedMonths.map((m, i) => (
+                  <div key={i} className="px-3 py-1.5" style={{ color: "#1C2624" }}>{m.grantTitle} — {MONTHS[m.monthIndex]} {m.year}</div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={onClose} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+            <button onClick={applyImport} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Apply import</button>
+          </div>
+        </div>
+      )}
+
+      {step === "done" && (
+        <div className="space-y-4 text-center py-6">
+          <CheckCircle size={28} style={{ color: "#2F6F53", margin: "0 auto" }} />
+          <p className="text-sm" style={{ color: "#1C2624" }}>Import applied — Personnel and Template budget actuals are up to date.</p>
+          <button onClick={onClose} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Done</button>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -6584,6 +7074,8 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const [budgetGroups, setBudgetGroups] = useState([]);
   const [scenarios, setScenarios] = useState([]);
   const [trash, setTrash] = useState([]);
+  const [paylocityProgramMap, setPaylocityProgramMap] = useState([]);
+  const [paylocityLastImport, setPaylocityLastImport] = useState(null);
   const [announcement, setAnnouncement] = useState(null);
   const [announcementDismissed, setAnnouncementDismissed] = useState(false);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
@@ -6675,6 +7167,14 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     try {
       const sc = await withTimeout(loadData("grantflow:scenarios"));
       if (sc) setScenarios(sc);
+    } catch (e) { /* no data yet */ }
+    try {
+      const pm = await withTimeout(loadData("grantflow:paylocityprogrammap"));
+      if (pm) setPaylocityProgramMap(pm);
+    } catch (e) { /* no data yet */ }
+    try {
+      const pli = await withTimeout(loadData("grantflow:paylocitylastimport"));
+      if (pli) setPaylocityLastImport(pli);
     } catch (e) { /* no data yet */ }
     try {
       const tr = await withTimeout(loadData("grantflow:trash"));
@@ -6774,6 +7274,16 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:scenarios", scenarios, "Scenarios");
   }, [scenarios, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:paylocityprogrammap", paylocityProgramMap, "Paylocity program mapping");
+  }, [paylocityProgramMap, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:paylocitylastimport", paylocityLastImport, "Paylocity last import");
+  }, [paylocityLastImport, loaded]);
 
   useEffect(() => {
     if (!loaded || isSyncingRef.current) return;
@@ -7009,6 +7519,9 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             grants={grants} staff={staff} setStaff={setStaff} costCenters={costCenters}
             setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenStaffId={pendingOpenStaffId} logActivity={logActivity}
+            budgets={budgets} setBudgets={setBudgets}
+            paylocityProgramMap={paylocityProgramMap} setPaylocityProgramMap={setPaylocityProgramMap}
+            paylocityLastImport={paylocityLastImport} setPaylocityLastImport={setPaylocityLastImport}
           />
         ) : tab === "activity-log" ? (
           <ActivityLogView activity={activity} />
