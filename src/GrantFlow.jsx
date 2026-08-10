@@ -37,47 +37,68 @@ function colIsWithinCutoff(col, cutoff) {
   return col.monthIndex <= cutoff.monthIndex;
 }
 
-// Copies actuals from a Template budget's lines onto its linked Operational
-// budget, matching by category+subcategory and by actual calendar month —
-// not array position — since the two budgets' periods can start on
-// different dates. If the Operational side doesn't already have a matching
-// line, one is created (Plan left at $0) so no data is silently dropped.
-// One-way only: Operational edits never flow back to the Template.
-function syncActualsToLinkedBudget(templateBudget, allBudgets) {
-  if (templateBudget.budgetType !== "Template" || !templateBudget.linkedBudgetId) return null;
-  const target = allBudgets.find((b) => b.id === templateBudget.linkedBudgetId);
-  if (!target || !templateBudget.periodStart || !templateBudget.periodEnd || !target.periodStart || !target.periodEnd) return null;
+// Copies actuals from a Template budget's lines onto every linked
+// Operational budget, matching by category+subcategory and by actual
+// calendar month — not array position — since periods can start on
+// different dates. A calendar-year Template can span more than one
+// Operational budget (e.g. two Oct–Sep fiscal years); each linked budget
+// only receives whichever months actually fall within its own period,
+// determined independently per target. If a target doesn't already have a
+// matching line, one is created (Plan left at $0) so no data is silently
+// dropped. One-way only: Operational edits never flow back to the Template.
+function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
+  const linkedIds = templateBudget.linkedBudgetIds && templateBudget.linkedBudgetIds.length
+    ? templateBudget.linkedBudgetIds
+    : (templateBudget.linkedBudgetId ? [templateBudget.linkedBudgetId] : []); // legacy single-link fallback
+  if (templateBudget.budgetType !== "Template" || linkedIds.length === 0 || !templateBudget.periodStart || !templateBudget.periodEnd) return [];
 
   const templateCols = monthColumnsForBudget(templateBudget.periodStart, templateBudget.periodEnd);
-  const targetCols = monthColumnsForBudget(target.periodStart, target.periodEnd);
-  const targetColIndexByYM = {};
-  targetCols.forEach((c, j) => { targetColIndexByYM[`${c.year}-${c.monthIndex}`] = j; });
+  const results = [];
 
-  let changed = false;
-  const newLines = target.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(targetCols.length).fill(0))] }));
+  linkedIds.forEach((targetId) => {
+    const target = allBudgets.find((b) => b.id === targetId);
+    if (!target || !target.periodStart || !target.periodEnd) return;
 
-  templateBudget.lines.forEach((tl) => {
-    const key = `${tl.category}|||${tl.subcategory || ""}`;
-    let targetLine = newLines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
-    if (!targetLine) {
-      targetLine = { ...newLine(), category: tl.category, subcategory: tl.subcategory, type: tl.type, amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
-      newLines.push(targetLine);
-      changed = true;
-    }
-    (tl.actuals || []).forEach((v, i) => {
-      const col = templateCols[i];
-      if (!col) return;
-      const j = targetColIndexByYM[`${col.year}-${col.monthIndex}`];
-      if (j === undefined) return;
-      const numVal = Number(v) || 0;
-      if ((Number(targetLine.actuals[j]) || 0) !== numVal) {
-        targetLine.actuals[j] = numVal;
+    const targetCols = monthColumnsForBudget(target.periodStart, target.periodEnd);
+    const targetColIndexByYM = {};
+    targetCols.forEach((c, j) => { targetColIndexByYM[`${c.year}-${c.monthIndex}`] = j; });
+
+    let changed = false;
+    const newLines = target.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(targetCols.length).fill(0))] }));
+
+    templateBudget.lines.forEach((tl) => {
+      const key = `${tl.category}|||${tl.subcategory || ""}`;
+      let targetLine = newLines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
+      // Only months from this template line that actually fall within this
+      // specific target's period will match below — a line with no
+      // in-range months for this target simply won't create one.
+      const hasInRangeMonth = (tl.actuals || []).some((v, i) => {
+        const col = templateCols[i];
+        return col && targetColIndexByYM[`${col.year}-${col.monthIndex}`] !== undefined;
+      });
+      if (!targetLine && !hasInRangeMonth) return;
+      if (!targetLine) {
+        targetLine = { ...newLine(), category: tl.category, subcategory: tl.subcategory, type: tl.type, amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
+        newLines.push(targetLine);
         changed = true;
       }
+      (tl.actuals || []).forEach((v, i) => {
+        const col = templateCols[i];
+        if (!col) return;
+        const j = targetColIndexByYM[`${col.year}-${col.monthIndex}`];
+        if (j === undefined) return;
+        const numVal = Number(v) || 0;
+        if ((Number(targetLine.actuals[j]) || 0) !== numVal) {
+          targetLine.actuals[j] = numVal;
+          changed = true;
+        }
+      });
     });
+
+    if (changed) results.push({ ...target, lines: newLines });
   });
 
-  return changed ? { ...target, lines: newLines } : null;
+  return results;
 }
 
 function monthColumnsForBudget(periodStart, periodEnd) {
@@ -1074,11 +1095,14 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 // ---------- budget form ----------
 
 function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [], budgets = [] }) {
-  const [form, setForm, undoForm, canUndoForm] = useUndoableState(budget || {
-    id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
-    status: "Draft", notes: "", lines: [newLine()], budgetType: "", linkedBudgetId: "",
-    approvedBy: "", approvedAt: "", rejectionReason: "",
-  });
+  const initial = budget
+    ? { ...budget, linkedBudgetIds: budget.linkedBudgetIds || (budget.linkedBudgetId ? [budget.linkedBudgetId] : []) }
+    : {
+      id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
+      status: "Draft", notes: "", lines: [newLine()], budgetType: "", linkedBudgetIds: [],
+      approvedBy: "", approvedAt: "", rejectionReason: "",
+    };
+  const [form, setForm, undoForm, canUndoForm] = useUndoableState(initial);
   const [approverName, setApproverName] = useState("");
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectBox, setShowRejectBox] = useState(false);
@@ -1299,16 +1323,33 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
 
       {form.budgetType === "Template" && (
         <div className="mb-4">
-          <Field label="Linked Operational budget">
-            <select className={inputCls} style={inputStyle} value={form.linkedBudgetId || ""} onChange={set("linkedBudgetId")}>
-              <option value="">Not linked</option>
-              {budgets
-                .filter((b) => b.id !== form.id && (b.grantId === form.grantId || b.costCenterId === form.costCenterId) && (form.grantId || form.costCenterId))
-                .map((b) => <option key={b.id} value={b.id}>{b.title || "Untitled budget"} ({b.fy}{b.budgetType ? `, ${b.budgetType}` : ""})</option>)}
-            </select>
-          </Field>
+          <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>Linked Operational budgets</p>
+          <p className="text-xs mb-2" style={{ color: "#8A8F87" }}>
+            A calendar-year Template can span more than one Operational fiscal year — check every budget this one should feed. Each linked budget only receives whichever months actually fall within its own period.
+          </p>
+          {(() => {
+            const candidates = budgets.filter((b) => b.id !== form.id && (form.grantId || form.costCenterId) && (b.grantId === form.grantId || b.costCenterId === form.costCenterId));
+            const linkedIds = form.linkedBudgetIds || [];
+            const toggle = (id) => setForm({
+              ...form,
+              linkedBudgetIds: linkedIds.includes(id) ? linkedIds.filter((x) => x !== id) : [...linkedIds, id],
+            });
+            if (candidates.length === 0) {
+              return <p className="text-xs" style={{ color: "#8A8F87" }}>No other budgets found for this grant/cost center yet.</p>;
+            }
+            return (
+              <div className="space-y-1 rounded-md border p-2" style={{ borderColor: "#E1E5DE" }}>
+                {candidates.map((b) => (
+                  <label key={b.id} className="flex items-center gap-2 text-sm" style={{ color: "#1C2624" }}>
+                    <input type="checkbox" checked={linkedIds.includes(b.id)} onChange={() => toggle(b.id)} />
+                    {b.title || "Untitled budget"} ({b.fy}{b.budgetType ? `, ${b.budgetType}` : ""})
+                  </label>
+                ))}
+              </div>
+            );
+          })()}
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
-            Whenever this Template budget is saved, its actuals are copied onto the linked budget for the matching calendar months — matched by category/subcategory, not row order. One-way only; editing the linked budget directly won't flow back here.
+            Whenever this Template budget is saved, its actuals are copied onto every linked budget for the matching calendar months — matched by category/subcategory, not row order. One-way only; editing a linked budget directly won't flow back here.
           </p>
         </div>
       )}
@@ -2313,11 +2354,11 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       const exists = prev.some((x) => x.id === b.id);
       logActivity?.("Budget", exists ? "Updated" : "Created", `${b.title || "Untitled budget"}${activeSelection ? ` (${activeSelection.title || activeSelection.name})` : ""}`);
       let next = exists ? prev.map((x) => (x.id === b.id ? b : x)) : [...prev, b];
-      const synced = syncActualsToLinkedBudget(b, next);
-      if (synced) {
+      const syncedTargets = syncActualsToLinkedBudgets(b, next);
+      syncedTargets.forEach((synced) => {
         logActivity?.("Budget", "Updated", `${synced.title || "Untitled budget"} (actuals synced from "${b.title || "Untitled budget"}")`);
         next = next.map((x) => (x.id === synced.id ? synced : x));
-      }
+      });
       return next;
     });
     setModal(null);
