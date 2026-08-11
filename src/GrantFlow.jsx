@@ -414,17 +414,30 @@ const stageColor = {
 const ANNUAL_HOURS = 1768;
 
 // Column classification for Paylocity's "Labor Distribution Percentages"
-// report (grouped by Worked Program), verified against real export data:
-// summing WAGE + the true employer BENEFIT columns for one employee equals
-// more than "Total Earnings" alone — "Total Earnings" itself is exactly
-// WAGE columns (regular/OT/PTO/GTL imputed income), which is what
-// distinguishes real employer benefit cost from taxable wages.
-const PAYLOCITY_WAGE_COLS = ["E - REG Amt", "E - FQOT Amt", "E - OT Amt", "E - BIRTH Amt", "E - BRVMT Amt", "E - SICK Amt", "E - VAC Amt", "E - VOLUN Amt", "E - RETRO Amt", "E - GTL Amt"];
-const PAYLOCITY_BENEFIT_COLS = ["E - 401ER Amt", "E - 401PS Amt", "E - ERCBU Amt", "E - ERCIG Amt", "E - ERDEN Amt", "E - ERKBU Amt", "E - ERKSR Amt", "E - ERLIF Amt", "E - ERWSH Amt", "E - HSAER Amt"];
+// report (grouped by Worked Program). Verified against two real exports
+// (single pay period AND full year-to-date) with zero mismatches across all
+// 398 employee-records: WAGE = every "E - ... Amt" column EXCEPT the
+// specific employer benefit-cost columns below. An exclusion list is used
+// rather than an inclusion whitelist so a new earning code Paylocity adds
+// later (bonus, holiday, jury duty, etc.) is correctly treated as wages by
+// default instead of silently dropped.
+const PAYLOCITY_BENEFIT_COLS = ["E - 401ER Amt", "E - 401PS Amt", "E - ERCBU Amt", "E - ERCIG Amt", "E - ERDEN Amt", "E - ERKBU Amt", "E - ERKSR Amt", "E - ERLIF Amt", "E - ERWSH Amt", "E - RPHRS Amt", "E - REGM Amt"];
 const PAYLOCITY_EMPLOYER_TAX_COLS = ["R - MED-R Amt", "R - SS-R Amt", "R - AZSUI Amt", "R - CAETT Amt", "R - CASUI Amt", "R - FLSUI Amt", "R - LASUI Amt", "R - NVCLA Amt", "R - NVSUI Amt", "R - OHSUI Amt", "R - ORSUI Amt", "R - ORWC Amt", "R - SCAST Amt", "R - SCSUI Amt", "R - TNSUI Amt", "R - TXAST Amt", "R - TXETT Amt", "R - TXSUI Amt", "R - VASUI Amt", "R - WACLA Amt", "R - WASUI Amt", "R - OR-LAN1 Amt"];
 const PAYLOCITY_FFCRA_CREDIT_COLS = ["R - FFCRAMC Amt", "R - FFCRAMPC Amt", "R - FFCRASC Amt", "R - FFCRAWC Amt"];
 
 const sumCols = (row, cols) => cols.reduce((a, c) => a + (Number(row[c]) || 0), 0);
+// Sums every "E - ... Amt" column present on a row except the known
+// benefit-cost columns — see note above on why this is exclusion-based.
+const sumWageCols = (row) => Object.keys(row).reduce((a, k) => (
+  k.startsWith("E - ") && k.endsWith(" Amt") && !PAYLOCITY_BENEFIT_COLS.includes(k) ? a + (Number(row[k]) || 0) : a
+), 0);
+// Paylocity exports names as "LAST, FIRST M." — normalize and compare just
+// last+first (ignoring middle initial/punctuation/case) to suggest a likely
+// match against an existing staff record's "Last, First" name.
+const paylocityNameKey = (n) => {
+  const norm = (n || "").toLowerCase().replace(/[.,]/g, "").replace(/\s+/g, " ").trim();
+  return norm.split(" ").slice(0, 2).join(" ");
+};
 const daysBetweenInclusive = (start, end) => Math.round((new Date(end + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000) + 1;
 // Splits a lump sum earned over [periodStart, periodEnd] across the calendar
 // months it spans, proportional to how many days of the period fall in each
@@ -5049,12 +5062,14 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
 }
 
 function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, setBudgets, paylocityProgramMap, setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, logActivity, onClose, onOpenStaff }) {
-  const [step, setStep] = useState("upload"); // upload -> crosswalk -> review -> done
+  const [step, setStep] = useState("upload"); // upload -> link -> crosswalk -> review -> done
   const [periodStart, setPeriodStart] = useState(paylocityLastImport ? "" : "2026-01-01");
   const [periodEnd, setPeriodEnd] = useState("");
   const [error, setError] = useState("");
   const [rows, setRows] = useState(null);
+  const [linkDraft, setLinkDraft] = useState({}); // paylocityId -> staffId | "__new__"
   const [crosswalkDraft, setCrosswalkDraft] = useState({}); // code -> { grantId, costCenterId, ignore }
+  const [personnelOnly, setPersonnelOnly] = useState(false);
   const [result, setResult] = useState(null);
 
   const parseFile = async (file) => {
@@ -5082,6 +5097,22 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     }
   };
 
+  const unmatchedEmployees = useMemo(() => {
+    if (!rows) return [];
+    const knownIds = new Set(staff.map((s) => s.paylocityId).filter(Boolean));
+    const byId = {};
+    rows.forEach((r) => {
+      const id = r["ID"];
+      if (id && !knownIds.has(id) && !byId[id]) byId[id] = r["Employee Name"] || id;
+    });
+    return Object.entries(byId).map(([paylocityId, name]) => ({ paylocityId, name }));
+  }, [rows, staff]);
+
+  const suggestMatch = (paylocityName) => {
+    const key = paylocityNameKey(paylocityName);
+    return staff.find((s) => !s.paylocityId && paylocityNameKey(s.name) === key) || null;
+  };
+
   const distinctCodes = useMemo(() => {
     if (!rows) return [];
     const seen = new Map();
@@ -5099,10 +5130,41 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     return distinctCodes.filter((c) => !mappedCodes.has(c.code));
   }, [distinctCodes, paylocityProgramMap]);
 
-  const goToCrosswalkOrReview = () => {
+  const goToNextStep = () => {
     if (!periodStart || !periodEnd) { setError("Enter the date range this report covers."); return; }
     if (!rows || rows.length === 0) { setError("Upload a file first."); return; }
     setError("");
+    if (unmatchedEmployees.length > 0) {
+      setStep("link");
+    } else {
+      goToCrosswalkOrReview();
+    }
+  };
+
+  const confirmLinks = () => {
+    // Anything left un-chosen defaults to whatever's showing in the
+    // dropdown (the suggested match, or "new employee") — finalize those
+    // defaults into state now so downstream matching can rely on them.
+    const finalized = { ...linkDraft };
+    unmatchedEmployees.forEach((e) => {
+      if (finalized[e.paylocityId] === undefined) {
+        const suggested = suggestMatch(e.name);
+        finalized[e.paylocityId] = suggested ? suggested.id : "__new__";
+      }
+    });
+    setLinkDraft(finalized);
+    goToCrosswalkOrReview();
+  };
+
+  // Existing staff records, with any confirmed name-based links applied
+  // in-memory — this is what matching uses from here on, so a person linked
+  // this way gets fully treated as matched for the rest of this import.
+  const getWorkingStaff = () => staff.map((s) => {
+    const linkedPaylocityId = Object.entries(linkDraft).find(([, sid]) => sid === s.id)?.[0];
+    return linkedPaylocityId && !s.paylocityId ? { ...s, paylocityId: linkedPaylocityId } : s;
+  });
+
+  const goToCrosswalkOrReview = () => {
     if (unmappedCodes.length > 0) {
       const draft = {};
       unmappedCodes.forEach((c) => { draft[c.code] = { grantId: "", costCenterId: "", ignore: false }; });
@@ -5130,6 +5192,8 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     const codeToTarget = {};
     fullMap.forEach((m) => { codeToTarget[m.code] = m; });
 
+    const workingStaff = getWorkingStaff();
+
     const byEmployee = {};
     rows.forEach((r) => {
       const id = r["ID"];
@@ -5138,7 +5202,7 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     });
 
     const staffByPaylocityId = {};
-    staff.forEach((s) => { if (s.paylocityId) staffByPaylocityId[s.paylocityId] = s; });
+    workingStaff.forEach((s) => { if (s.paylocityId) staffByPaylocityId[s.paylocityId] = s; });
 
     const totalDays = daysBetweenInclusive(periodStart, periodEnd);
     const factor = totalDays > 0 ? 365 / totalDays : 0;
@@ -5149,7 +5213,7 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
 
     Object.entries(byEmployee).forEach(([paylocityId, employeeRows]) => {
       const existingStaff = staffByPaylocityId[paylocityId];
-      const totalWage = employeeRows.reduce((a, r) => a + sumCols(r, PAYLOCITY_WAGE_COLS), 0);
+      const totalWage = employeeRows.reduce((a, r) => a + sumWageCols(r), 0);
       const totalBenefit = employeeRows.reduce((a, r) => a + sumCols(r, PAYLOCITY_BENEFIT_COLS), 0);
       const totalEmployerTax = employeeRows.reduce((a, r) => a + sumCols(r, PAYLOCITY_EMPLOYER_TAX_COLS) - sumCols(r, PAYLOCITY_FFCRA_CREDIT_COLS), 0);
 
@@ -5199,12 +5263,14 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
 
       matchedUpdates.push({ staffId: existingStaff.id, patch });
 
+      if (personnelOnly) return; // comp/allocation only — never touch budget actuals
+
       // Real dollars for this specific period, split by calendar month, into
       // whichever grant each program row maps to — this is what feeds the
       // Template budget's Actuals.
       targets.forEach(({ row, target }) => {
         if (!target || target.ignore || !target.grantId) return; // budget actuals only make sense for grant-linked budgets
-        const rowWage = sumCols(row, PAYLOCITY_WAGE_COLS);
+        const rowWage = sumWageCols(row);
         const rowBenefitAndTax = sumCols(row, PAYLOCITY_BENEFIT_COLS) + sumCols(row, PAYLOCITY_EMPLOYER_TAX_COLS) - sumCols(row, PAYLOCITY_FFCRA_CREDIT_COLS);
         if (!grantMonthlyTotals[target.grantId]) grantMonthlyTotals[target.grantId] = { wage: {}, benefitAndTax: {} };
         splitAmountAcrossMonths(rowWage, periodStart, periodEnd).forEach(({ year, monthIndex, amount }) => {
@@ -5219,7 +5285,7 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     });
 
     const matchedIds = new Set(Object.keys(byEmployee).map((pid) => staffByPaylocityId[pid]?.id).filter(Boolean));
-    const missingStaff = staff.filter((s) => s.paylocityId && !matchedIds.has(s.id) && (s.status || "Active") !== "Inactive");
+    const missingStaff = workingStaff.filter((s) => s.paylocityId && !matchedIds.has(s.id) && (s.status || "Active") !== "Inactive");
 
     // Find, for each grant with $ activity, its Template budget(s) and which
     // months couldn't be placed anywhere.
@@ -5333,10 +5399,56 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
             <input type="file" accept=".xlsx" className={inputCls} style={inputStyle} onChange={(e) => e.target.files[0] && parseFile(e.target.files[0])} />
           </Field>
           {rows && <p className="text-xs" style={{ color: "#2F6F53" }}>{rows.length} rows read, covering {distinctCodes.length} program codes.</p>}
+          <label className="flex items-start gap-2 text-sm p-3 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <input type="checkbox" className="mt-0.5" checked={personnelOnly} onChange={(e) => setPersonnelOnly(e.target.checked)} />
+            <span>
+              Personnel only — don't touch budget actuals
+              <span className="block text-xs mt-0.5" style={{ color: "#8A8F87" }}>
+                Use this for a quick "what's everyone's current allocation" check between full imports — e.g. a single recent pay period, after you've already imported a fuller period covering the same months. Comp fields and allocations still update normally; nothing gets written to any budget, and the "actuals complete through" marker doesn't move.
+              </span>
+            </span>
+          </label>
           {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
           <div className="flex justify-end gap-2 pt-2">
             <button onClick={onClose} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-            <button onClick={goToCrosswalkOrReview} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
+            <button onClick={goToNextStep} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
+          </div>
+        </div>
+      )}
+
+      {step === "link" && (
+        <div className="space-y-4">
+          <p className="text-sm" style={{ color: "#5B6B66" }}>
+            These Paylocity employees don't have a matching Paylocity ID on an existing staff record yet. Link each to the right person — this only needs to happen once, and future imports will match them automatically. Anyone left as "New employee" won't be updated; they'll show up on the review screen to add as a fresh record instead.
+          </p>
+          <div className="space-y-2 max-h-96 overflow-y-auto">
+            {unmatchedEmployees.map((e) => {
+              const suggested = suggestMatch(e.name);
+              const currentValue = linkDraft[e.paylocityId] ?? (suggested ? suggested.id : "__new__");
+              return (
+                <div key={e.paylocityId} className="flex items-center gap-2 p-2 rounded-md border" style={{ borderColor: "#E1E5DE" }}>
+                  <div className="text-sm flex-1" style={{ color: "#1C2624" }}>
+                    {e.name} <span style={{ color: "#8A8F87", fontFamily: "var(--mono-font)" }}>({e.paylocityId})</span>
+                  </div>
+                  <select
+                    className={inputCls}
+                    style={{ ...inputStyle, flex: 2 }}
+                    value={currentValue}
+                    onChange={(ev) => setLinkDraft((d) => ({ ...d, [e.paylocityId]: ev.target.value }))}
+                  >
+                    <option value="__new__">New employee — not in the portal yet</option>
+                    {staff.filter((s) => !s.paylocityId).sort((a, b) => (a.name || "").localeCompare(b.name || "")).map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}{suggested?.id === s.id ? " (suggested match)" : ""}</option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+          {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={() => setStep("upload")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
+            <button onClick={confirmLinks} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
           </div>
         </div>
       )}
@@ -5372,7 +5484,7 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
           </div>
           {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
           <div className="flex justify-end gap-2 pt-2">
-            <button onClick={() => setStep("upload")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
+            <button onClick={() => setStep(unmatchedEmployees.length > 0 ? "link" : "upload")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
             <button onClick={confirmCrosswalk} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
           </div>
         </div>
@@ -5380,6 +5492,11 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
 
       {step === "review" && result && (
         <div className="space-y-4">
+          {personnelOnly && (
+            <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#EAF1F7", color: "#1F5C6B" }}>
+              Personnel only — comp fields and allocations below will update, but no budget will be touched and no "actuals complete through" marker will move.
+            </p>
+          )}
           <div className="flex items-center gap-3 text-xs">
             <span className="px-2 py-1 rounded-md" style={{ background: "#F0F5F2", color: "#2F6F53" }}>{result.matchedCount} matched and will be updated</span>
             {result.newEmployees.length > 0 && <span className="px-2 py-1 rounded-md" style={{ background: "#FBF3E4", color: "#8A5A0B" }}>{result.newEmployees.length} new, unmatched</span>}
