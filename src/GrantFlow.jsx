@@ -4863,7 +4863,9 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const activeStaff = staff.filter((s) => (s.status || "Active") !== "Inactive");
   const costByGrant = personnelCostByGrant(activeStaff);
   const costByCostCenter = personnelCostByCostCenter(activeStaff);
-  const totalPersonnelCost = activeStaff.reduce((a, s) => a + staffAnnualCost(s), 0);
+  const totalWages = activeStaff.reduce((a, s) => a + staffFullyLoadedCost(s).wagesTotal, 0);
+  const totalTaxesAndBenefits = activeStaff.reduce((a, s) => a + staffFullyLoadedCost(s).taxAndBenefitsTotal, 0);
+  const totalPersonnelCost = totalWages + totalTaxesAndBenefits;
 
   const saveStaff = (s) => {
     setStaff((prev) => {
@@ -4907,6 +4909,8 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <StatCard label="Total staff" value={activeStaff.length} />
+        <StatCard label="Total annual wages" value={fmt(totalWages)} />
+        <StatCard label="Total annual taxes & benefits" value={fmt(totalTaxesAndBenefits)} />
         <StatCard label="Total annual personnel cost" value={fmt(totalPersonnelCost)} />
         <StatCard label="Grants with allocated staff" value={Object.keys(costByGrant).length} />
       </div>
@@ -5130,10 +5134,19 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     return distinctCodes.filter((c) => !mappedCodes.has(c.code));
   }, [distinctCodes, paylocityProgramMap]);
 
+  const [wideRangeAck, setWideRangeAck] = useState(false);
+
   const goToNextStep = () => {
     if (!periodStart || !periodEnd) { setError("Enter the date range this report covers."); return; }
     if (!rows || rows.length === 0) { setError("Upload a file first."); return; }
+    const days = daysBetweenInclusive(periodStart, periodEnd);
+    if (personnelOnly && days > 45 && !wideRangeAck) {
+      setError(`This is a ${days}-day range for a Personnel-only snapshot — that's a lot wider than a typical single pay period, and will dilute the annualized numbers toward this period's actual average instead of reflecting current run-rate. If that's intentional, click Continue again to proceed.`);
+      setWideRangeAck(true);
+      return;
+    }
     setError("");
+    setWideRangeAck(false);
     if (unmatchedEmployees.length > 0) {
       setStep("link");
     } else {
@@ -5311,7 +5324,7 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
       });
     });
 
-    setResult({ matchedUpdates, newEmployees, missingStaff, budgetTargets, unplacedMonths, matchedCount: matchedUpdates.length });
+    setResult({ matchedUpdates, newEmployees, missingStaff, budgetTargets, unplacedMonths, matchedCount: matchedUpdates.length, factor, totalDays });
     setStep("review");
   };
 
@@ -5370,8 +5383,13 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
       return next;
     });
 
-    setPaylocityLastImport({ periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) });
-    logActivity?.("Personnel", "Updated", `Paylocity import applied — ${matchedUpdates.length} staff updated (${fmtDate(periodStart)}–${fmtDate(periodEnd)})`);
+    // Personnel-only imports are quick snapshots, not ledger events — the
+    // "last import" marker (which future full imports use to suggest their
+    // start date) should only move for imports that actually touched Actuals.
+    if (!personnelOnly) {
+      setPaylocityLastImport({ periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) });
+    }
+    logActivity?.("Personnel", "Updated", `Paylocity import applied — ${matchedUpdates.length} staff updated (${fmtDate(periodStart)}–${fmtDate(periodEnd)})${personnelOnly ? " [Personnel only]" : ""}`);
     setStep("done");
   };
 
@@ -5389,10 +5407,10 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
           )}
           <div className="grid grid-cols-2 gap-4">
             <Field label="Report period start">
-              <input type="date" className={inputCls} style={inputStyle} value={periodStart} onChange={(e) => setPeriodStart(e.target.value)} />
+              <input type="date" className={inputCls} style={inputStyle} value={periodStart} onChange={(e) => { setPeriodStart(e.target.value); setWideRangeAck(false); }} />
             </Field>
             <Field label="Report period end">
-              <input type="date" className={inputCls} style={inputStyle} value={periodEnd} onChange={(e) => setPeriodEnd(e.target.value)} />
+              <input type="date" className={inputCls} style={inputStyle} value={periodEnd} onChange={(e) => { setPeriodEnd(e.target.value); setWideRangeAck(false); }} />
             </Field>
           </div>
           <Field label="Paylocity export (.xlsx)">
@@ -5400,7 +5418,7 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
           </Field>
           {rows && <p className="text-xs" style={{ color: "#2F6F53" }}>{rows.length} rows read, covering {distinctCodes.length} program codes.</p>}
           <label className="flex items-start gap-2 text-sm p-3 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-            <input type="checkbox" className="mt-0.5" checked={personnelOnly} onChange={(e) => setPersonnelOnly(e.target.checked)} />
+            <input type="checkbox" className="mt-0.5" checked={personnelOnly} onChange={(e) => { setPersonnelOnly(e.target.checked); setWideRangeAck(false); }} />
             <span>
               Personnel only — don't touch budget actuals
               <span className="block text-xs mt-0.5" style={{ color: "#8A8F87" }}>
@@ -5492,6 +5510,9 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
 
       {step === "review" && result && (
         <div className="space-y-4">
+          <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#F6F7F3", color: "#5B6B66" }}>
+            Annualizing at ×{result.factor.toFixed(2)} ({result.totalDays}-day period → 365 days). Double-check this looks right before applying — a much larger or smaller multiplier than expected usually means the date range doesn't match the file.
+          </p>
           {personnelOnly && (
             <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#EAF1F7", color: "#1F5C6B" }}>
               Personnel only — comp fields and allocations below will update, but no budget will be touched and no "actuals complete through" marker will move.
