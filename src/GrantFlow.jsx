@@ -46,6 +46,96 @@ function colIsWithinCutoff(col, cutoff) {
 // determined independently per target. If a target doesn't already have a
 // matching line, one is created (Plan left at $0) so no data is silently
 // dropped. One-way only: Operational edits never flow back to the Template.
+// Replicates the Org Budget page's "Whole Organization" scope (Template
+// budgets only, Active/Awarded, Deferred Revenue group excluded) so any
+// other view — like the Dashboard's FY summary — always matches what Org
+// Budget itself shows, rather than maintaining a second, drifting version
+// of the same math. Plan revenue is a straight sum; Actual expense reuses
+// the same owner-chained cross-year bridging as the Org Budget page, so a
+// marked "actuals complete through" cutoff projects forward here too.
+function computeOrgFYTotals(budgets, grants, costCenters, budgetGroups, calYear) {
+  const deferredRevenueGroupId = (budgetGroups || []).find((bg) => bg.name?.trim().toLowerCase() === "deferred revenue")?.id || null;
+  const excludedGrantIds = deferredRevenueGroupId ? new Set(grants.filter((g) => g.budgetGroupId === deferredRevenueGroupId).map((g) => g.id)) : null;
+  const excludedCcIds = deferredRevenueGroupId ? new Set((costCenters || []).filter((c) => c.budgetGroupId === deferredRevenueGroupId).map((c) => c.id)) : null;
+
+  const scopedBudgets = budgets
+    .filter((b) => !(b.grantId && excludedGrantIds?.has(b.grantId)) && !(b.costCenterId && excludedCcIds?.has(b.costCenterId)))
+    .filter((b) => isActiveBudget(b.status) && b.budgetType === "Template");
+
+  let planRevenue = 0;
+  scopedBudgets.forEach((b) => {
+    const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+    b.lines.forEach((l) => {
+      if (l.type !== "revenue") return;
+      const vals = l.amounts || [];
+      cols.forEach((col, i) => {
+        if (col && col.year === calYear) planRevenue += Number(vals[i]) || 0;
+      });
+    });
+  });
+
+  const ownerKey = (b) => b.grantId || b.costCenterId || `__standalone_${b.id}`;
+  const byOwner = {};
+  scopedBudgets.forEach((b) => { (byOwner[ownerKey(b)] = byOwner[ownerKey(b)] || []).push(b); });
+
+  let actualExpense = 0;
+  Object.values(byOwner).forEach((ownerBudgets) => {
+    ownerBudgets.sort((a, b) => new Date(a.periodStart) - new Date(b.periodStart));
+    const lineMeta = {};
+    ownerBudgets.forEach((b) => b.lines.forEach((l) => {
+      const key = `${l.category}|||${l.subcategory || ""}`;
+      if (!lineMeta[key]) lineMeta[key] = { type: l.type };
+    }));
+
+    const budgetLineAvg = {};
+    const budgetLineActuals = {};
+    ownerBudgets.forEach((b) => {
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      Object.keys(lineMeta).forEach((key) => {
+        const matching = b.lines.filter((l) => `${l.category}|||${l.subcategory || ""}` === key);
+        if (matching.length === 0) return;
+        const combined = Array(cols.length).fill(0);
+        matching.forEach((l) => (l.actuals || []).forEach((v, i) => { if (i < combined.length) combined[i] += Number(v) || 0; }));
+        budgetLineActuals[`${b.id}|||${key}`] = combined;
+        const cutoff = parseActualsThrough(b.actualsThrough);
+        if (!cutoff) return;
+        const vals = cols.map((col, i) => (colIsWithinCutoff(col, cutoff) ? combined[i] : null)).filter((v) => v !== null);
+        budgetLineAvg[`${b.id}|||${key}`] = vals.length ? vals.reduce((a, x) => a + x, 0) / vals.length : 0;
+      });
+    });
+
+    Object.keys(lineMeta).forEach((key) => {
+      if (lineMeta[key].type !== "expense") return;
+      const timeline = [];
+      ownerBudgets.forEach((b) => {
+        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+        const combined = budgetLineActuals[`${b.id}|||${key}`];
+        const cutoff = parseActualsThrough(b.actualsThrough);
+        cols.forEach((col, i) => {
+          timeline.push({
+            year: col.year,
+            monthIndex: col.monthIndex,
+            isRealEntry: !!(combined && cutoff && colIsWithinCutoff(col, cutoff)),
+            rawValue: combined ? (Number(combined[i]) || 0) : 0,
+            budgetId: b.id,
+            atOrAfterCutoff: cutoff ? !colIsWithinCutoff(col, cutoff) : false,
+          });
+        });
+      });
+      timeline.sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
+      let basis = null;
+      timeline.forEach((t) => {
+        const avgKey = `${t.budgetId}|||${key}`;
+        if (t.atOrAfterCutoff && budgetLineAvg[avgKey] !== undefined) basis = budgetLineAvg[avgKey];
+        const value = t.isRealEntry ? t.rawValue : (basis !== null ? basis : t.rawValue);
+        if (t.year === calYear) actualExpense += value;
+      });
+    });
+  });
+
+  return { planRevenue, actualExpense };
+}
+
 function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
   const linkedIds = templateBudget.linkedBudgetIds && templateBudget.linkedBudgetIds.length
     ? templateBudget.linkedBudgetIds
@@ -1960,7 +2050,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
 
 // ---------- main views ----------
 
-function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
+function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, costCenters, budgetGroups }) {
   const activeGrants = grants.filter((g) => g.stage === "Active");
   const totalAward = activeGrants.reduce((a, g) => a + (Number(g.awardAmount) || 0), 0);
   const totalRemaining = activeGrants.reduce((a, g) => {
@@ -1978,8 +2068,11 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
     const end = g.end ? new Date(g.end) : null;
     return (!start || start <= fyEnd) && (!end || end >= fyStart);
   });
-  const fyTotalAward = fyGrants.reduce((a, g) => a + (Number(g.obligatedFunds) || 0), 0);
-  const fyTotalRemaining = fyGrants.reduce((a, g) => a + (Number(g.obligatedFundsRemaining) || 0), 0);
+  // Sourced from the Org Budget page's own math (Whole Organization scope,
+  // Template budgets) rather than grant-level award fields, so this always
+  // matches what Org Budget itself shows for the same fiscal year.
+  const { planRevenue: fyTotalAward, actualExpense: fyActualExpense } = computeOrgFYTotals(budgets, grants, costCenters, budgetGroups, fyYear);
+  const fyTotalRemaining = fyTotalAward - fyActualExpense;
   const upcoming = [...grants]
     .filter((g) => g.end)
     .sort((a, b) => new Date(a.end) - new Date(b.end))
@@ -2071,8 +2164,8 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo }) {
       <div>
         <h2 className="font-display text-base mb-2" style={{ color: "#1C2624" }}>Fiscal year {fyYear} (Jan–Dec)</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <StatCard label={`FY${fyYear} total award`} value={fmt(fyTotalAward)} sub={`${fyGrants.length} grants active in FY${fyYear}`} />
-          <StatCard label={`FY${fyYear} award remaining`} value={fmt(fyTotalRemaining)} sub="Sum of Obligated funds remaining" />
+          <StatCard label={`FY${fyYear} total award`} value={fmt(fyTotalAward)} sub={`Planned revenue, Org Budget (Template) — ${fyGrants.length} grants active in FY${fyYear}`} />
+          <StatCard label={`FY${fyYear} award remaining`} value={fmt(fyTotalRemaining)} sub="Planned revenue minus actual expense, Org Budget" />
         </div>
       </div>
 
@@ -7598,7 +7691,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
         {!loaded ? (
           <div className="text-sm" style={{ color: "#8A8F87" }}>Loading…</div>
         ) : tab === "dashboard" ? (
-          <Dashboard grants={grants} budgets={budgets} reports={reports} tasks={tasks} staff={staff} invoices={invoices} goTo={goTo} />
+          <Dashboard grants={grants} budgets={budgets} reports={reports} tasks={tasks} staff={staff} invoices={invoices} goTo={goTo} costCenters={costCenters} budgetGroups={budgetGroups} />
         ) : tab === "grants" ? (
           <GrantsView
             key={pendingNewGrant ? "grants-new" : pendingExpandGrantId ? `grants-expand-${pendingExpandGrantId}` : "grants"}
