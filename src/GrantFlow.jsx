@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, Fragment, Component } from "react
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "./firebaseConfig";
 import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
   ExternalLink, Download, Search, ArrowRight, AlertCircle, CheckCircle2,
@@ -241,6 +242,114 @@ const CATEGORIES = [
 ];
 const CUSTOM_CATEGORY = "__custom__";
 
+// Maps a bare account code (e.g. "4100") to its canonical category,
+// subcategory string, and type — built once from CATEGORIES so an imported
+// Excel template lands under the exact same names every other budget in the
+// app already uses, regardless of minor wording/punctuation differences in
+// the source file (e.g. "Grants & Contracts" vs "Grants and Contracts").
+const CODE_TO_CATEGORY = {};
+CATEGORIES.forEach((cat) => {
+  cat.subs.forEach((sub) => {
+    const m = sub.match(/^(\d{3,4}[A-Za-z]*)\s*-/);
+    if (m) CODE_TO_CATEGORY[m[1]] = { category: cat.name, subcategory: sub, type: cat.type };
+  });
+});
+
+const EXCEL_ERROR_STRINGS = ["#REF!", "#DIV/0!", "#VALUE!", "#N/A", "#NAME?", "#NULL!", "#NUM!"];
+
+// Parses one of Nation's Finest's "Rolling 12 Months P&L" grant budget
+// exports (a fixed, known layout per grant, confirmed consistent across
+// templates) into the shape needed to create or update a Template budget.
+// Rows are matched purely by leading account code against CODE_TO_CATEGORY
+// — this sidesteps needing to parse the file's own header/indentation
+// hierarchy at all, and guarantees whatever lands in GrantFlow uses exactly
+// the category names already used everywhere else.
+function parseExcelTemplateWorkbook(aoa) {
+  const warnings = [];
+  const projectLabel = String(aoa[6]?.[1] || "");
+  const projectCodeMatch = projectLabel.match(/^(\d+)/);
+  const projectCode = projectCodeMatch ? projectCodeMatch[1] : null;
+
+  const actualsNote = String(aoa[4]?.[5] || "");
+  const actualsNoteMatch = actualsNote.match(/Updated up to (\d{2})\/(\d{2})\/(\d{4})/);
+  const actualsThroughDate = actualsNoteMatch ? { year: Number(actualsNoteMatch[3]), monthIndex: Number(actualsNoteMatch[1]) - 1 } : null;
+
+  const monthCols = [];
+  for (let c = 1; c <= 12; c++) {
+    const raw = aoa[9]?.[c];
+    if (raw === null || raw === undefined) { monthCols.push(null); continue; }
+    const d = new Date(raw);
+    monthCols.push(isNaN(d.getTime()) ? null : { year: d.getUTCFullYear(), monthIndex: d.getUTCMonth() });
+  }
+  const validMonths = monthCols.filter(Boolean);
+  if (validMonths.length === 0) {
+    return { error: "Couldn't read the month headers in row 10 — this doesn't look like the expected template layout." };
+  }
+  const fy = aoa[9]?.[13];
+  const firstMonth = validMonths[0];
+  const lastMonth = validMonths[validMonths.length - 1];
+  const periodStart = `${firstMonth.year}-${String(firstMonth.monthIndex + 1).padStart(2, "0")}-01`;
+  const lastDay = new Date(lastMonth.year, lastMonth.monthIndex + 1, 0).getDate();
+  const periodEnd = `${lastMonth.year}-${String(lastMonth.monthIndex + 1).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+
+  const isMonthActual = (col) => {
+    if (!col) return false;
+    if (actualsThroughDate) {
+      return col.year < actualsThroughDate.year || (col.year === actualsThroughDate.year && col.monthIndex <= actualsThroughDate.monthIndex);
+    }
+    return false;
+  };
+
+  const linesByKey = {};
+  const unrecognizedCodes = new Set();
+  let inKindBlock = false;
+
+  for (let i = 11; i < aoa.length; i++) {
+    const row = aoa[i];
+    if (!row) continue;
+    const rawLabel = row[0];
+    if (rawLabel === null || rawLabel === undefined) continue;
+    const label = String(rawLabel).trim();
+    if (!label) continue;
+
+    if (/^in\s*kind\s*activity$/i.test(label)) { inKindBlock = true; continue; }
+    if (/^total\s+in\s*kind\s*activity/i.test(label)) { inKindBlock = false; continue; }
+    if (inKindBlock) continue;
+
+    const codeMatch = label.match(/^(\d{3,4}[A-Za-z]*)\s*-/);
+    if (!codeMatch) continue; // header, "Total ..." rollup, ratio row, etc. — not a real line
+
+    const target = CODE_TO_CATEGORY[codeMatch[1]];
+    if (!target) { unrecognizedCodes.add(label); continue; }
+
+    const key = `${target.category}|||${target.subcategory}`;
+    if (!linesByKey[key]) linesByKey[key] = { ...target, amounts: Array(12).fill(0), actuals: Array(12).fill(0) };
+
+    for (let m = 0; m < 12; m++) {
+      const col = monthCols[m];
+      if (!col) continue;
+      const raw = row[m + 1];
+      let val = 0;
+      if (typeof raw === "number") val = raw;
+      else if (typeof raw === "string" && EXCEL_ERROR_STRINGS.includes(raw.trim())) {
+        warnings.push(`"${target.category} / ${target.subcategory}", ${MONTHS[col.monthIndex]} ${col.year}: source cell contains ${raw.trim()} — imported as $0.`);
+      } else if (raw !== null && raw !== undefined && raw !== "") {
+        const n = Number(raw);
+        if (!isNaN(n)) val = n;
+      }
+      if (isMonthActual(col)) linesByKey[key].actuals[m] += val;
+      else linesByKey[key].amounts[m] += val;
+    }
+  }
+
+  return {
+    projectCode, fy, periodStart, periodEnd, actualsThroughDate, monthCols,
+    lines: Object.values(linesByKey),
+    warnings,
+    unrecognizedCodes: [...unrecognizedCodes],
+  };
+}
+
 const STAGES = ["Prospecting", "Writing", "Applied", "Awarded", "Rejected", "Active", "Closing", "Closed"];
 const SITE_OPTIONS = [
   "Carson City", "Chico", "Flagstaff", "Mather", "Menlo Park", "Monterey", "Prescott",
@@ -276,7 +385,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.1.2";
+const APP_VERSION = "1.2.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -879,6 +988,41 @@ async function loadData(baseKey) {
 
 async function saveData(baseKey, value) {
   await window.storage.set(baseKey, JSON.stringify(value), true);
+}
+
+// Captures a rendered chart's <svg> element as a PNG, so an Excel export can
+// embed an actual picture of the chart rather than just its underlying data
+// — ExcelJS can embed images but has no support for creating live, editable
+// Excel chart objects.
+function svgElementToPngBase64(svgEl, widthPx, heightPx) {
+  return new Promise((resolve, reject) => {
+    if (!svgEl) { resolve(null); return; }
+    try {
+      const clone = svgEl.cloneNode(true);
+      clone.setAttribute("width", String(widthPx));
+      clone.setAttribute("height", String(heightPx));
+      const svgString = new XMLSerializer().serializeToString(clone);
+      const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(svgBlob);
+      const img = new Image();
+      img.onload = () => {
+        const scale = 2; // render at 2x for a crisper embedded image
+        const canvas = document.createElement("canvas");
+        canvas.width = widthPx * scale;
+        canvas.height = heightPx * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        URL.revokeObjectURL(url);
+        resolve(canvas.toDataURL("image/png").split(",")[1]);
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+      img.src = url;
+    } catch (e) {
+      resolve(null);
+    }
+  });
 }
 
 function downloadFile(filename, content, mime) {
@@ -2525,6 +2669,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [duplicatePrompt, setDuplicatePrompt] = useState(null); // the budget being duplicated, or null
   const [overviewSearch, setOverviewSearch] = useState("");
   const [overviewSort, setOverviewSort] = useState({ key: "title", dir: "asc" });
+  const [showExcelImport, setShowExcelImport] = useState(false);
 
   const grant = grants.find((g) => g.id === selectedGrantId);
   const costCenter = costCenters.find((c) => c.id === selectedCostCenterId);
@@ -2690,11 +2835,18 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Budgets</h1>
-        {activeSelection && canEdit && (
-          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-            <Plus size={16} /> New budget
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {canEdit && (
+            <button onClick={() => setShowExcelImport(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Upload size={16} /> Import Excel Template
+            </button>
+          )}
+          {activeSelection && canEdit && (
+            <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+              <Plus size={16} /> New budget
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
@@ -2933,7 +3085,274 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           </div>
         </Modal>
       )}
+      {showExcelImport && (
+        <ExcelTemplateImportModal
+          grants={grants}
+          budgets={budgets}
+          setBudgets={setBudgets}
+          logActivity={logActivity}
+          onClose={() => setShowExcelImport(false)}
+        />
+      )}
     </div>
+  );
+}
+
+function ExcelTemplateImportModal({ grants, budgets, setBudgets, logActivity, onClose }) {
+  const [step, setStep] = useState("upload"); // upload -> review -> done
+  const [error, setError] = useState("");
+  const [parsed, setParsed] = useState(null); // { projectCode, projectLabel, periodStart, periodEnd, fy, lines, warnings, actualsThrough }
+  const [fyOverride, setFyOverride] = useState("");
+  const [manualGrantId, setManualGrantId] = useState("");
+
+  const parseFile = async (file) => {
+    setError("");
+    setParsed(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+      const getRaw = (r, c) => sheet[XLSX.utils.encode_cell({ r, c })];
+
+      const monthHeaderRowIdx = aoa.findIndex((row) => row && row[1] === "Month Ending");
+      if (monthHeaderRowIdx === -1) {
+        setError("Couldn't find the \"Month Ending\" header row — this doesn't look like the expected template layout.");
+        return;
+      }
+      const dateRowIdx = monthHeaderRowIdx + 1;
+      const flagRowIdx = monthHeaderRowIdx + 2;
+      const dataStartRowIdx = flagRowIdx + 1;
+      const monthCols = [];
+      for (let c = 1; c < aoa[monthHeaderRowIdx].length; c++) {
+        if (aoa[monthHeaderRowIdx][c] === "Month Ending") monthCols.push(c);
+        else break;
+      }
+      if (monthCols.length === 0) {
+        setError("No month columns found next to the \"Month Ending\" header.");
+        return;
+      }
+      const periodStartDate = aoa[dateRowIdx][monthCols[0]];
+      const periodEndDate = aoa[dateRowIdx][monthCols[monthCols.length - 1]];
+      if (!(periodStartDate instanceof Date) || !(periodEndDate instanceof Date)) {
+        setError("Couldn't read the month-ending dates — expected real dates in that row.");
+        return;
+      }
+      const periodStart = `${periodStartDate.getUTCFullYear()}-${String(periodStartDate.getUTCMonth() + 1).padStart(2, "0")}-01`;
+      const periodEnd = periodEndDate.toISOString().slice(0, 10);
+      const flags = monthCols.map((c) => aoa[flagRowIdx][c]);
+
+      const projectRow = aoa.find((row) => row && row[0] === "Project:");
+      const projectLabel = projectRow ? projectRow[1] : null;
+      const projectCode = projectLabel ? String(projectLabel).split("--")[0].trim() : null;
+
+      const CODE_RE = /^\d{3,4}\w*\s*-\s*/;
+      let currentType = null;
+      let currentCategory = null;
+      const lines = [];
+      const warnings = [];
+
+      for (let r = dataStartRowIdx; r < aoa.length; r++) {
+        const row = aoa[r];
+        if (!row) continue;
+        const rawLabel = row[0];
+        if (rawLabel === null || rawLabel === undefined) continue;
+        const label = String(rawLabel).trim();
+        if (!label) continue;
+        if (/^changes in net income$/i.test(label) || /^in kind activity$/i.test(label)) break;
+        if (/^revenue$/i.test(label)) { currentType = "revenue"; continue; }
+        if (/^expenditures?$/i.test(label)) { currentType = "expense"; continue; }
+        if (/^total\s/i.test(label)) continue;
+        if (label.includes("%")) continue;
+
+        if (CODE_RE.test(label)) {
+          const subcategory = label.replace(/&/g, "and");
+          const category = (currentCategory || "Uncategorized").replace(/&/g, "and");
+          const amounts = Array(monthCols.length).fill(0);
+          const actuals = Array(monthCols.length).fill(0);
+          monthCols.forEach((c, i) => {
+            const raw = getRaw(r, c);
+            let val = row[c];
+            if (raw && raw.t === "e") {
+              warnings.push(`"${subcategory}", month ${i + 1}: formula error (${raw.w}) in source file — imported as $0`);
+              val = 0;
+            }
+            val = Number(val) || 0;
+            if (flags[i] === "ACTUALS") actuals[i] = val; else amounts[i] = val;
+          });
+          lines.push({ category, subcategory, type: currentType || "expense", amounts, actuals });
+          continue;
+        }
+
+        const firstVal = row[1];
+        const isBlank = firstVal === null || firstVal === undefined || (typeof firstVal === "string" && firstVal.trim() === "");
+        if (isBlank) currentCategory = label;
+      }
+
+      if (lines.length === 0) {
+        setError("No account lines were found — double-check this is the expected template export.");
+        return;
+      }
+
+      const lastActualsIdx = flags.lastIndexOf("ACTUALS");
+      const actualsThrough = lastActualsIdx >= 0
+        ? (() => { const d = aoa[dateRowIdx][monthCols[lastActualsIdx]]; return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`; })()
+        : "";
+
+      const matchedGrant = grants.find((g) => g.programCode && String(g.programCode).trim() === projectCode);
+      const fy = String(periodStartDate.getUTCFullYear());
+
+      setParsed({ projectCode, projectLabel, periodStart, periodEnd, fy, lines, warnings, actualsThrough, matchedGrantId: matchedGrant?.id || "" });
+      setFyOverride(fy);
+      setManualGrantId(matchedGrant?.id || "");
+      setStep("review");
+    } catch (e) {
+      setError("Couldn't read that file — make sure it's the expected .xlsx template export.");
+    }
+  };
+
+  const targetGrantId = manualGrantId || parsed?.matchedGrantId || "";
+  const existingBudget = parsed
+    ? budgets.find((b) => b.grantId === targetGrantId && b.budgetType === "Template" && String(b.fy) === String(fyOverride))
+    : null;
+
+  const applyImport = () => {
+    if (!targetGrantId) { setError("Select a grant before continuing."); return; }
+    const grant = grants.find((g) => g.id === targetGrantId);
+
+    setBudgets((prev) => {
+      if (existingBudget) {
+        const cols = monthColumnsForBudget(existingBudget.periodStart, existingBudget.periodEnd);
+        const colIndexByYM = {};
+        cols.forEach((c, i) => { colIndexByYM[`${c.year}-${c.monthIndex}`] = i; });
+        const importCols = monthColumnsForBudget(parsed.periodStart, parsed.periodEnd);
+
+        let newLines = existingBudget.lines.map((l) => ({ ...l, amounts: [...(l.amounts || [])], actuals: [...(l.actuals || [])] }));
+        parsed.lines.forEach((pl) => {
+          let target = newLines.find((l) => l.category === pl.category && l.subcategory === pl.subcategory);
+          if (!target) {
+            target = { ...newLine(), category: pl.category, subcategory: pl.subcategory, type: pl.type, amounts: Array(cols.length).fill(0), actuals: Array(cols.length).fill(0) };
+            newLines.push(target);
+          }
+          importCols.forEach((col, i) => {
+            const j = colIndexByYM[`${col.year}-${col.monthIndex}`];
+            if (j === undefined) return;
+            if (pl.amounts[i]) target.amounts[j] = pl.amounts[i];
+            if (pl.actuals[i]) target.actuals[j] = pl.actuals[i];
+          });
+        });
+        const newCutoff = parsed.actualsThrough;
+        const cutoff = newCutoff && (!existingBudget.actualsThrough || newCutoff > existingBudget.actualsThrough) ? newCutoff : existingBudget.actualsThrough;
+        const updated = { ...existingBudget, lines: newLines, actualsThrough: cutoff };
+        logActivity?.("Budget", "Updated", `${updated.title} (Excel template import)`);
+        return prev.map((b) => (b.id === existingBudget.id ? updated : b));
+      }
+
+      const newBudget = {
+        id: uid(), grantId: targetGrantId, costCenterId: "",
+        title: `${grant?.title || "Untitled"} — Template ${fyOverride}`,
+        fy: fyOverride, periodStart: parsed.periodStart, periodEnd: parsed.periodEnd,
+        status: "Draft", budgetType: "Template", linkedBudgetIds: [],
+        notes: "", approvedBy: "", approvedAt: "", rejectionReason: "",
+        actualsThrough: parsed.actualsThrough,
+        lines: parsed.lines.map((pl) => ({ ...newLine(), category: pl.category, subcategory: pl.subcategory, type: pl.type, amounts: pl.amounts, actuals: pl.actuals })),
+      };
+      logActivity?.("Budget", "Created", `${newBudget.title} (Excel template import)`);
+      return [...prev, newBudget];
+    });
+
+    setStep("done");
+  };
+
+  return (
+    <Modal title="Import Excel Template" onClose={onClose} wide>
+      {step === "upload" && (
+        <div className="space-y-4">
+          <p className="text-sm" style={{ color: "#5B6B66" }}>
+            Upload the Rolling 12-Month P&amp;L export for a grant. Account lines with a numeric code (e.g. "4100 - Grants and Contracts") are imported — category headers, "Total" rollups, and individual named sub-lines with no code are skipped automatically.
+          </p>
+          <Field label="Template export (.xlsx)">
+            <input type="file" accept=".xlsx" className={inputCls} style={inputStyle} onChange={(e) => e.target.files[0] && parseFile(e.target.files[0])} />
+          </Field>
+          {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={onClose} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {step === "review" && parsed && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <Field label="Grant">
+              <GrantPicker grants={grants} value={targetGrantId} onChange={setManualGrantId} placeholder="Select a grant" />
+            </Field>
+            <Field label="Fiscal year">
+              <input className={inputCls} style={inputStyle} value={fyOverride} onChange={(e) => setFyOverride(e.target.value)} />
+            </Field>
+          </div>
+          {!parsed.matchedGrantId && (
+            <p className="text-xs" style={{ color: "#C08A2E" }}>
+              No grant found with program code "{parsed.projectCode}" — select the correct grant above before continuing.
+            </p>
+          )}
+          <p className="text-xs px-3 py-2 rounded-md" style={{ background: existingBudget ? "#EAF1F7" : "#F0F5F2", color: existingBudget ? "#1F5C6B" : "#2F6F53" }}>
+            {existingBudget
+              ? `Will update the existing Template budget "${existingBudget.title}" for FY${fyOverride} — new lines are added, matching lines are overwritten for the months this file covers.`
+              : `Will create a new Template budget for FY${fyOverride}, period ${fmtDate(parsed.periodStart)}–${fmtDate(parsed.periodEnd)}.`}
+          </p>
+          <p className="text-xs" style={{ color: "#8A8F87" }}>
+            {parsed.lines.length} account lines parsed. "Actuals complete through" will be set to {parsed.actualsThrough ? fmtDate(`${parsed.actualsThrough}-01`) : "—"}.
+          </p>
+
+          {parsed.warnings.length > 0 && (
+            <div>
+              <p className="text-xs font-medium mb-1" style={{ color: "#C08A2E" }}>{parsed.warnings.length} formula error(s) in the source file — imported as $0</p>
+              <div className="max-h-32 overflow-y-auto text-xs rounded-md border p-2" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
+                {parsed.warnings.slice(0, 20).map((w, i) => <div key={i}>{w}</div>)}
+              </div>
+            </div>
+          )}
+
+          <div className="max-h-64 overflow-y-auto rounded-md border" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-xs">
+              <thead>
+                <tr style={{ background: "#F6F7F3", color: "#5B6B66" }}>
+                  <th className="text-left px-2 py-1.5">Category</th>
+                  <th className="text-left px-2 py-1.5">Subcategory</th>
+                  <th className="text-left px-2 py-1.5">Type</th>
+                </tr>
+              </thead>
+              <tbody>
+                {parsed.lines.map((l, i) => (
+                  <tr key={i} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                    <td className="px-2 py-1" style={{ color: "#1C2624" }}>{l.category}</td>
+                    <td className="px-2 py-1" style={{ color: "#1C2624" }}>{l.subcategory}</td>
+                    <td className="px-2 py-1" style={{ color: "#8A8F87" }}>{l.type}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={() => setStep("upload")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
+            <button onClick={applyImport} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>
+              {existingBudget ? "Update budget" : "Create budget"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === "done" && (
+        <div className="space-y-4 text-center py-6">
+          <CheckCircle size={28} style={{ color: "#2F6F53", margin: "0 auto" }} />
+          <p className="text-sm" style={{ color: "#1C2624" }}>Template budget {existingBudget ? "updated" : "created"} successfully.</p>
+          <button onClick={onClose} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Done</button>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -3354,6 +3773,9 @@ function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices })
   const [scope, setScope] = useState("all"); // all | a budget group id
   const [calYear, setCalYear] = useState("All");
   const [grantSort, setGrantSort] = useState({ key: "planExpense", dir: "desc" });
+  const [exporting, setExporting] = useState(false);
+  const barChartWrapRef = useRef(null);
+  const lineChartWrapRef = useRef(null);
 
   const scopedGrantIds = useMemo(() => {
     if (scope === "all") return null;
@@ -3455,27 +3877,119 @@ function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices })
     return Object.values(map);
   }, [invoices, grants, scope, scopedGrantIds]);
 
-  const exportAllCsv = () => {
-    const maxMonths = budgets.reduce((max, b) => Math.max(max, ...b.lines.map((l) => (l.amounts || []).length), 12), 12);
-    const monthCols = Array.from({ length: maxMonths }, (_, i) => `Month ${i + 1}`);
-    const rows = [["Grant", "Budget", "Period Start", "Category", "Subcategory", "Description", "Type", ...monthCols, "Total"]];
-    budgets.forEach((b) => {
-      const g = grants.find((x) => x.id === b.grantId);
-      b.lines.forEach((l) => {
-        const padded = resizeMonthlyArray(l.amounts, maxMonths);
-        rows.push([g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.description || "", l.type, ...padded, lineTotal(l)]);
+  const exportAllCsv = async () => {
+    setExporting(true);
+    try {
+      const HEADER_FILL = "FFF6F7F3";
+      const GREEN = "FF2F6F53";
+      const RED = "FFB5443A";
+      const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+      // Capture the two live charts as images before building the workbook —
+      // ExcelJS can embed a picture of a chart, but has no support for
+      // creating a real, editable Excel chart object.
+      const barSvg = barChartWrapRef.current?.querySelector("svg") || null;
+      const lineSvg = lineChartWrapRef.current?.querySelector("svg") || null;
+      const [barPng, linePng] = await Promise.all([
+        svgElementToPngBase64(barSvg, 520, 280),
+        svgElementToPngBase64(lineSvg, 520, 280),
+      ]);
+
+      const wb = new ExcelJS.Workbook();
+
+      // ---- Sheet 1: Summary (charts + category table) ----
+      const ws1 = wb.addWorksheet("Summary");
+      ws1.mergeCells(1, 1, 1, 6);
+      ws1.getCell(1, 1).value = "Nation's Finest — Reporting Summary";
+      ws1.getCell(1, 1).font = { bold: true, size: 13 };
+      ws1.mergeCells(2, 1, 2, 6);
+      ws1.getCell(2, 1).value = `Scope: ${scope === "all" ? "Whole Organization" : (budgetGroups.find((g) => g.id === scope)?.name || "Scoped view")} — ${calYear === "All" ? "All years" : `Calendar year ${calYear}`} — Generated ${fmtDate(new Date().toISOString().slice(0, 10))}`;
+      ws1.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+      let imgRow = 4;
+      if (barPng) {
+        const imgId = wb.addImage({ base64: barPng, extension: "png" });
+        ws1.addImage(imgId, { tl: { col: 0, row: imgRow - 1 }, ext: { width: 520, height: 280 } });
+      }
+      if (linePng) {
+        const imgId = wb.addImage({ base64: linePng, extension: "png" });
+        ws1.addImage(imgId, { tl: { col: 7, row: imgRow - 1 }, ext: { width: 520, height: 280 } });
+      }
+      let r = imgRow + 16; // clear the embedded images before starting the table
+
+      ws1.getRow(r).values = ["Category", "Plan", "Actual", "Variance"];
+      ws1.getRow(r).eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
       });
-    });
-    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
-    downloadFile("nations-finest-budget-lines.csv", csv, "text/csv");
+      r++;
+      agg.byCategory.forEach((c) => {
+        const variance = round2(c.actual - c.plan);
+        ws1.getRow(r).values = [c.category, round2(c.plan), round2(c.actual), variance];
+        ws1.getCell(r, 2).numFmt = "$#,##0";
+        ws1.getCell(r, 3).numFmt = "$#,##0";
+        ws1.getCell(r, 4).numFmt = "$#,##0";
+        ws1.getCell(r, 4).font = { color: { argb: isNetNegative(variance) ? RED : GREEN } };
+        r++;
+      });
+      ws1.columns = [{ width: 30 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 4 }, { width: 4 }, { width: 4 }, { width: 30 }];
+
+      // ---- Sheet 2: By Grant / Cost Center ----
+      const ws2 = wb.addWorksheet("By Grant");
+      const header2 = ["Grant / Cost Center", "Plan revenue", "Plan expense", "Plan net", "Actual revenue", "Actual expense", "Actual net"];
+      ws2.getRow(1).values = header2;
+      ws2.getRow(1).eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+      });
+      sortedByGrant.forEach((g, i) => {
+        const rowIdx = i + 2;
+        const planNet = round2(g.planRevenue - g.planExpense);
+        const actualNet = round2(g.actualRevenue - g.actualExpense);
+        ws2.getRow(rowIdx).values = [g.name, round2(g.planRevenue), round2(g.planExpense), planNet, round2(g.actualRevenue), round2(g.actualExpense), actualNet];
+        [2, 3, 4, 5, 6, 7].forEach((col) => { ws2.getCell(rowIdx, col).numFmt = "$#,##0"; });
+        ws2.getCell(rowIdx, 4).font = { color: { argb: isNetNegative(planNet) ? RED : GREEN } };
+        ws2.getCell(rowIdx, 7).font = { color: { argb: isNetNegative(actualNet) ? RED : GREEN } };
+      });
+      ws2.views = [{ state: "frozen", ySplit: 1 }];
+      ws2.columns = [{ width: 34 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 15 }];
+
+      // ---- Sheet 3: Budget Lines (full detail, same data as before) ----
+      const ws3 = wb.addWorksheet("Budget Lines");
+      const maxMonths = budgets.reduce((max, b) => Math.max(max, ...b.lines.map((l) => (l.amounts || []).length), 12), 12);
+      const monthCols = Array.from({ length: maxMonths }, (_, i) => `Month ${i + 1}`);
+      const header3 = ["Grant", "Budget", "Period Start", "Category", "Subcategory", "Description", "Type", ...monthCols, "Total"];
+      ws3.getRow(1).values = header3;
+      ws3.getRow(1).eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+      });
+      let r3 = 2;
+      budgets.forEach((b) => {
+        const g = grants.find((x) => x.id === b.grantId);
+        b.lines.forEach((l) => {
+          const padded = resizeMonthlyArray(l.amounts, maxMonths);
+          ws3.getRow(r3).values = [g?.title || "", b.title, b.periodStart || "", l.category, l.subcategory, l.description || "", l.type, ...padded.map(round2), round2(lineTotal(l))];
+          for (let c = 8; c <= 8 + maxMonths; c++) ws3.getCell(r3, c).numFmt = "$#,##0";
+          r3++;
+        });
+      });
+      ws3.views = [{ state: "frozen", ySplit: 1 }];
+      ws3.columns = [{ width: 26 }, { width: 22 }, { width: 12 }, { width: 20 }, { width: 24 }, { width: 20 }, { width: 10 }, ...monthCols.map(() => ({ width: 11 })), { width: 13 }];
+
+      const buffer = await wb.xlsx.writeBuffer();
+      downloadFile("nations-finest-reporting.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Reporting</h1>
-        <button onClick={exportAllCsv} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-          <Download size={15} /> Export all as CSV
+        <button onClick={exportAllCsv} disabled={exporting} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exporting ? 0.6 : 1 }}>
+          <Download size={15} /> {exporting ? "Building export…" : "Export Excel"}
         </button>
       </div>
 
@@ -3536,7 +4050,7 @@ function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices })
       )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }} ref={barChartWrapRef}>
           <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Expense by category — Plan vs. Actual</h2>
           {agg.byCategory.length === 0 ? <p className="text-sm" style={{ color: "#8A8F87" }}>No monthly data yet.</p> : (
             <ResponsiveContainer width="100%" height={280}>
@@ -3553,7 +4067,7 @@ function ReportingView({ grants, budgets, costCenters, budgetGroups, invoices })
           )}
         </div>
 
-        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }} ref={lineChartWrapRef}>
           <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Monthly trend — Plan vs. Actual</h2>
           <ResponsiveContainer width="100%" height={280}>
             <LineChart data={agg.monthly}>
@@ -4498,25 +5012,75 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const netProjected = totalRevenueProjected.map((p, i) => p || totalExpenseProjected[i]);
   const anyProjected = dataMode === "actual" && scopedBudgets.some((b) => parseActualsThrough(b.actualsThrough));
 
-  const exportCsv = () => {
+  const exportCsv = async () => {
     const monthLabels = MONTHS.map((m) => (calYear === "All" ? m : `${m} ${calYear}`));
-    const rows = [];
-    if (anyProjected) rows.push(["Note: months after each budget's marked \"actuals complete through\" date are run-rate projections, not entered data."]);
-    rows.push(["Category", "Subcategory", ...monthLabels, "Total"]);
+    const HEADER_FILL = "FFF6F7F3";
+    const GREEN = "FF2F6F53";
+    const RED = "FFB5443A";
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Org Budget");
+
+    const titleParts = [
+      "Nation's Finest — Organizational Budget",
+      scope === "all" ? "Whole Organization" : (budgetGroups.find((g) => g.id === scope)?.name || "Scoped view"),
+      dataMode === "plan" ? "Plan" : "Actual",
+      calYear === "All" ? "All years" : `Calendar year ${calYear}`,
+    ];
+    ws.mergeCells(1, 1, 1, monthLabels.length + 3);
+    const titleCell = ws.getCell(1, 1);
+    titleCell.value = titleParts.join(" — ");
+    titleCell.font = { bold: true, size: 13 };
+    ws.getRow(1).height = 22;
+
+    ws.mergeCells(2, 1, 2, monthLabels.length + 3);
+    const subCell = ws.getCell(2, 1);
+    subCell.value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}${anyProjected ? " — italicized figures in the app are run-rate projections; this export shows the same blended totals as numbers" : ""}`;
+    subCell.font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+    const headerRowIdx = 4;
+    const header = ["Category", "Subcategory", ...monthLabels, "Total"];
+    ws.getRow(headerRowIdx).values = header;
+    ws.getRow(headerRowIdx).eachCell((cell) => {
+      cell.font = { bold: true };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+    });
+
+    let r = headerRowIdx + 1;
+    const writeRow = (category, subcategory, values, opts = {}) => {
+      const total = values.reduce((a, v) => a + v, 0);
+      const rowVals = [category, subcategory, ...values.map(round2), round2(total)];
+      ws.getRow(r).values = rowVals;
+      ws.getRow(r).eachCell((cell, colNumber) => {
+        if (colNumber >= 3) cell.numFmt = "$#,##0";
+        if (opts.bold) cell.font = { ...(cell.font || {}), bold: true };
+        if (opts.fill) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: opts.fill } };
+        if (opts.color) cell.font = { ...(cell.font || {}), bold: true, color: { argb: opts.color } };
+      });
+      r++;
+    };
+
     const pushSection = (cats) => cats.forEach((c) => {
       const bucket = grouped[c.name];
-      rows.push([c.name, "", ...bucket.monthly, bucket.monthly.reduce((a, b) => a + b, 0)]);
+      writeRow(c.name, "", bucket.monthly, { bold: true });
       Object.entries(bucket.subs).forEach(([sub, subData]) => {
-        rows.push([c.name, sub, ...subData.values, subData.values.reduce((a, b) => a + b, 0)]);
+        writeRow("", sub, subData.values);
       });
     });
+
     pushSection(revenueCats);
-    rows.push(["Total Revenue", "", ...totalRevenue, totalRevenue.reduce((a, b) => a + b, 0)]);
+    writeRow("Total Revenue", "", totalRevenue, { bold: true, fill: HEADER_FILL, color: GREEN });
     pushSection(expenseCats);
-    rows.push(["Total Expense", "", ...totalExpense, totalExpense.reduce((a, b) => a + b, 0)]);
-    rows.push(["Net", "", ...net, net.reduce((a, b) => a + b, 0)]);
-    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
-    downloadFile("nations-finest-organizational-budget.csv", csv, "text/csv");
+    writeRow("Total Expense", "", totalExpense, { bold: true, fill: HEADER_FILL });
+    const netTotal = round2(net.reduce((a, b) => a + b, 0));
+    writeRow("Net", "", net, { bold: true, fill: HEADER_FILL, color: isNetNegative(netTotal) ? RED : GREEN });
+
+    ws.columns = [{ width: 26 }, { width: 30 }, ...monthLabels.map(() => ({ width: 13 })), { width: 15 }];
+    ws.views = [{ state: "frozen", xSplit: 2, ySplit: headerRowIdx }];
+
+    const buffer = await wb.xlsx.writeBuffer();
+    downloadFile("nations-finest-organizational-budget.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   };
 
   return (
@@ -4560,7 +5124,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
             </button>
           </div>
           <button onClick={exportCsv} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-            <Download size={15} /> Export CSV
+            <Download size={15} /> Export Excel
           </button>
           <button onClick={() => printSection("org-budget-print-area", "GrantFlow Organizational Budget")} className="no-print inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
             <Printer size={15} /> Print / Save PDF
@@ -5166,7 +5730,8 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
   const [rows, setRows] = useState(null);
   const [linkDraft, setLinkDraft] = useState({}); // paylocityId -> staffId | "__new__"
   const [crosswalkDraft, setCrosswalkDraft] = useState({}); // code -> { grantId, costCenterId, ignore }
-  const [personnelOnly, setPersonnelOnly] = useState(false);
+  const [updateComp, setUpdateComp] = useState(true);
+  const [updateAllocations, setUpdateAllocations] = useState(true);
   const [result, setResult] = useState(null);
 
   const parseFile = async (file) => {
@@ -5232,9 +5797,10 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
   const goToNextStep = () => {
     if (!periodStart || !periodEnd) { setError("Enter the date range this report covers."); return; }
     if (!rows || rows.length === 0) { setError("Upload a file first."); return; }
+    if (!updateComp && !updateAllocations) { setError("Check at least one of Compensation or Allocations to import."); return; }
     const days = daysBetweenInclusive(periodStart, periodEnd);
-    if (personnelOnly && days > 45 && !wideRangeAck) {
-      setError(`This is a ${days}-day range for a Personnel-only snapshot — that's a lot wider than a typical single pay period, and will dilute the annualized numbers toward this period's actual average instead of reflecting current run-rate. If that's intentional, click Continue again to proceed.`);
+    if (updateAllocations && days > 45 && !wideRangeAck) {
+      setError(`This is a ${days}-day range for updating allocations — that's a lot wider than a typical single pay period, and will blend everyone's percentages toward this period's average instead of reflecting who's currently working where. If that's intentional, click Continue again to proceed.`);
       setWideRangeAck(true);
       return;
     }
@@ -5343,33 +5909,35 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
       const annualEmployerTax = totalEmployerTax * factor;
       const payrollTaxRate = annualWage > 0 ? (annualEmployerTax / annualWage) * 100 : 0;
 
-      const patch = {
-        benefits: fte > 0 ? annualBenefit / fte : annualBenefit,
-        payrollTaxRate,
-        paylocityId,
-        lastPaylocitySync: { periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) },
-      };
-      if (existingStaff.payType === "Hourly") {
-        const hours = Number(existingStaff.annualHours) || ANNUAL_HOURS;
-        patch.hourlyRate = fte > 0 && hours > 0 ? annualWage / (hours * fte) : 0;
-      } else {
-        patch.annualSalary = fte > 0 ? annualWage / fte : annualWage;
+      const patch = { paylocityId };
+      if (updateComp) {
+        patch.benefits = fte > 0 ? annualBenefit / fte : annualBenefit;
+        patch.payrollTaxRate = payrollTaxRate;
+        patch.lastPaylocitySync = { periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) };
+        if (existingStaff.payType === "Hourly") {
+          const hours = Number(existingStaff.annualHours) || ANNUAL_HOURS;
+          patch.hourlyRate = fte > 0 && hours > 0 ? annualWage / (hours * fte) : 0;
+        } else {
+          patch.annualSalary = fte > 0 ? annualWage / fte : annualWage;
+        }
       }
 
       // Allocations replace entirely, from this import's Labor % breakdown —
       // rows with an "ignore" target simply don't contribute an allocation.
-      const newAllocations = [];
-      targets.forEach(({ row, target }) => {
-        if (!target || target.ignore) return;
-        const pct = (Number(row["Labor %"]) || 0) * 100;
-        if (target.grantId) newAllocations.push({ id: uid(), type: "grant", grantId: target.grantId, costCenterId: "", percent: Math.round(pct * 100) / 100 });
-        else if (target.costCenterId) newAllocations.push({ id: uid(), type: "costCenter", grantId: "", costCenterId: target.costCenterId, percent: Math.round(pct * 100) / 100 });
-      });
-      patch.allocations = newAllocations;
+      if (updateAllocations) {
+        const newAllocations = [];
+        targets.forEach(({ row, target }) => {
+          if (!target || target.ignore) return;
+          const pct = (Number(row["Labor %"]) || 0) * 100;
+          if (target.grantId) newAllocations.push({ id: uid(), type: "grant", grantId: target.grantId, costCenterId: "", percent: Math.round(pct * 100) / 100 });
+          else if (target.costCenterId) newAllocations.push({ id: uid(), type: "costCenter", grantId: "", costCenterId: target.costCenterId, percent: Math.round(pct * 100) / 100 });
+        });
+        patch.allocations = newAllocations;
+      }
 
       matchedUpdates.push({ staffId: existingStaff.id, patch });
 
-      if (personnelOnly) return; // comp/allocation only — never touch budget actuals
+      if (!updateComp) return; // allocations-only run — never touch budget actuals
 
       // Real dollars for this specific period, split by calendar month, into
       // whichever grant each program row maps to — this is what feeds the
@@ -5476,13 +6044,15 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
       return next;
     });
 
-    // Personnel-only imports are quick snapshots, not ledger events — the
-    // "last import" marker (which future full imports use to suggest their
-    // start date) should only move for imports that actually touched Actuals.
-    if (!personnelOnly) {
+    // The "last import" marker (which future full imports use to suggest
+    // their start date) should only move when this run actually touched
+    // Actuals — an allocations-only run is a quick snapshot, not a ledger
+    // event.
+    if (updateComp) {
       setPaylocityLastImport({ periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) });
     }
-    logActivity?.("Personnel", "Updated", `Paylocity import applied — ${matchedUpdates.length} staff updated (${fmtDate(periodStart)}–${fmtDate(periodEnd)})${personnelOnly ? " [Personnel only]" : ""}`);
+    const modeTag = updateComp && updateAllocations ? "" : updateComp ? " [Compensation only]" : " [Allocations only]";
+    logActivity?.("Personnel", "Updated", `Paylocity import applied — ${matchedUpdates.length} staff updated (${fmtDate(periodStart)}–${fmtDate(periodEnd)})${modeTag}`);
     setStep("done");
   };
 
@@ -5510,12 +6080,22 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
             <input type="file" accept=".xlsx" className={inputCls} style={inputStyle} onChange={(e) => e.target.files[0] && parseFile(e.target.files[0])} />
           </Field>
           {rows && <p className="text-xs" style={{ color: "#2F6F53" }}>{rows.length} rows read, covering {distinctCodes.length} program codes.</p>}
+          <p className="text-xs font-medium" style={{ color: "#5B6B66" }}>What should this import update?</p>
           <label className="flex items-start gap-2 text-sm p-3 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-            <input type="checkbox" className="mt-0.5" checked={personnelOnly} onChange={(e) => { setPersonnelOnly(e.target.checked); setWideRangeAck(false); }} />
+            <input type="checkbox" className="mt-0.5" checked={updateComp} onChange={(e) => { setUpdateComp(e.target.checked); setWideRangeAck(false); }} />
             <span>
-              Personnel only — don't touch budget actuals
+              Compensation — wages, benefits, payroll tax rate
               <span className="block text-xs mt-0.5" style={{ color: "#8A8F87" }}>
-                Use this for a quick "what's everyone's current allocation" check between full imports — e.g. a single recent pay period, after you've already imported a fuller period covering the same months. Comp fields and allocations still update normally; nothing gets written to any budget, and the "actuals complete through" marker doesn't move.
+                Annualizes this period's rate. Use a full year-to-date range to match a blended actual-plus-forecast total. Writes to the linked Template budget's Actuals, and advances "actuals complete through" to the end of this period.
+              </span>
+            </span>
+          </label>
+          <label className="flex items-start gap-2 text-sm p-3 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <input type="checkbox" className="mt-0.5" checked={updateAllocations} onChange={(e) => { setUpdateAllocations(e.target.checked); setWideRangeAck(false); }} />
+            <span>
+              Allocations — current grant percentages
+              <span className="block text-xs mt-0.5" style={{ color: "#8A8F87" }}>
+                Use a single recent pay period for the freshest snapshot of who's working where right now. Never touches any budget.
               </span>
             </span>
           </label>
@@ -5606,9 +6186,14 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
           <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#F6F7F3", color: "#5B6B66" }}>
             Annualizing at ×{result.factor.toFixed(2)} ({result.totalDays}-day period → 365 days). Double-check this looks right before applying — a much larger or smaller multiplier than expected usually means the date range doesn't match the file.
           </p>
-          {personnelOnly && (
+          {!updateComp && (
             <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#EAF1F7", color: "#1F5C6B" }}>
-              Personnel only — comp fields and allocations below will update, but no budget will be touched and no "actuals complete through" marker will move.
+              Allocations only — no budget will be touched and no "actuals complete through" marker will move.
+            </p>
+          )}
+          {updateComp && !updateAllocations && (
+            <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#EAF1F7", color: "#1F5C6B" }}>
+              Compensation only — allocation percentages below are left exactly as they are today.
             </p>
           )}
           <div className="flex items-center gap-3 text-xs">
@@ -5685,10 +6270,10 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
 
 // ---------- invoicing ----------
 
-function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit = true, onSave, onClose, onDelete }) {
+function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], currentUserEmail, canEdit = true, onSave, onClose, onDelete }) {
   const grantDefault = grants[0]?.id || "";
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(invoice || {
-    id: uid(), grantId: grantDefault, invoiceNumber: "", amount: 0,
+    id: uid(), grantId: grantDefault, costCenterId: "", invoiceNumber: "", amount: 0,
     submittedDate: "", dueDate: "", paidDate: "", status: "Draft", notes: "", supportingDocsUrl: "",
     periodStart: "", periodEnd: "",
     verification: {
@@ -5696,6 +6281,10 @@ function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit
       discrepancies: [], signedOff: false, signedOffBy: "", signedOffAt: "",
     },
   });
+  // Whether this invoice is billed against a grant or a cost center — an
+  // invoice can only be one or the other, mirroring how budgets themselves
+  // are owned (grantId XOR costCenterId).
+  const [ownerType, setOwnerType] = useState(invoice?.costCenterId ? "costCenter" : "grant");
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const verification = form.verification || { expectedChecks: {}, vendors: [], glTotal: "", plTotal: "", docsUrl: "", discrepancies: [], signedOff: false };
   const setV = (patch) => setForm({ ...form, verification: { ...verification, ...patch } });
@@ -5707,10 +6296,12 @@ function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit
   const ymNum = (y, m) => y * 12 + m;
   const toYM = (dateStr) => { const [y, m] = dateStr.split("-").map(Number); return ymNum(y, m - 1); };
   const expectedCategories = useMemo(() => {
-    if (!form.grantId || !form.periodStart || !form.periodEnd) return [];
+    if ((!form.grantId && !form.costCenterId) || !form.periodStart || !form.periodEnd) return [];
     const startYM = toYM(form.periodStart);
     const endYM = toYM(form.periodEnd);
-    const relevant = budgets.filter((b) => b.grantId === form.grantId && (b.status === "Active" || b.status === "Awarded"));
+    const relevant = budgets.filter((b) => (
+      (form.grantId && b.grantId === form.grantId) || (form.costCenterId && b.costCenterId === form.costCenterId)
+    ) && (b.status === "Active" || b.status === "Awarded"));
     const seen = new Set();
     const result = [];
     relevant.forEach((b) => {
@@ -5728,7 +6319,7 @@ function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit
       });
     });
     return result;
-  }, [form.grantId, form.periodStart, form.periodEnd, budgets]);
+  }, [form.grantId, form.costCenterId, form.periodStart, form.periodEnd, budgets]);
 
   const addVendor = () => setV({ vendors: [...verification.vendors, { id: uid(), name: "", expectedAmount: "", found: "pending" }] });
   const updateVendor = (id, patch) => setV({ vendors: verification.vendors.map((v) => (v.id === id ? { ...v, ...patch } : v)) });
@@ -5755,8 +6346,37 @@ function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit
     <Modal title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
-        <Field label="Grant">
-          <GrantPicker grants={grants} value={form.grantId} onChange={(v) => setForm({ ...form, grantId: v })} placeholder="Select a grant" />
+        <Field label="Grant or cost center">
+          <div className="flex items-center gap-2">
+            <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
+              <button
+                type="button"
+                onClick={() => { setOwnerType("grant"); setForm({ ...form, costCenterId: "" }); }}
+                className="px-3 py-2 text-xs font-medium"
+                style={{ background: ownerType === "grant" ? "#1F5C6B" : "#FFFFFF", color: ownerType === "grant" ? "#FFFFFF" : "#5B6B66" }}
+              >
+                Grant
+              </button>
+              <button
+                type="button"
+                onClick={() => { setOwnerType("costCenter"); setForm({ ...form, grantId: "" }); }}
+                className="px-3 py-2 text-xs font-medium"
+                style={{ background: ownerType === "costCenter" ? "#1F5C6B" : "#FFFFFF", color: ownerType === "costCenter" ? "#FFFFFF" : "#5B6B66" }}
+              >
+                Cost Center
+              </button>
+            </div>
+            {ownerType === "grant" ? (
+              <div className="flex-1">
+                <GrantPicker grants={grants} value={form.grantId} onChange={(v) => setForm({ ...form, grantId: v })} placeholder="Select a grant" />
+              </div>
+            ) : (
+              <select className={inputCls} style={inputStyle} value={form.costCenterId} onChange={(e) => setForm({ ...form, costCenterId: e.target.value })}>
+                <option value="">Select a cost center</option>
+                {costCenters.map((cc) => <option key={cc.id} value={cc.id}>{cc.name}</option>)}
+              </select>
+            )}
+          </div>
         </Field>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <Field label="Invoice number">
@@ -5984,7 +6604,7 @@ function InvoiceModal({ invoice, grants, budgets = [], currentUserEmail, canEdit
   );
 }
 
-function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, canEdit, initialOpenInvoiceId, logActivity, budgets = [] }) {
+function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEmail, canEdit, initialOpenInvoiceId, logActivity, budgets = [], costCenters = [] }) {
   const [modal, setModal] = useState(() => (initialOpenInvoiceId ? invoices.find((i) => i.id === stripNonce(initialOpenInvoiceId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [grantFilter, setGrantFilter] = useState("All");
@@ -6088,14 +6708,63 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
     logActivity?.("Invoice", "Deleted", inv?.invoiceNumber || "Untitled invoice");
     setConfirm(null);
   };
-  const exportCsv = () => {
-    const rows = [["Grant", "Invoice #", "Amount", "Status", "Submitted", "Due", "Paid", "Days outstanding"]];
+  const exportCsv = async () => {
+    const HEADER_FILL = "FFF6F7F3";
+    const RED = "FFB5443A";
+    const GREEN = "FF2F6F53";
+    const AMBER = "FFC08A2E";
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Invoices");
+
+    const header = ["Grant / Cost Center", "Invoice #", "Amount", "Status", "Submitted", "Due", "Paid", "Days outstanding"];
+    ws.mergeCells(1, 1, 1, header.length);
+    const titleCell = ws.getCell(1, 1);
+    titleCell.value = "Nation's Finest — Invoices";
+    titleCell.font = { bold: true, size: 13 };
+    ws.getRow(1).height = 22;
+
+    ws.mergeCells(2, 1, 2, header.length);
+    ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}`;
+    ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+    const headerRowIdx = 4;
+    ws.getRow(headerRowIdx).values = header;
+    ws.getRow(headerRowIdx).eachCell((cell) => {
+      cell.font = { bold: true };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+    });
+
+    const statusColor = { Paid: GREEN, Submitted: AMBER, Rejected: RED, Draft: "FF8A8F87" };
+    let r = headerRowIdx + 1;
     invoices.forEach((i) => {
       const g = grants.find((x) => x.id === i.grantId);
-      rows.push([g?.title || "", i.invoiceNumber, i.amount, i.status, i.submittedDate, i.dueDate, i.paidDate, daysOutstanding(i) ?? ""]);
+      const cc = costCenters.find((x) => x.id === i.costCenterId);
+      const overdue = isInvoiceOverdue(i);
+      const days = daysOutstanding(i);
+      ws.getRow(r).values = [
+        g?.title || cc?.name || "",
+        i.invoiceNumber || "",
+        Number(i.amount) || 0,
+        i.status || "",
+        i.submittedDate ? fmtDate(i.submittedDate) : "",
+        i.dueDate ? fmtDate(i.dueDate) : "",
+        i.paidDate ? fmtDate(i.paidDate) : "",
+        days ?? "",
+      ];
+      ws.getCell(r, 3).numFmt = "$#,##0";
+      ws.getCell(r, 4).font = { bold: true, color: { argb: statusColor[i.status] || "FF1C2624" } };
+      if (overdue) {
+        ws.getCell(r, 6).font = { bold: true, color: { argb: RED } };
+      }
+      r++;
     });
-    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
-    downloadFile("nations-finest-invoices.csv", csv, "text/csv");
+
+    ws.columns = [{ width: 34 }, { width: 16 }, { width: 14 }, { width: 12 }, { width: 13 }, { width: 13 }, { width: 13 }, { width: 16 }];
+    ws.views = [{ state: "frozen", ySplit: headerRowIdx }];
+
+    const buffer = await wb.xlsx.writeBuffer();
+    downloadFile("nations-finest-invoices.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   };
 
   const statusColor = { Draft: "#8A8F87", Submitted: "#5B7FA6", Paid: "#2F6F53", Rejected: "#B5443A" };
@@ -6115,7 +6784,7 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
             <ExternalLink size={15} /> Tungsten System
           </a>
           <button onClick={exportCsv} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-            <Download size={15} /> Export CSV
+            <Download size={15} /> Export Excel
           </button>
           {canEdit && (
             <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
@@ -6239,12 +6908,13 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
             <tbody>
               {visible.map((i) => {
                 const g = grants.find((x) => x.id === i.grantId);
+                const cc = costCenters.find((x) => x.id === i.costCenterId);
                 const overdue = isInvoiceOverdue(i);
                 const outstanding = daysOutstanding(i);
                 const flagged = i.verification?.discrepancies?.some((d) => d.status !== "resolved");
                 return (
                   <tr key={i.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: overdue ? "#B5443A" : "#E1E5DE" }} onClick={() => setModal(i)}>
-                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{g?.title || "Unknown grant"}</td>
+                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{g?.title || cc?.name || "Unknown grant"}</td>
                     <td className="px-3 py-2" style={{ color: "#1C2624" }}>
                       <div className="flex items-center gap-1.5">
                         {i.invoiceNumber || "—"}
@@ -6287,6 +6957,7 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
         <InvoiceModal
           invoice={modal === "new" ? null : modal}
           grants={grants}
+          costCenters={costCenters}
           budgets={budgets}
           currentUserEmail={currentUserEmail}
           canEdit={canEdit}
@@ -6489,7 +7160,8 @@ function GlobalSearch({ grants, budgets, reports, staff, tasks, invoices, costCe
     ...invoices.filter((i) => matches(i.invoiceNumber) || matches(i.notes))
       .slice(0, 5).map((i) => {
         const g = grants.find((x) => x.id === i.grantId);
-        return { type: "Invoice", label: i.invoiceNumber || "Untitled invoice", sub: g?.title || "", action: () => goTo("invoicing", null, null, i.id) };
+        const cc = costCenters.find((x) => x.id === i.costCenterId);
+        return { type: "Invoice", label: i.invoiceNumber || "Untitled invoice", sub: g?.title || cc?.name || "", action: () => goTo("invoicing", null, null, i.id) };
       }),
   ].slice(0, 12);
 
@@ -7715,7 +8387,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
         ) : tab === "invoicing" ? (
           <InvoicingView
             key={pendingOpenInvoiceId ? `invoices-open-${pendingOpenInvoiceId}` : "invoicing"}
-            grants={grants} invoices={invoices} setInvoices={setInvoices} budgets={budgets}
+            grants={grants} invoices={invoices} setInvoices={setInvoices} budgets={budgets} costCenters={costCenters}
             setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenInvoiceId={pendingOpenInvoiceId} logActivity={logActivity}
           />
