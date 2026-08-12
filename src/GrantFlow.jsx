@@ -574,6 +574,7 @@ function grantBurn(grant, budgets) {
   const today = new Date();
   const mine = budgets.filter((b) => {
     if (b.grantId !== grant.id) return false;
+    if (b.budgetType !== "Operational") return false; // pace against what's actually contracted with the grantor, not the internal Template version
     if (!b.periodStart || !b.periodEnd) return false;
     return today >= new Date(b.periodStart) && today <= new Date(b.periodEnd);
   });
@@ -6918,20 +6919,20 @@ const paceColor = {
 };
 
 function BurnRateView({ grants, budgets }) {
-  const withBudgets = grants.filter((g) => budgets.some((b) => b.grantId === g.id));
+  const withBudgets = grants.filter((g) => budgets.some((b) => b.grantId === g.id && b.budgetType === "Operational"));
 
   return (
     <div className="space-y-4">
       <div>
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Burn Rate</h1>
         <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
-          Uses recorded actuals where you've entered them (Budgets → Actual). Falls back to the planned schedule for any grant without actuals yet.
+          Paced against each grant's Operational budget — the version actually contracted with the grantor — not the internal Template. Uses recorded actuals where you've entered them (Budgets → Actual). Falls back to the planned schedule for any grant without actuals yet.
         </p>
       </div>
 
       {withBudgets.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          No grants with budgets yet — add a budget to see burn rate.
+          No grants with an Operational budget yet — add one to see burn rate.
         </div>
       ) : (
         <div className="overflow-x-auto border rounded-lg bg-white" style={{ borderColor: "#E1E5DE" }}>
