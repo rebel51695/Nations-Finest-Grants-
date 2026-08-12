@@ -264,7 +264,7 @@ const EXCEL_ERROR_STRINGS = ["#REF!", "#DIV/0!", "#VALUE!", "#N/A", "#NAME?", "#
 // — this sidesteps needing to parse the file's own header/indentation
 // hierarchy at all, and guarantees whatever lands in GrantFlow uses exactly
 // the category names already used everywhere else.
-function parseExcelTemplateWorkbook(aoa) {
+function parseExcelTemplateWorkbook(aoa, sheet) {
   const warnings = [];
   const projectLabel = String(aoa[6]?.[1] || "");
   const projectCodeMatch = projectLabel.match(/^(\d+)/);
@@ -329,9 +329,13 @@ function parseExcelTemplateWorkbook(aoa) {
       const col = monthCols[m];
       if (!col) continue;
       const raw = row[m + 1];
+      const rawCell = sheet ? sheet[XLSX.utils.encode_cell({ r: i, c: m + 1 })] : null;
       let val = 0;
-      if (typeof raw === "number") val = raw;
-      else if (typeof raw === "string" && EXCEL_ERROR_STRINGS.includes(raw.trim())) {
+      if (rawCell && rawCell.t === "e") {
+        warnings.push(`"${target.category} / ${target.subcategory}", ${MONTHS[col.monthIndex]} ${col.year}: source cell contains a formula error (${rawCell.w || "#ERROR"}) — imported as $0.`);
+      } else if (typeof raw === "number") {
+        val = raw;
+      } else if (typeof raw === "string" && EXCEL_ERROR_STRINGS.includes(raw.trim())) {
         warnings.push(`"${target.category} / ${target.subcategory}", ${MONTHS[col.monthIndex]} ${col.year}: source cell contains ${raw.trim()} — imported as $0.`);
       } else if (raw !== null && raw !== undefined && raw !== "") {
         const n = Number(raw);
@@ -3113,96 +3117,29 @@ function ExcelTemplateImportModal({ grants, budgets, setBudgets, logActivity, on
       const wb = XLSX.read(buf, { type: "array", cellDates: true });
       const sheet = wb.Sheets[wb.SheetNames[0]];
       const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
-      const getRaw = (r, c) => sheet[XLSX.utils.encode_cell({ r, c })];
 
-      const monthHeaderRowIdx = aoa.findIndex((row) => row && row[1] === "Month Ending");
-      if (monthHeaderRowIdx === -1) {
-        setError("Couldn't find the \"Month Ending\" header row — this doesn't look like the expected template layout.");
-        return;
-      }
-      const dateRowIdx = monthHeaderRowIdx + 1;
-      const flagRowIdx = monthHeaderRowIdx + 2;
-      const dataStartRowIdx = flagRowIdx + 1;
-      const monthCols = [];
-      for (let c = 1; c < aoa[monthHeaderRowIdx].length; c++) {
-        if (aoa[monthHeaderRowIdx][c] === "Month Ending") monthCols.push(c);
-        else break;
-      }
-      if (monthCols.length === 0) {
-        setError("No month columns found next to the \"Month Ending\" header.");
-        return;
-      }
-      const periodStartDate = aoa[dateRowIdx][monthCols[0]];
-      const periodEndDate = aoa[dateRowIdx][monthCols[monthCols.length - 1]];
-      if (!(periodStartDate instanceof Date) || !(periodEndDate instanceof Date)) {
-        setError("Couldn't read the month-ending dates — expected real dates in that row.");
-        return;
-      }
-      const periodStart = `${periodStartDate.getUTCFullYear()}-${String(periodStartDate.getUTCMonth() + 1).padStart(2, "0")}-01`;
-      const periodEnd = periodEndDate.toISOString().slice(0, 10);
-      const flags = monthCols.map((c) => aoa[flagRowIdx][c]);
-
-      const projectRow = aoa.find((row) => row && row[0] === "Project:");
-      const projectLabel = projectRow ? projectRow[1] : null;
-      const projectCode = projectLabel ? String(projectLabel).split("--")[0].trim() : null;
-
-      const CODE_RE = /^\d{3,4}\w*\s*-\s*/;
-      let currentType = null;
-      let currentCategory = null;
-      const lines = [];
-      const warnings = [];
-
-      for (let r = dataStartRowIdx; r < aoa.length; r++) {
-        const row = aoa[r];
-        if (!row) continue;
-        const rawLabel = row[0];
-        if (rawLabel === null || rawLabel === undefined) continue;
-        const label = String(rawLabel).trim();
-        if (!label) continue;
-        if (/^changes in net income$/i.test(label) || /^in kind activity$/i.test(label)) break;
-        if (/^revenue$/i.test(label)) { currentType = "revenue"; continue; }
-        if (/^expenditures?$/i.test(label)) { currentType = "expense"; continue; }
-        if (/^total\s/i.test(label)) continue;
-        if (label.includes("%")) continue;
-
-        if (CODE_RE.test(label)) {
-          const subcategory = label.replace(/&/g, "and");
-          const category = (currentCategory || "Uncategorized").replace(/&/g, "and");
-          const amounts = Array(monthCols.length).fill(0);
-          const actuals = Array(monthCols.length).fill(0);
-          monthCols.forEach((c, i) => {
-            const raw = getRaw(r, c);
-            let val = row[c];
-            if (raw && raw.t === "e") {
-              warnings.push(`"${subcategory}", month ${i + 1}: formula error (${raw.w}) in source file — imported as $0`);
-              val = 0;
-            }
-            val = Number(val) || 0;
-            if (flags[i] === "ACTUALS") actuals[i] = val; else amounts[i] = val;
-          });
-          lines.push({ category, subcategory, type: currentType || "expense", amounts, actuals });
-          continue;
-        }
-
-        const firstVal = row[1];
-        const isBlank = firstVal === null || firstVal === undefined || (typeof firstVal === "string" && firstVal.trim() === "");
-        if (isBlank) currentCategory = label;
-      }
-
-      if (lines.length === 0) {
-        setError("No account lines were found — double-check this is the expected template export.");
+      const result = parseExcelTemplateWorkbook(aoa, sheet);
+      if (result.error) { setError(result.error); return; }
+      if (result.lines.length === 0) {
+        setError("No recognized account lines were found — double-check this is the expected template export.");
         return;
       }
 
-      const lastActualsIdx = flags.lastIndexOf("ACTUALS");
-      const actualsThrough = lastActualsIdx >= 0
-        ? (() => { const d = aoa[dateRowIdx][monthCols[lastActualsIdx]]; return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`; })()
+      const matchedGrant = grants.find((g) => g.programCode && String(g.programCode).trim() === result.projectCode);
+      const fy = String(result.fy || new Date(result.periodStart).getUTCFullYear());
+      const actualsThrough = result.actualsThroughDate
+        ? `${result.actualsThroughDate.year}-${String(result.actualsThroughDate.monthIndex + 1).padStart(2, "0")}`
         : "";
 
-      const matchedGrant = grants.find((g) => g.programCode && String(g.programCode).trim() === projectCode);
-      const fy = String(periodStartDate.getUTCFullYear());
+      const warnings = [...result.warnings];
+      result.unrecognizedCodes.forEach((label) => {
+        warnings.push(`"${label}" has an account code not found in GrantFlow's category list — this line was skipped. Add it to CATEGORIES if it should be tracked.`);
+      });
 
-      setParsed({ projectCode, projectLabel, periodStart, periodEnd, fy, lines, warnings, actualsThrough, matchedGrantId: matchedGrant?.id || "" });
+      setParsed({
+        projectCode: result.projectCode, periodStart: result.periodStart, periodEnd: result.periodEnd,
+        fy, lines: result.lines, warnings, actualsThrough, matchedGrantId: matchedGrant?.id || "",
+      });
       setFyOverride(fy);
       setManualGrantId(matchedGrant?.id || "");
       setStep("review");
