@@ -1680,9 +1680,9 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
               options={budgets.filter((b) => {
                 if (b.id === form.id || (!form.grantId && !form.costCenterId)) return false;
                 if (!(b.grantId === form.grantId || b.costCenterId === form.costCenterId)) return false;
-                const isDraftOrActive = b.status === "Draft" || b.status === "Active";
+                const isLinkable = b.status === "Draft" || b.status === "Active" || b.status === "Closed";
                 const alreadyLinked = (form.linkedBudgetIds || []).includes(b.id);
-                return isDraftOrActive || alreadyLinked; // keep a since-changed link visible so it can still be unlinked
+                return isLinkable || alreadyLinked; // keep a since-changed link visible so it can still be unlinked
               })}
               selectedIds={form.linkedBudgetIds || []}
               onChange={(ids) => setForm({ ...form, linkedBudgetIds: ids })}
@@ -1691,7 +1691,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             />
           </Field>
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
-            A calendar-year Template can span more than one Operational fiscal year — link every budget this one should feed. Only Draft and Active budgets are offered here. Each linked budget only receives whichever months actually fall within its own period.
+            A calendar-year Template can span more than one Operational fiscal year — link every budget this one should feed, including a Closed one if the grant's period overlaps into it. Each linked budget only receives whichever months actually fall within its own period.
           </p>
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
             Whenever this Template budget is saved, its actuals are copied onto every linked budget for the matching calendar months — matched by category/subcategory, not row order. One-way only; editing a linked budget directly won't flow back here.
