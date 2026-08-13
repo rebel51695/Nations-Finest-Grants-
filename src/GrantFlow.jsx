@@ -244,8 +244,8 @@ const CATEGORIES = [
   // structure as any other line, but deliberately excluded from
   // revenue/expense/net everywhere (see budgetTotals, budgetActualTotals,
   // and OrgBudgetView) since they're not income statement activity.
-  { name: "Deferred Revenue", type: "balance", subs: ["1290 - Deferred Revenue - SSVF", "2600 - Deferred Revenue"] },
-  { name: "Cash", type: "balance", subs: ["1012 - B of A Main Checking"] },
+  { name: "Deferred Revenue", type: "balance", sign: -1, subs: ["1290 - Deferred Revenue - SSVF", "2600 - Deferred Revenue"] },
+  { name: "Cash", type: "balance", sign: 1, subs: ["1012 - B of A Main Checking"] },
 ];
 const CUSTOM_CATEGORY = "__custom__";
 
@@ -5014,9 +5014,10 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 
     const pushSection = (cats) => cats.forEach((c) => {
       const bucket = grouped[c.name];
-      writeRow(c.name, "", bucket.monthly, { bold: true });
+      const sign = c.sign || 1;
+      writeRow(c.name, "", bucket.monthly.map((v) => v * sign), { bold: true });
       Object.entries(bucket.subs).forEach(([sub, subData]) => {
-        writeRow("", sub, subData.values);
+        writeRow("", sub, subData.values.map((v) => v * sign));
       });
     });
 
@@ -5229,14 +5230,17 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
                 <>
                   <tr><td colSpan={MONTHS.length + 2} className="py-2"></td></tr>
                   <OrgBudgetRow label="Balance Sheet (not included in Net)" values={Array(12).fill(0)} isHeader bold />
-                  {balanceCats.map((c) => (
-                    <Fragment key={c.name}>
-                      <OrgBudgetRow label={c.name} values={grouped[c.name].monthly} projected={grouped[c.name].monthlyProjected} indent color="#5B7FA6" />
-                      {Object.entries(grouped[c.name].subs).map(([sub, subData]) => (
-                        <OrgBudgetRow key={c.name + sub} label={sub} values={subData.values} projected={subData.projected} indent color="#5B6B66" />
-                      ))}
-                    </Fragment>
-                  ))}
+                  {balanceCats.map((c) => {
+                    const sign = c.sign || 1;
+                    return (
+                      <Fragment key={c.name}>
+                        <OrgBudgetRow label={c.name} values={grouped[c.name].monthly.map((v) => v * sign)} projected={grouped[c.name].monthlyProjected} indent color="#5B7FA6" />
+                        {Object.entries(grouped[c.name].subs).map(([sub, subData]) => (
+                          <OrgBudgetRow key={c.name + sub} label={sub} values={subData.values.map((v) => v * sign)} projected={subData.projected} indent color="#5B6B66" />
+                        ))}
+                      </Fragment>
+                    );
+                  })}
                 </>
               )}
             </tbody>
