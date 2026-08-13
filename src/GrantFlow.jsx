@@ -245,6 +245,7 @@ const CATEGORIES = [
   // revenue/expense/net everywhere (see budgetTotals, budgetActualTotals,
   // and OrgBudgetView) since they're not income statement activity.
   { name: "Deferred Revenue", type: "balance", subs: ["1290 - Deferred Revenue - SSVF", "2600 - Deferred Revenue"] },
+  { name: "Cash", type: "balance", subs: ["1012 - B of A Main Checking"] },
 ];
 const CUSTOM_CATEGORY = "__custom__";
 
