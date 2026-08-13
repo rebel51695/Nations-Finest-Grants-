@@ -236,9 +236,15 @@ const CATEGORIES = [
     "6140 - Interest", "6145 - Ret. Forfeiture", "6150 - Spec. Projects", "6155 - Taxes", "6175 - Miscellaneous",
     "6185 - Insurance Claim Expense", "6190 - Refunds/NSF Checks", "6300 - Bad Debt", "6700 - Depreciation",
     "6750 - Intercompany Billing", "6989 - Other Total Budget", "6990 - Indirect", "6998 - REC F.A./EQ. Grantor",
-    "6999 - Asses Sale Gain/Loss",
+    "6999 - Asses Sale Gain/Loss", "8000 - Unallocated Expenses",
   ] },
+  { name: "In-Kind Expenses", type: "expense", subs: ["6066 - InKind Rent Expense", "6067 - InKind Event Expense"] },
   { name: "TFA", type: "expense", subs: ["7100 - Category 1 Temporary Financial Assistance", "7200 - Category 2 Temporary Financial Assistance"] },
+  // Balance sheet accounts — tracked with the same Plan/Actual monthly
+  // structure as any other line, but deliberately excluded from
+  // revenue/expense/net everywhere (see budgetTotals, budgetActualTotals,
+  // and OrgBudgetView) since they're not income statement activity.
+  { name: "Deferred Revenue", type: "balance", subs: ["1290 - Deferred Revenue - SSVF", "2600 - Deferred Revenue"] },
 ];
 const CUSTOM_CATEGORY = "__custom__";
 
@@ -453,8 +459,11 @@ function budgetTotals(budget) {
   const monthly = Array(12).fill(0);
   for (const line of budget.lines) {
     const t = lineTotal(line);
-    if (line.type === "revenue") revenue += t; else expense += t;
-    line.amounts.forEach((a, i) => { monthly[i] += (line.type === "revenue" ? 1 : -1) * (Number(a) || 0); });
+    if (line.type === "revenue") { revenue += t; line.amounts.forEach((a, i) => { monthly[i] += Number(a) || 0; }); }
+    else if (line.type === "expense") { expense += t; line.amounts.forEach((a, i) => { monthly[i] -= Number(a) || 0; }); }
+    // Balance-sheet-type lines (e.g. Deferred Revenue) are tracked but
+    // deliberately excluded from revenue/expense/net — they're not income
+    // statement activity.
   }
   return { revenue, expense, net: revenue - expense, monthly };
 }
@@ -464,8 +473,8 @@ function budgetActualTotals(budget) {
   const monthly = Array(12).fill(0);
   for (const line of budget.lines) {
     const t = lineActualTotal(line);
-    if (line.type === "revenue") revenue += t; else expense += t;
-    (line.actuals || []).forEach((a, i) => { monthly[i] += (line.type === "revenue" ? 1 : -1) * (Number(a) || 0); });
+    if (line.type === "revenue") { revenue += t; (line.actuals || []).forEach((a, i) => { monthly[i] += Number(a) || 0; }); }
+    else if (line.type === "expense") { expense += t; (line.actuals || []).forEach((a, i) => { monthly[i] -= Number(a) || 0; }); }
   }
   return { revenue, expense, net: revenue - expense, monthly };
 }
@@ -1959,7 +1968,9 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                 {cols.map((_, i) => {
                   const net = form.lines.reduce((sum, l) => {
                     const v = Number((l[field] || [])[i]) || 0;
-                    return sum + (l.type === "revenue" ? v : -v);
+                    if (l.type === "revenue") return sum + v;
+                    if (l.type === "expense") return sum - v;
+                    return sum; // balance-sheet-type lines aren't income statement activity
                   }, 0);
                   return (
                     <Fragment key={i}>
@@ -4787,6 +4798,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
 
   const revenueCats = CATEGORIES.filter((c) => c.type === "revenue");
   const expenseCats = CATEGORIES.filter((c) => c.type === "expense");
+  const balanceCats = CATEGORIES.filter((c) => c.type === "balance");
 
   const grouped = useMemo(() => {
     const map = {};
@@ -5014,6 +5026,12 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
     const netTotal = round2(net.reduce((a, b) => a + b, 0));
     writeRow("Net", "", net, { bold: true, fill: HEADER_FILL, color: isNetNegative(netTotal) ? RED : GREEN });
 
+    if (balanceCats.length > 0) {
+      r++; // blank separator row
+      writeRow("Balance Sheet (not included in Net)", "", Array(monthLabels.length).fill(0), { bold: true, fill: HEADER_FILL });
+      pushSection(balanceCats);
+    }
+
     ws.columns = [{ width: 26 }, { width: 30 }, ...monthLabels.map(() => ({ width: 13 })), { width: 15 }];
     ws.views = [{ state: "frozen", xSplit: 2, ySplit: headerRowIdx }];
 
@@ -5206,6 +5224,20 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
               ))}
               <OrgBudgetRow label="Total Expense" values={totalExpense} projected={totalExpenseProjected} bold />
               <OrgBudgetRow label="Net Total" values={net} projected={netProjected} bold color={!isNetNegative(net.reduce((a, b) => a + b, 0)) ? "#2F6F53" : "#B5443A"} />
+              {balanceCats.length > 0 && (
+                <>
+                  <tr><td colSpan={MONTHS.length + 2} className="py-2"></td></tr>
+                  <OrgBudgetRow label="Balance Sheet (not included in Net)" values={Array(12).fill(0)} isHeader bold />
+                  {balanceCats.map((c) => (
+                    <Fragment key={c.name}>
+                      <OrgBudgetRow label={c.name} values={grouped[c.name].monthly} projected={grouped[c.name].monthlyProjected} indent color="#5B7FA6" />
+                      {Object.entries(grouped[c.name].subs).map(([sub, subData]) => (
+                        <OrgBudgetRow key={c.name + sub} label={sub} values={subData.values} projected={subData.projected} indent color="#5B6B66" />
+                      ))}
+                    </Fragment>
+                  ))}
+                </>
+              )}
             </tbody>
           </table>
         </div>
