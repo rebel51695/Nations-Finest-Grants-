@@ -375,6 +375,10 @@ const BUDGET_STATUSES = ["Draft", "Pending Approval", "Active", "Awarded", "Reje
 // org-wide Org Budget view — the two can differ (internal cost allocation,
 // admin categorization, etc.) without one distorting the other.
 const BUDGET_TYPES = ["Operational", "Template"];
+// The stored value stays "Operational" (every existing budget already has
+// this exact string saved) — only the display label changes to "Grant
+// Budget" per the org's preferred terminology.
+const budgetTypeLabel = (t) => (t === "Operational" ? "Grant Budget" : t);
 // "Awarded" is functionally identical to "Active" everywhere budgets are scoped,
 // totaled, or rolled up (org budget, scenarios, burn rate, dashboard counts, etc).
 // It exists as a separate status purely so it can be labeled/badged differently.
@@ -1648,7 +1652,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         <Field label="Budget type">
           <select className={inputCls} style={inputStyle} value={form.budgetType || ""} onChange={set("budgetType")}>
             <option value="">Select type</option>
-            {BUDGET_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            {BUDGET_TYPES.map((t) => <option key={t} value={t}>{budgetTypeLabel(t)}</option>)}
           </select>
         </Field>
         <Field label="Status">
@@ -1685,7 +1689,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
 
       {form.budgetType === "Template" && (
         <div className="mb-4">
-          <Field label="Linked Operational budgets">
+          <Field label="Linked Grant Budgets">
             <MultiSelectDropdown
               options={budgets.filter((b) => {
                 if (b.id === form.id || (!form.grantId && !form.costCenterId)) return false;
@@ -1697,11 +1701,11 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
               selectedIds={form.linkedBudgetIds || []}
               onChange={(ids) => setForm({ ...form, linkedBudgetIds: ids })}
               placeholder="Select budgets to link…"
-              renderLabel={(b) => `${b.title || "Untitled budget"} (${b.fy}${b.budgetType ? `, ${b.budgetType}` : ""})`}
+              renderLabel={(b) => `${b.title || "Untitled budget"} (${b.fy}${b.budgetType ? `, ${budgetTypeLabel(b.budgetType)}` : ""})`}
             />
           </Field>
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
-            A calendar-year Template can span more than one Operational fiscal year — link every budget this one should feed, including a Closed one if the grant's period overlaps into it. Each linked budget only receives whichever months actually fall within its own period.
+            A calendar-year Template can span more than one Grant Budget fiscal year — link every budget this one should feed, including a Closed one if the grant's period overlaps into it. Each linked budget only receives whichever months actually fall within its own period.
           </p>
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
             Whenever this Template budget is saved, its actuals are copied onto every linked budget for the matching calendar months — matched by category/subcategory, not row order. One-way only; editing a linked budget directly won't flow back here.
@@ -2768,41 +2772,68 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     setModal(newBudget);
     setDuplicatePrompt(null);
   };
-  const exportCsv = (budget) => {
-    const labels = monthColumnsForBudget(budget.periodStart, budget.periodEnd).map((c) => c.label);
-    const rows = [["Category", "Subcategory", "Description", "Type", ...labels, "Total"]];
-    budget.lines.forEach((l) => {
-      rows.push([l.category, l.subcategory, l.description || "", l.type, ...l.amounts, lineTotal(l)]);
-    });
-    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
-    downloadFile("nations-finest-budget-lines.csv", csv, "text/csv");
-  };
-  const exportXlsx = (budget) => {
+  const exportXlsx = async (budget) => {
+    const HEADER_FILL = "FFF6F7F3";
+    const GREEN = "FF2F6F53";
+    const RED = "FFB5443A";
+    const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
     const g = grants.find((x) => x.id === budget.grantId);
     const cc = costCenters.find((x) => x.id === budget.costCenterId);
     const label = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Budget";
     const t = budgetTotals(budget);
     const cols = monthColumnsForBudget(budget.periodStart, budget.periodEnd);
-    const labels = cols.map((c) => c.label);
-    const rows = [
-      [label],
-      [`${budget.title}${budget.fy ? ` (${budget.fy})` : ""}`],
-      [`Period: ${fmtDate(budget.periodStart)} – ${fmtDate(budget.periodEnd)}`, `Status: ${budget.status}`],
-      [],
-      ["Category", "Subcategory", "Description", "Type", ...labels, "Total"],
-      ...budget.lines.map((l) => [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts, lineTotal(l)]),
-      [],
-      ["Total Revenue", "", "", "", ...Array(cols.length).fill(""), t.revenue],
-      ["Total Expense", "", "", "", ...Array(cols.length).fill(""), t.expense],
-      ["Net", "", "", "", ...Array(cols.length).fill(""), t.net],
-    ];
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...cols.map(() => ({ wch: 12 })), { wch: 14 }];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Budget");
+    const monthLabels = cols.map((c) => c.label);
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Budget");
+
+    ws.mergeCells(1, 1, 1, monthLabels.length + 5);
+    const titleCell = ws.getCell(1, 1);
+    titleCell.value = `${label} — ${budget.title}${budget.fy ? ` (${budget.fy})` : ""}`;
+    titleCell.font = { bold: true, size: 13 };
+    ws.getRow(1).height = 22;
+
+    ws.mergeCells(2, 1, 2, monthLabels.length + 5);
+    ws.getCell(2, 1).value = `Period: ${fmtDate(budget.periodStart)} – ${fmtDate(budget.periodEnd)}  •  Status: ${budget.status}  •  Generated ${fmtDate(new Date().toISOString().slice(0, 10))}`;
+    ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+    const headerRowIdx = 4;
+    const header = ["Category", "Subcategory", "Description", "Type", ...monthLabels, "Total"];
+    ws.getRow(headerRowIdx).values = header;
+    ws.getRow(headerRowIdx).eachCell((cell) => {
+      cell.font = { bold: true };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+    });
+
+    let r = headerRowIdx + 1;
+    budget.lines.forEach((l) => {
+      const rowVals = [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts.map(round2), round2(lineTotal(l))];
+      ws.getRow(r).values = rowVals;
+      ws.getRow(r).eachCell((cell, colNumber) => { if (colNumber >= 5) cell.numFmt = "$#,##0"; });
+      r++;
+    });
+
+    const writeTotalRow = (label, value, color) => {
+      const rowVals = [label, "", "", "", ...Array(monthLabels.length).fill(""), round2(value)];
+      ws.getRow(r).values = rowVals;
+      ws.getRow(r).eachCell((cell, colNumber) => {
+        cell.font = { bold: true, color: color ? { argb: color } : undefined };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+        if (colNumber === monthLabels.length + 5) cell.numFmt = "$#,##0";
+      });
+      r++;
+    };
+    writeTotalRow("Total Revenue", t.revenue, GREEN);
+    writeTotalRow("Total Expense", t.expense, null);
+    writeTotalRow("Net", t.net, isNetNegative(t.net) ? RED : GREEN);
+
+    ws.columns = [{ width: 26 }, { width: 28 }, { width: 20 }, { width: 10 }, ...monthLabels.map(() => ({ width: 12 })), { width: 14 }];
+    ws.views = [{ state: "frozen", xSplit: 2, ySplit: headerRowIdx }];
+
     const safe = (s) => (s || "budget").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
-    const arrayBuffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-    downloadFile(`${safe(g?.title || cc?.name)}-${safe(budget.title)}.xlsx`, arrayBuffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    const buffer = await wb.xlsx.writeBuffer();
+    downloadFile(`${safe(g?.title || cc?.name)}-${safe(budget.title)}.xlsx`, buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   };
 
   const allBudgetsEnriched = useMemo(() => budgets.map((b) => {
@@ -2935,7 +2966,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                     </td>
                     <td className="py-1.5">
                       {b.budgetType ? (
-                        <Badge color={b.budgetType === "Template" ? "#5B7FA6" : "#8A8F87"}>{b.budgetType}</Badge>
+                        <Badge color={b.budgetType === "Template" ? "#5B7FA6" : "#8A8F87"}>{budgetTypeLabel(b.budgetType)}</Badge>
                       ) : (
                         <span className="text-xs" style={{ color: "#C08A2E" }}>Not set</span>
                       )}
@@ -3028,9 +3059,6 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                 <div className="flex gap-2 mt-4 flex-wrap">
                   <button onClick={() => setModal(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
                     <Pencil size={13} /> {canEdit ? "View/edit budget" : "View budget"}
-                  </button>
-                  <button onClick={() => exportCsv(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-                    <Download size={13} /> Export CSV
                   </button>
                   <button onClick={() => exportXlsx(b)} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
                     <Download size={13} /> Export Excel
@@ -5107,7 +5135,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
         )}
       </div>
       <p className="text-xs" style={{ color: "#8A8F87" }}>
-        Only budgets marked as budget type "Template" are included here — the "Operational" version sent to a grantor doesn't affect this rollup.
+        Only budgets marked as budget type "Template" are included here — the "Grant Budget" version sent to a grantor doesn't affect this rollup.
       </p>
       {scope === "all" && deferredRevenueGroupId && (
         <p className="text-xs" style={{ color: "#8A8F87" }}>
@@ -6963,13 +6991,13 @@ function BurnRateView({ grants, budgets }) {
       <div>
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Burn Rate</h1>
         <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
-          Paced against each grant's Operational budget — the version actually contracted with the grantor — not the internal Template. Uses recorded actuals where you've entered them (Budgets → Actual). Falls back to the planned schedule for any grant without actuals yet.
+          Paced against each grant's Grant Budget — the version actually contracted with the grantor — not the internal Template. Uses recorded actuals where you've entered them (Budgets → Actual). Falls back to the planned schedule for any grant without actuals yet.
         </p>
       </div>
 
       {withBudgets.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          No grants with an Operational budget yet — add one to see burn rate.
+          No grants with a Grant Budget yet — add one to see burn rate.
         </div>
       ) : (
         <div className="overflow-x-auto border rounded-lg bg-white" style={{ borderColor: "#E1E5DE" }}>
