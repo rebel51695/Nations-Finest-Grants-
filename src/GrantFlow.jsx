@@ -6,7 +6,7 @@ import ExcelJS from "exceljs";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
   ExternalLink, Download, Search, ArrowRight, AlertCircle, CheckCircle2,
-  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical, Undo2,
+  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical, Undo2, Lock,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
 import {
@@ -400,7 +400,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.3.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -2215,7 +2215,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
 
 // ---------- main views ----------
 
-function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, costCenters, budgetGroups }) {
+function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, costCenters, budgetGroups, restrictedFunds = [] }) {
   const activeGrants = grants.filter((g) => g.stage === "Active");
   const totalAward = activeGrants.reduce((a, g) => a + (Number(g.awardAmount) || 0), 0);
   const totalRemaining = activeGrants.reduce((a, g) => {
@@ -2334,6 +2334,21 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, cos
         </div>
       </div>
 
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <StatCard
+          label="Restricted funds, org-wide"
+          value={fmt(restrictedFunds.reduce((a, r) => a + computeRestrictedFundsLedger(r, r.grantId, budgets).currentBalance, 0))}
+          sub={
+            <span
+              onClick={() => goTo("restricted-funds")}
+              style={{ cursor: "pointer", color: "#1F5C6B" }}
+            >
+              View Restricted Funds →
+            </span>
+          }
+        />
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="col-span-2 space-y-6">
           <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
@@ -2435,7 +2450,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, cos
   );
 }
 
-function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, canEdit, autoOpenNew, initialExpandId, goTo, logActivity }) {
+function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, canEdit, autoOpenNew, initialExpandId, goTo, logActivity, restrictedFunds, setRestrictedFunds }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("All");
   const [riskFilter, setRiskFilter] = useState("All");
@@ -2494,8 +2509,10 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
     const cascadedAllocations = (staff || [])
       .map((s) => ({ staffId: s.id, allocations: (s.allocations || []).filter((a) => a.grantId === id) }))
       .filter((x) => x.allocations.length > 0);
+    const cascadedRestrictedFunds = (restrictedFunds || []).filter((r) => r.grantId === id);
     pushTrash(setTrash, "grant", g, currentUserEmail, {
       budgets: cascadedBudgets, reports: cascadedReports, tasks: cascadedTasks, invoices: cascadedInvoices, staffAllocations: cascadedAllocations,
+      restrictedFunds: cascadedRestrictedFunds,
     });
     setGrants((prev) => prev.filter((g) => g.id !== id));
     setBudgets((prev) => prev.filter((b) => b.grantId !== id));
@@ -2503,6 +2520,7 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
     setTasks?.((prev) => prev.filter((t) => t.grantId !== id));
     setInvoices?.((prev) => prev.filter((i) => i.grantId !== id));
     setStaff?.((prev) => prev.map((s) => ({ ...s, allocations: (s.allocations || []).filter((a) => a.grantId !== id) })));
+    setRestrictedFunds?.((prev) => prev.filter((r) => r.grantId !== id));
     logActivity?.("Grant", "Deleted", g?.title || "Untitled grant");
     setConfirm(null);
     setExpanded(null);
@@ -4560,7 +4578,7 @@ function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true
   );
 }
 
-function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, isAdmin, canEdit, logActivity }) {
+function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, setRestrictedFunds, isAdmin, canEdit, logActivity }) {
   const [confirm, setConfirm] = useState(null);
 
   const labelFor = (t) => {
@@ -4597,6 +4615,7 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
             return { ...s, allocations: [...(s.allocations || []), ...match.allocations] };
           }));
         }
+        if (t.extra?.restrictedFunds?.length) setRestrictedFunds?.((prev) => [...prev, ...t.extra.restrictedFunds]);
         break;
       case "costCenter":
         setCostCenters((prev) => [...prev, t.data]);
@@ -6983,6 +7002,306 @@ const paceColor = {
   "Not started": "#8A8F87", "No budget period set": "#8A8F87",
 };
 
+// Sums a grant's real EXPENSE actuals for one specific calendar month across
+// every Template budget covering it — used to auto-compute a Restricted
+// Funds release. Deliberately uses only real recorded actuals (never the
+// cross-year run-rate projection used elsewhere), since this is a ledger of
+// what actually happened, not a forecast.
+function grantMonthlyExpenseActual(grantId, budgets, year, monthIndex) {
+  const templateBudgets = budgets.filter((b) => b.grantId === grantId && b.budgetType === "Template" && (b.status === "Active" || b.status === "Awarded"));
+  let total = 0;
+  templateBudgets.forEach((b) => {
+    if (!b.periodStart || !b.periodEnd) return;
+    const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+    const idx = cols.findIndex((c) => c.year === year && c.monthIndex === monthIndex);
+    if (idx === -1) return;
+    b.lines.forEach((l) => {
+      if (l.type !== "expense") return;
+      total += Number((l.actuals || [])[idx]) || 0;
+    });
+  });
+  return total;
+}
+
+// Walks a grant's Restricted Funds record forward, month by month, from its
+// beginning balance to the later of "today" or its latest dated entry —
+// producing a real running balance rather than isolated monthly figures,
+// since that's what a restricted-funds ledger actually needs to answer
+// "how much is currently still restricted."
+function computeRestrictedFundsLedger(record, grantId, budgets) {
+  if (!record || !record.beginningBalanceDate) return { rows: [], currentBalance: 0 };
+  const start = new Date(record.beginningBalanceDate + "T00:00:00");
+  let y = start.getUTCFullYear();
+  let m = start.getUTCMonth();
+
+  const entriesByKey = {};
+  (record.entries || []).forEach((e) => { entriesByKey[`${e.year}-${e.monthIndex}`] = e; });
+
+  const today = new Date();
+  let endYear = today.getFullYear();
+  let endMonth = today.getMonth();
+  (record.entries || []).forEach((e) => {
+    if (e.year > endYear || (e.year === endYear && e.monthIndex > endMonth)) { endYear = e.year; endMonth = e.monthIndex; }
+  });
+
+  const rows = [];
+  let balance = Number(record.beginningBalance) || 0;
+  let guard = 0;
+  while ((y < endYear || (y === endYear && m <= endMonth)) && guard < 600) {
+    guard++;
+    const entry = entriesByKey[`${y}-${m}`];
+    const added = entry ? Number(entry.added) || 0 : 0;
+    const mode = entry?.releaseMode || "auto";
+    const released = mode === "manual" ? (Number(entry?.manualRelease) || 0) : grantMonthlyExpenseActual(grantId, budgets, y, m);
+    balance = balance + added - released;
+    rows.push({ year: y, monthIndex: m, added, released, mode, balance });
+    m++;
+    if (m > 11) { m = 0; y++; }
+  }
+  return { rows, currentBalance: balance };
+}
+
+function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFunds, canEdit, logActivity }) {
+  const [view, setView] = useState("summary"); // summary | grant
+  const [selectedGrantId, setSelectedGrantId] = useState("");
+
+  const eligibleGrants = grants.filter((g) => g.stage === "Active" || g.stage === "Awarded" || g.stage === "Closing" || g.stage === "Closed");
+  const recordByGrant = {};
+  restrictedFunds.forEach((r) => { recordByGrant[r.grantId] = r; });
+
+  const summaryRows = eligibleGrants
+    .map((g) => {
+      const record = recordByGrant[g.id];
+      if (!record) return null;
+      const { currentBalance } = computeRestrictedFundsLedger(record, g.id, budgets);
+      return { grant: g, currentBalance };
+    })
+    .filter(Boolean);
+  const orgTotal = summaryRows.reduce((a, r) => a + r.currentBalance, 0);
+  const untracked = eligibleGrants.filter((g) => !recordByGrant[g.id]);
+
+  const selectedGrant = grants.find((g) => g.id === selectedGrantId);
+  const selectedRecord = recordByGrant[selectedGrantId];
+  const ledger = selectedRecord ? computeRestrictedFundsLedger(selectedRecord, selectedGrantId, budgets) : { rows: [], currentBalance: 0 };
+
+  const updateRecord = (patch) => {
+    setRestrictedFunds((prev) => prev.map((r) => (r.id === selectedRecord.id ? { ...r, ...patch } : r)));
+  };
+  const updateEntry = (year, monthIndex, patch) => {
+    const entries = [...(selectedRecord.entries || [])];
+    const idx = entries.findIndex((e) => e.year === year && e.monthIndex === monthIndex);
+    if (idx === -1) entries.push({ id: uid(), year, monthIndex, added: 0, releaseMode: "auto", manualRelease: 0, ...patch });
+    else entries[idx] = { ...entries[idx], ...patch };
+    updateRecord({ entries });
+  };
+
+  const seedFromAward = () => {
+    const startDateStr = selectedGrant.start ? selectedGrant.start.slice(0, 7) + "-01" : new Date().toISOString().slice(0, 10);
+    const d = new Date(startDateStr + "T00:00:00");
+    const record = {
+      id: uid(), grantId: selectedGrantId,
+      beginningBalance: 0,
+      beginningBalanceDate: startDateStr,
+      entries: [{ id: uid(), year: d.getUTCFullYear(), monthIndex: d.getUTCMonth(), added: Number(selectedGrant.awardAmount) || 0, releaseMode: "auto", manualRelease: 0 }],
+    };
+    setRestrictedFunds((prev) => [...prev, record]);
+    logActivity?.("Restricted Funds", "Created", `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title} (seeded from award amount)`);
+  };
+
+  const startCustom = () => {
+    const record = {
+      id: uid(), grantId: selectedGrantId,
+      beginningBalance: 0,
+      beginningBalanceDate: new Date().toISOString().slice(0, 10),
+      entries: [],
+    };
+    setRestrictedFunds((prev) => [...prev, record]);
+  };
+
+  const [addFundsOpen, setAddFundsOpen] = useState(false);
+  const [addFundsMonth, setAddFundsMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [addFundsAmount, setAddFundsAmount] = useState("");
+  const addFunds = () => {
+    const [y, m] = addFundsMonth.split("-").map(Number);
+    const entries = [...(selectedRecord.entries || [])];
+    const idx = entries.findIndex((e) => e.year === y && e.monthIndex === m - 1);
+    const amt = Number(addFundsAmount) || 0;
+    if (idx === -1) entries.push({ id: uid(), year: y, monthIndex: m - 1, added: amt, releaseMode: "auto", manualRelease: 0 });
+    else entries[idx] = { ...entries[idx], added: (Number(entries[idx].added) || 0) + amt };
+    updateRecord({ entries });
+    logActivity?.("Restricted Funds", "Updated", `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title} — added ${fmt(amt)} restricted funds`);
+    setAddFundsOpen(false);
+    setAddFundsAmount("");
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Restricted Funds</h1>
+          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
+            Temporarily restricted net assets — tracked as a running balance per grant, independent of any single budget's fiscal year. Releases are auto-computed from that month's real grant expense actuals unless manually overridden.
+          </p>
+        </div>
+        <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
+          <button onClick={() => setView("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "summary" ? "#1F5C6B" : "#FFFFFF", color: view === "summary" ? "#FFFFFF" : "#5B6B66" }}>Org Summary</button>
+          <button onClick={() => setView("grant")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "grant" ? "#1F5C6B" : "#FFFFFF", color: view === "grant" ? "#FFFFFF" : "#5B6B66" }}>By Grant</button>
+        </div>
+      </div>
+
+      {view === "summary" && (
+        <div className="space-y-4">
+          <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+            <div className="text-xs" style={{ color: "#8A8F87" }}>TOTAL RESTRICTED BALANCE, ORG-WIDE</div>
+            <div className="text-2xl font-display mt-1" style={{ color: "#1C2624" }}>{fmt(orgTotal)}</div>
+          </div>
+          <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ background: "#F6F7F3" }}>
+                  <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant</th>
+                  <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Current restricted balance</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summaryRows.map(({ grant, currentBalance }) => (
+                  <tr key={grant.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: "#E1E5DE" }} onClick={() => { setSelectedGrantId(grant.id); setView("grant"); }}>
+                    <td className="px-4 py-2" style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</td>
+                    <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(currentBalance)}</td>
+                  </tr>
+                ))}
+                {summaryRows.length === 0 && (
+                  <tr><td colSpan={2} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          {untracked.length > 0 && (
+            <p className="text-xs" style={{ color: "#8A8F87" }}>
+              {untracked.length} grant{untracked.length === 1 ? "" : "s"} not yet tracked here — switch to "By Grant" to set one up.
+            </p>
+          )}
+        </div>
+      )}
+
+      {view === "grant" && (
+        <div className="space-y-4">
+          <div className="max-w-md">
+            <GrantPicker grants={eligibleGrants} value={selectedGrantId} onChange={setSelectedGrantId} placeholder="Select a grant" />
+          </div>
+
+          {!selectedGrantId ? (
+            <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Select a grant to view its restricted funds ledger.</div>
+          ) : !selectedRecord ? (
+            <div className="bg-white rounded-lg border p-6" style={{ borderColor: "#E1E5DE" }}>
+              <p className="text-sm mb-4" style={{ color: "#5B6B66" }}>No Restricted Funds record exists yet for this grant.</p>
+              {canEdit && (
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={seedFromAward} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>
+                    Start from award amount ({fmt(selectedGrant?.awardAmount)})
+                  </button>
+                  <button onClick={startCustom} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+                    Set a custom beginning balance instead
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+                  <Field label="Beginning balance">
+                    <input type="number" disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.beginningBalance} onChange={(e) => updateRecord({ beginningBalance: e.target.value })} />
+                  </Field>
+                  <Field label="As-of date">
+                    <input type="date" disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.beginningBalanceDate} onChange={(e) => updateRecord({ beginningBalanceDate: e.target.value })} />
+                  </Field>
+                  <div>
+                    <div className="text-xs font-medium mb-1" style={{ color: "#5B6B66" }}>Current restricted balance</div>
+                    <div className="text-xl font-display" style={{ color: "#1C2624" }}>{fmt(ledger.currentBalance)}</div>
+                  </div>
+                </div>
+                {canEdit && (
+                  addFundsOpen ? (
+                    <div className="flex items-end gap-2 p-3 rounded-md" style={{ background: "#F6F7F3" }}>
+                      <Field label="Month">
+                        <input type="month" className={inputCls} style={inputStyle} value={addFundsMonth} onChange={(e) => setAddFundsMonth(e.target.value)} />
+                      </Field>
+                      <Field label="Amount">
+                        <input type="number" className={inputCls} style={inputStyle} value={addFundsAmount} onChange={(e) => setAddFundsAmount(e.target.value)} />
+                      </Field>
+                      <button onClick={addFunds} className="text-sm px-4 py-2 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Add</button>
+                      <button onClick={() => setAddFundsOpen(false)} className="text-sm px-4 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setAddFundsOpen(true)} className="text-sm inline-flex items-center gap-1" style={{ color: "#1F5C6B" }}>
+                      <Plus size={14} /> Add restricted funds (e.g. an amendment or supplemental award)
+                    </button>
+                  )
+                )}
+              </div>
+
+              <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr style={{ background: "#F6F7F3" }}>
+                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Month</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Added</th>
+                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Release mode</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Released</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Running balance</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ledger.rows.map((row) => {
+                      const autoValue = grantMonthlyExpenseActual(selectedGrantId, budgets, row.year, row.monthIndex);
+                      return (
+                        <tr key={`${row.year}-${row.monthIndex}`} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                          <td className="px-3 py-1.5" style={{ color: "#1C2624" }}>{MONTHS[row.monthIndex]} {row.year}</td>
+                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{row.added ? fmt(row.added) : "—"}</td>
+                          <td className="px-3 py-1.5">
+                            <select
+                              disabled={!canEdit}
+                              className="text-xs rounded border px-1.5 py-1"
+                              style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+                              value={row.mode}
+                              onChange={(e) => updateEntry(row.year, row.monthIndex, { releaseMode: e.target.value, manualRelease: e.target.value === "manual" ? autoValue : 0 })}
+                            >
+                              <option value="auto">Auto</option>
+                              <option value="manual">Manual override</option>
+                            </select>
+                          </td>
+                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>
+                            {row.mode === "manual" && canEdit ? (
+                              <input
+                                type="number"
+                                className="text-xs rounded border px-1.5 py-1 text-right w-28"
+                                style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+                                value={row.released}
+                                onChange={(e) => updateEntry(row.year, row.monthIndex, { manualRelease: e.target.value })}
+                              />
+                            ) : (
+                              <span style={{ color: row.mode === "manual" ? "#C08A2E" : "#1C2624" }}>{row.released ? fmt(row.released) : "—"}</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(row.balance) ? "#2F6F53" : "#B5443A" }}>{fmt(row.balance)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-xs" style={{ color: "#8A8F87" }}>
+                "Auto" pulls that month's real expense actuals from this grant's Grant Budget(s) — not a projection. Switch a month to "Manual override" to enter the release yourself.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BurnRateView({ grants, budgets }) {
   const withBudgets = grants.filter((g) => budgets.some((b) => b.grantId === g.id && b.budgetType === "Operational"));
 
@@ -7285,7 +7604,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [] }) {
   const [showHealthCheck, setShowHealthCheck] = useState(false);
 
   // Runs the same categories of checks we've done manually against backup
@@ -7355,8 +7674,16 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
       }
     });
 
+    (restrictedFunds || []).forEach((r) => {
+      const g = grantById[r.grantId];
+      const { currentBalance } = computeRestrictedFundsLedger(r, r.grantId, budgets);
+      if (currentBalance < -0.01) {
+        issues.push({ level: "error", area: "Restricted Funds", text: `"${g ? (g.programCode ? g.programCode + " - " : "") + g.title : "Unknown grant"}" has a negative restricted balance (${fmt(currentBalance)}) — more has been released than was ever added.` });
+      }
+    });
+
     return issues;
-  }, [grants, budgets, reports, tasks, costCenters]);
+  }, [grants, budgets, reports, tasks, costCenters, restrictedFunds]);
 
   const issueCounts = { error: 0, warn: 0, info: 0 };
   healthIssues.forEach((i) => { issueCounts[i.level] = (issueCounts[i.level] || 0) + 1; });
@@ -7954,6 +8281,7 @@ const NAV = [
   { key: "org-budget", label: "Org Budget", icon: PieChart },
   { key: "scenarios", label: "Scenarios", icon: FlaskConical },
   { key: "burn-rate", label: "Burn Rate", icon: TrendingUp },
+  { key: "restricted-funds", label: "Restricted Funds", icon: Lock },
   { key: "personnel", label: "Personnel", icon: Users },
   { key: "activity-log", label: "Activity Log", icon: History },
   { key: "trash", label: "Trash", icon: Trash2 },
@@ -7982,6 +8310,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const [trash, setTrash] = useState([]);
   const [paylocityProgramMap, setPaylocityProgramMap] = useState([]);
   const [paylocityLastImport, setPaylocityLastImport] = useState(null);
+  const [restrictedFunds, setRestrictedFunds] = useState([]);
   const [announcement, setAnnouncement] = useState(null);
   const [announcementDismissed, setAnnouncementDismissed] = useState(false);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
@@ -8081,6 +8410,10 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     try {
       const pli = await withTimeout(loadData("grantflow:paylocitylastimport"));
       if (pli) setPaylocityLastImport(pli);
+    } catch (e) { /* no data yet */ }
+    try {
+      const rf = await withTimeout(loadData("grantflow:restrictedfunds"));
+      if (rf) setRestrictedFunds(rf);
     } catch (e) { /* no data yet */ }
     try {
       const tr = await withTimeout(loadData("grantflow:trash"));
@@ -8190,6 +8523,11 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:paylocitylastimport", paylocityLastImport, "Paylocity last import");
   }, [paylocityLastImport, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:restrictedfunds", restrictedFunds, "Restricted funds");
+  }, [restrictedFunds, loaded]);
 
   useEffect(() => {
     if (!loaded || isSyncingRef.current) return;
@@ -8362,11 +8700,11 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             </button>
           </div>
         )}
-        <main className="flex-1 px-4 md:px-8 py-4 md:py-8" style={{ maxWidth: (tab === "grant-reports" || tab === "org-budget" || tab === "burn-rate") ? "100%" : "72rem" }}>
+        <main className="flex-1 px-4 md:px-8 py-4 md:py-8" style={{ maxWidth: (tab === "grant-reports" || tab === "org-budget" || tab === "burn-rate" || tab === "restricted-funds") ? "100%" : "72rem" }}>
         {!loaded ? (
           <div className="text-sm" style={{ color: "#8A8F87" }}>Loading…</div>
         ) : tab === "dashboard" ? (
-          <Dashboard grants={grants} budgets={budgets} reports={reports} tasks={tasks} staff={staff} invoices={invoices} goTo={goTo} costCenters={costCenters} budgetGroups={budgetGroups} />
+          <Dashboard grants={grants} budgets={budgets} reports={reports} tasks={tasks} staff={staff} invoices={invoices} goTo={goTo} costCenters={costCenters} budgetGroups={budgetGroups} restrictedFunds={restrictedFunds} />
         ) : tab === "grants" ? (
           <GrantsView
             key={pendingNewGrant ? "grants-new" : pendingExpandGrantId ? `grants-expand-${pendingExpandGrantId}` : "grants"}
@@ -8375,6 +8713,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
             setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             autoOpenNew={pendingNewGrant} initialExpandId={pendingExpandGrantId} goTo={goTo} logActivity={logActivity}
+            restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
           />
         ) : tab === "budgets" ? (
           <BudgetsView
@@ -8419,6 +8758,11 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           />
         ) : tab === "burn-rate" ? (
           <BurnRateView grants={grants} budgets={budgets} />
+        ) : tab === "restricted-funds" ? (
+          <RestrictedFundsView
+            grants={grants} budgets={budgets} restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
+            canEdit={canEdit} logActivity={logActivity}
+          />
         ) : tab === "personnel" ? (
           <PersonnelView
             key={pendingOpenStaffId ? `staff-open-${pendingOpenStaffId}` : "personnel"}
@@ -8436,6 +8780,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             trash={trash} setTrash={setTrash}
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setTasks={setTasks}
             setInvoices={setInvoices} setStaff={setStaff} setCostCenters={setCostCenters} setScenarios={setScenarios}
+            setRestrictedFunds={setRestrictedFunds}
             isAdmin={isAdmin} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "data" ? (
@@ -8444,6 +8789,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setTrash={setTrash} setActivity={setActivity}
             canEdit={canEdit}
             logActivity={logActivity}
+            restrictedFunds={restrictedFunds}
           />
         ) : tab === "user-access" && isAdmin ? (
           <AdminPanel currentUserEmail={currentUserEmail || whoami} />
