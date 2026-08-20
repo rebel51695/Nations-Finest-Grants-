@@ -7200,6 +7200,71 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
     programRollup[groupName].releases += r.totalReleased;
   });
 
+  const [exporting, setExporting] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+
+  const exportTrnaExcel = async () => {
+    setExporting(true);
+    try {
+      const HEADER_FILL = "FFF6F7F3";
+      const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("TRNA Tracker");
+
+      const header = ["Fund / Restriction", "Donor / Source", "Program", "Restriction Type", "Start Date", "End Date", "Beginning Balance", "Restricted Revenue", "Releases from Restriction", "Adjustments", "Ending Balance", "Release %", "Status", "Over/Under Flag"];
+      ws.mergeCells(1, 1, 1, header.length);
+      ws.getCell(1, 1).value = "Nation's Finest — TRNA Rollforward Detail";
+      ws.getCell(1, 1).font = { bold: true, size: 13 };
+      ws.mergeCells(2, 1, 2, header.length);
+      ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}`;
+      ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+      const headerRowIdx = 4;
+      ws.getRow(headerRowIdx).values = header;
+      ws.getRow(headerRowIdx).eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+      });
+
+      let r = headerRowIdx + 1;
+      summaryRows.forEach(({ grant, currentBalance, totalAdded, totalReleased, status, needsReview }) => {
+        const record = recordByGrant[grant.id];
+        const sortedEntries = [...(record.entries || [])].sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
+        const seedAdded = sortedEntries[0]?.added || 0;
+        const adjustments = totalAdded - seedAdded;
+        const pct = totalAdded > 0 ? totalReleased / totalAdded : 0;
+        const groupName = budgetGroups.find((bg) => bg.id === grant.budgetGroupId)?.name || "";
+        ws.getRow(r).values = [
+          grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title,
+          grant.funding || "",
+          groupName,
+          record.restrictionType || "Time & Purpose",
+          grant.start ? fmtDate(grant.start) : "",
+          grant.end ? fmtDate(grant.end) : "",
+          round2(record.beginningBalance),
+          round2(seedAdded),
+          round2(-totalReleased),
+          round2(adjustments),
+          round2(currentBalance),
+          pct,
+          status,
+          needsReview ? "Past End Date - Review" : "OK",
+        ];
+        [7, 8, 9, 10, 11].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
+        ws.getCell(r, 12).numFmt = "0%";
+        r++;
+      });
+
+      ws.columns = [{ width: 36 }, { width: 16 }, { width: 28 }, { width: 16 }, { width: 12 }, { width: 12 }, { width: 15 }, { width: 15 }, { width: 18 }, { width: 14 }, { width: 15 }, { width: 10 }, { width: 15 }, { width: 20 }];
+      ws.views = [{ state: "frozen", ySplit: headerRowIdx }];
+
+      const buffer = await wb.xlsx.writeBuffer();
+      downloadFile("nations-finest-trna-tracker.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const selectedGrant = grants.find((g) => g.id === selectedGrantId);
   const selectedRecord = recordByGrant[selectedGrantId];
   const ledger = selectedRecord ? computeRestrictedFundsLedger(selectedRecord, selectedGrantId, budgets) : { rows: [], currentBalance: 0, totalAdded: 0, totalReleased: 0 };
@@ -7257,6 +7322,13 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
     setAddFundsAmount("");
   };
 
+  const deleteRecord = () => {
+    const label = `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title}`;
+    if (!window.confirm(`Stop tracking Restricted Funds for "${label}"? This removes its entire ledger — beginning balance, every month's entries, and history. This can't be undone.`)) return;
+    setRestrictedFunds((prev) => prev.filter((r) => r.id !== selectedRecord.id));
+    logActivity?.("Restricted Funds", "Deleted", label);
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -7266,9 +7338,19 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
             Temporarily restricted net assets — tracked as a running balance per grant, independent of any single budget's fiscal year. Releases are auto-computed from that month's real grant expense actuals unless manually overridden.
           </p>
         </div>
-        <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
-          <button onClick={() => setView("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "summary" ? "#1F5C6B" : "#FFFFFF", color: view === "summary" ? "#FFFFFF" : "#5B6B66" }}>Org Summary</button>
-          <button onClick={() => setView("grant")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "grant" ? "#1F5C6B" : "#FFFFFF", color: view === "grant" ? "#FFFFFF" : "#5B6B66" }}>By Grant</button>
+        <div className="flex items-center gap-2 shrink-0">
+          {canEdit && (
+            <button onClick={() => setShowImport(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Upload size={15} /> Import Excel
+            </button>
+          )}
+          <button onClick={exportTrnaExcel} disabled={exporting} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exporting ? 0.6 : 1 }}>
+            <Download size={15} /> {exporting ? "Building…" : "Export Excel"}
+          </button>
+          <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
+            <button onClick={() => setView("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "summary" ? "#1F5C6B" : "#FFFFFF", color: view === "summary" ? "#FFFFFF" : "#5B6B66" }}>Org Summary</button>
+            <button onClick={() => setView("grant")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "grant" ? "#1F5C6B" : "#FFFFFF", color: view === "grant" ? "#FFFFFF" : "#5B6B66" }}>By Grant</button>
+          </div>
         </div>
       </div>
 
@@ -7470,11 +7552,242 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
               <p className="text-xs" style={{ color: "#8A8F87" }}>
                 "Auto" pulls that month's real expense actuals from this grant's Grant Budget(s) — not a projection. Switch a month to "Manual override" to enter the release yourself.
               </p>
+              {canEdit && (
+                <div className="pt-2 border-t" style={{ borderColor: "#E1E5DE" }}>
+                  <button onClick={deleteRecord} className="text-xs inline-flex items-center gap-1" style={{ color: "#B5443A" }}>
+                    <Trash2 size={13} /> Delete Restricted Funds tracking for this grant
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
       )}
+      {showImport && (
+        <RestrictedFundsImportModal
+          grants={grants}
+          restrictedFunds={restrictedFunds}
+          setRestrictedFunds={setRestrictedFunds}
+          logActivity={logActivity}
+          onClose={() => setShowImport(false)}
+        />
+      )}
     </div>
+  );
+}
+
+function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFunds, logActivity, onClose }) {
+  const [step, setStep] = useState("upload"); // upload -> link -> review -> done
+  const [error, setError] = useState("");
+  const [rows, setRows] = useState(null); // parsed rows from the sheet
+  const [linkDraft, setLinkDraft] = useState({}); // row index -> grantId | "__skip__"
+  const [conflictDraft, setConflictDraft] = useState({}); // grantId -> "replace" | "skip"
+
+  const parseFile = async (file) => {
+    setError("");
+    setRows(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const dataSheetName = wb.SheetNames.find((n) => /tracker1|detail/i.test(n)) || wb.SheetNames.find((n) => n !== "Lists" && n !== "Dashboard") || wb.SheetNames[0];
+      const sheet = wb.Sheets[dataSheetName];
+      const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+      const headerRowIdx = aoa.findIndex((row) => row && row.some((c) => typeof c === "string" && c.trim() === "Fund / Restriction"));
+      if (headerRowIdx === -1) {
+        setError('Couldn\'t find the "Fund / Restriction" header row — make sure this is the TRNA Tracker detail sheet.');
+        return;
+      }
+      const header = aoa[headerRowIdx];
+      const col = (name) => header.findIndex((c) => c === name);
+      const cFund = col("Fund / Restriction"), cType = col("Restriction Type"), cBeg = col("Beginning Balance"),
+        cRev = col("Restricted Revenue"), cRel = col("Releases from Restriction"), cAdj = col("Adjustments");
+
+      const parsed = [];
+      for (let i = headerRowIdx + 1; i < aoa.length; i++) {
+        const row = aoa[i];
+        if (!row || !row[cFund]) continue;
+        const fundLabel = String(row[cFund]).trim();
+        const code = fundLabel.split(" - ")[0].trim();
+        const restrictedRevenue = Number(row[cRev]) || 0;
+        const releases = Math.abs(Number(row[cRel]) || 0);
+        const adjustments = Number(row[cAdj]) || 0;
+        const beginningBalance = Number(row[cBeg]) || 0;
+        const restrictionType = RESTRICTION_TYPES.includes(row[cType]) ? row[cType] : "Time & Purpose";
+        parsed.push({ fundLabel, code, restrictedRevenue, releases, adjustments, beginningBalance, restrictionType });
+      }
+      if (parsed.length === 0) {
+        setError("No data rows were found under the header row.");
+        return;
+      }
+      setRows(parsed);
+      setStep("link");
+    } catch (e) {
+      setError("Couldn't read that file — make sure it's the TRNA Tracker workbook.");
+    }
+  };
+
+  // Match each row to a grant by the leading code in "Fund / Restriction" —
+  // exact match only. A compound reference (e.g. multiple codes combined
+  // into one row) won't match anything and needs a manual pick, same as
+  // every other importer in this app.
+  const suggestedGrant = (code) => grants.find((g) => g.programCode && String(g.programCode).trim() === code);
+  const unmatchedRows = (rows || []).map((r, i) => ({ ...r, index: i })).filter((r) => !suggestedGrant(r.code));
+
+  const goToReview = () => {
+    const finalized = { ...linkDraft };
+    unmatchedRows.forEach((r) => {
+      if (finalized[r.index] === undefined) finalized[r.index] = "__skip__";
+    });
+    setLinkDraft(finalized);
+    setStep("review");
+  };
+
+  const resolvedRows = (rows || [])
+    .map((r, i) => {
+      const linked = linkDraft[i];
+      const grantId = linked && linked !== "__skip__" ? linked : suggestedGrant(r.code)?.id;
+      if (!grantId) return null;
+      const grant = grants.find((g) => g.id === grantId);
+      const existing = restrictedFunds.find((rf) => rf.grantId === grantId);
+      return { ...r, index: i, grant, existing };
+    })
+    .filter(Boolean);
+
+  const applyImport = () => {
+    const today = new Date();
+    let created = 0, updated = 0, skipped = 0;
+    setRestrictedFunds((prev) => {
+      let next = [...prev];
+      resolvedRows.forEach((r) => {
+        if (r.existing && conflictDraft[r.grant.id] !== "replace") { skipped++; return; }
+        const record = {
+          id: r.existing?.id || uid(),
+          grantId: r.grant.id,
+          beginningBalance: r.beginningBalance,
+          beginningBalanceDate: `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-01`,
+          restrictionType: r.restrictionType,
+          entries: [{
+            id: uid(), year: today.getFullYear(), monthIndex: today.getMonth(),
+            added: r.restrictedRevenue + r.adjustments, releaseMode: "manual", manualRelease: r.releases,
+          }],
+        };
+        if (r.existing) { next = next.map((x) => (x.id === r.existing.id ? record : x)); updated++; }
+        else { next = [...next, record]; created++; }
+      });
+      return next;
+    });
+    logActivity?.("Restricted Funds", "Updated", `Imported from TRNA Tracker Excel — ${created} created, ${updated} updated, ${skipped} skipped`);
+    setStep("done");
+  };
+
+  return (
+    <Modal title="Import from TRNA Tracker Excel" onClose={onClose} wide>
+      {step === "upload" && (
+        <div className="space-y-4">
+          <p className="text-sm" style={{ color: "#5B6B66" }}>
+            Upload the TRNA Tracker workbook. Each row becomes a starting snapshot — beginning balance, total restricted revenue, and total releases as of today — with releases marked as a manual entry so nothing here silently recomputes from budget actuals until you choose to.
+          </p>
+          <Field label="TRNA Tracker workbook (.xlsx)">
+            <input type="file" accept=".xlsx" className={inputCls} style={inputStyle} onChange={(e) => e.target.files[0] && parseFile(e.target.files[0])} />
+          </Field>
+          {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={onClose} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {step === "link" && (
+        <div className="space-y-4">
+          {unmatchedRows.length === 0 ? (
+            <p className="text-sm" style={{ color: "#5B6B66" }}>Every row matched a grant by its program code. Continue to review.</p>
+          ) : (
+            <>
+              <p className="text-sm" style={{ color: "#5B6B66" }}>
+                These rows didn't match a grant's program code exactly (often because the "Fund / Restriction" cell combines more than one code) — pick the right grant, or skip the row.
+              </p>
+              <div className="space-y-2 max-h-96 overflow-y-auto">
+                {unmatchedRows.map((r) => (
+                  <div key={r.index} className="flex items-center gap-2 p-2 rounded-md border" style={{ borderColor: "#E1E5DE" }}>
+                    <div className="text-sm flex-1" style={{ color: "#1C2624" }}>{r.fundLabel}</div>
+                    <select
+                      className={inputCls} style={{ ...inputStyle, flex: 1 }}
+                      value={linkDraft[r.index] ?? "__skip__"}
+                      onChange={(e) => setLinkDraft((d) => ({ ...d, [r.index]: e.target.value }))}
+                    >
+                      <option value="__skip__">Skip this row</option>
+                      {grants.map((g) => <option key={g.id} value={g.id}>{g.programCode ? `${g.programCode} - ${g.title}` : g.title}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={() => setStep("upload")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
+            <button onClick={goToReview} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Continue</button>
+          </div>
+        </div>
+      )}
+
+      {step === "review" && (
+        <div className="space-y-4">
+          <p className="text-xs px-3 py-2 rounded-md" style={{ background: "#F6F7F3", color: "#5B6B66" }}>
+            {resolvedRows.length} of {rows.length} rows matched to a grant. For any grant that already has tracking, choose whether to replace it or leave it as-is.
+          </p>
+          <div className="max-h-96 overflow-y-auto rounded-md border" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-xs">
+              <thead>
+                <tr style={{ background: "#F6F7F3", color: "#5B6B66" }}>
+                  <th className="text-left px-2 py-1.5">Grant</th>
+                  <th className="text-right px-2 py-1.5">Beginning</th>
+                  <th className="text-right px-2 py-1.5">Restricted Rev.</th>
+                  <th className="text-right px-2 py-1.5">Releases</th>
+                  <th className="text-left px-2 py-1.5">If already tracked</th>
+                </tr>
+              </thead>
+              <tbody>
+                {resolvedRows.map((r) => (
+                  <tr key={r.index} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                    <td className="px-2 py-1" style={{ color: "#1C2624" }}>{r.grant.programCode ? `${r.grant.programCode} - ${r.grant.title}` : r.grant.title}</td>
+                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.beginningBalance)}</td>
+                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.restrictedRevenue + r.adjustments)}</td>
+                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.releases)}</td>
+                    <td className="px-2 py-1">
+                      {r.existing ? (
+                        <select
+                          className="text-xs rounded border px-1.5 py-1"
+                          style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+                          value={conflictDraft[r.grant.id] || "skip"}
+                          onChange={(e) => setConflictDraft((d) => ({ ...d, [r.grant.id]: e.target.value }))}
+                        >
+                          <option value="skip">Already tracked — skip</option>
+                          <option value="replace">Replace existing</option>
+                        </select>
+                      ) : (
+                        <span style={{ color: "#2F6F53" }}>New</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <button onClick={() => setStep("link")} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back</button>
+            <button onClick={applyImport} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Apply import</button>
+          </div>
+        </div>
+      )}
+
+      {step === "done" && (
+        <div className="space-y-4 text-center py-6">
+          <CheckCircle size={28} style={{ color: "#2F6F53", margin: "0 auto" }} />
+          <p className="text-sm" style={{ color: "#1C2624" }}>Import applied.</p>
+          <button onClick={onClose} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>Done</button>
+        </div>
+      )}
+    </Modal>
   );
 }
 
