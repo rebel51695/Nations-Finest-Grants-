@@ -1220,7 +1220,7 @@ function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
   );
 }
 
-function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivity, onSave, onClose, onDelete }) {
+function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, deleteBudgetGroup, logActivity, onSave, onClose, onDelete }) {
   const [form, setForm] = useState(costCenter || { id: uid(), name: "", description: "", budgetGroupId: "" });
   const [bgModal, setBgModal] = useState(null);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
@@ -1234,6 +1234,7 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivit
     setForm((f) => ({ ...f, budgetGroupId: bg.id }));
     setBgModal(null);
   };
+  const currentGroup = budgetGroups?.find((bg) => bg.id === form.budgetGroupId);
 
   return (
     <Modal title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
@@ -1247,6 +1248,9 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivit
               <option value="">No group</option>
               {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
             </select>
+            {currentGroup && (
+              <button onClick={() => setBgModal(currentGroup)} className="shrink-0 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>Edit</button>
+            )}
             <button onClick={() => setBgModal("new")} className="shrink-0 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>+ New</button>
           </div>
         </Field>
@@ -1269,12 +1273,24 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, logActivit
           </button>
         </div>
       </div>
-      {bgModal && <BudgetGroupModal budgetGroup={bgModal === "new" ? null : bgModal} onSave={saveBudgetGroup} onClose={() => setBgModal(null)} />}
+      {bgModal && (
+        <BudgetGroupModal
+          budgetGroup={bgModal === "new" ? null : bgModal}
+          onSave={saveBudgetGroup}
+          onClose={() => setBgModal(null)}
+          onDelete={bgModal === "new" ? undefined : () => {
+            const deleted = deleteBudgetGroup?.(bgModal.id);
+            if (!deleted) return;
+            if (form.budgetGroupId === bgModal.id) setForm((f) => ({ ...f, budgetGroupId: "" }));
+            setBgModal(null);
+          }}
+        />
+      )}
     </Modal>
   );
 }
 
-function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit = true, onSave, onClose }) {
+function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, logActivity, canEdit = true, onSave, onClose }) {
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(grant || {
     id: uid(), title: "", programCode: "", funding: "", sites: [], stage: "Prospecting",
     awardAmount: 0, start: "", end: "", riskStatus: "Low", cadence: [],
@@ -1387,6 +1403,9 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
               <option value="">No group</option>
               {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
             </select>
+            {budgetGroups?.find((bg) => bg.id === form.budgetGroupId) && (
+              <button onClick={() => setBgModal(budgetGroups.find((bg) => bg.id === form.budgetGroupId))} className="shrink-0 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>Edit</button>
+            )}
             <button onClick={() => setBgModal("new")} className="shrink-0 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>+ New</button>
           </div>
         </Field>
@@ -1453,7 +1472,19 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
           </button>
         )}
       </div>
-      {bgModal && canEdit && <BudgetGroupModal budgetGroup={bgModal === "new" ? null : bgModal} onSave={saveBudgetGroup} onClose={() => setBgModal(null)} />}
+      {bgModal && canEdit && (
+        <BudgetGroupModal
+          budgetGroup={bgModal === "new" ? null : bgModal}
+          onSave={saveBudgetGroup}
+          onClose={() => setBgModal(null)}
+          onDelete={bgModal === "new" ? undefined : () => {
+            const deleted = deleteBudgetGroup?.(bgModal.id);
+            if (!deleted) return;
+            if (form.budgetGroupId === bgModal.id) setForm((f) => ({ ...f, budgetGroupId: "" }));
+            setBgModal(null);
+          }}
+        />
+      )}
     </Modal>
   );
 }
@@ -2487,7 +2518,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, cos
   );
 }
 
-function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, canEdit, autoOpenNew, initialExpandId, goTo, logActivity, restrictedFunds, setRestrictedFunds }) {
+function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGroups, setBudgetGroups, setGrants, setBudgets, setReports, setTasks, setStaff, setInvoices, setTrash, currentUserEmail, canEdit, autoOpenNew, initialExpandId, goTo, logActivity, restrictedFunds, setRestrictedFunds, deleteBudgetGroup }) {
   const [search, setSearch] = useState("");
   const [stageFilter, setStageFilter] = useState("All");
   const [riskFilter, setRiskFilter] = useState("All");
@@ -2725,7 +2756,7 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
         </div>
       )}
 
-      {modal && <GrantModal grant={modal === "new" ? null : modal} budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} logActivity={logActivity} canEdit={canEdit} onSave={saveGrant} onClose={() => setModal(null)} />}
+      {modal && <GrantModal grant={modal === "new" ? null : modal} budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} deleteBudgetGroup={deleteBudgetGroup} logActivity={logActivity} canEdit={canEdit} onSave={saveGrant} onClose={() => setModal(null)} />}
       {confirm && (
         <ConfirmModal
           message="This moves the grant, all of its budgets, invoices, linked grant reports and tasks to Trash, and removes it from any staff allocations. It can be restored from Trash later if needed."
@@ -2737,7 +2768,7 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
   );
 }
 
-function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, setTrash, currentUserEmail, canEdit, initialOpenBudgetId, logActivity }) {
+function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelectedGrantId, costCenters, setCostCenters, selectedCostCenterId, setSelectedCostCenterId, budgetGroups, setBudgetGroups, setTrash, currentUserEmail, canEdit, initialOpenBudgetId, logActivity, deleteBudgetGroup }) {
   const [modal, setModal] = useState(() => (initialOpenBudgetId ? budgets.find((b) => b.id === stripNonce(initialOpenBudgetId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [ccModal, setCcModal] = useState(null); // null | "new" | costCenter object
@@ -3157,6 +3188,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           costCenter={ccModal === "new" ? null : ccModal}
           budgetGroups={budgetGroups}
           setBudgetGroups={setBudgetGroups}
+          deleteBudgetGroup={deleteBudgetGroup}
           logActivity={logActivity}
           onSave={saveCostCenter}
           onClose={() => setCcModal(null)}
@@ -8728,6 +8760,20 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     })();
   }, [loaded]);
 
+  // Centralized here (rather than in the Grant/Cost Center modals themselves)
+  // since a budget group can be referenced by both grants and cost centers —
+  // deleting it needs to unassign it from both, which only this level can see.
+  const deleteBudgetGroup = (id) => {
+    const bg = budgetGroups.find((b) => b.id === id);
+    const affected = grants.filter((g) => g.budgetGroupId === id).length + costCenters.filter((c) => c.budgetGroupId === id).length;
+    if (!window.confirm(`Delete budget group "${bg?.name || "Untitled"}"?${affected > 0 ? ` It's currently assigned to ${affected} grant(s)/cost center(s), which will be unassigned (set to "No group").` : ""}`)) return false;
+    setBudgetGroups((prev) => prev.filter((b) => b.id !== id));
+    setGrants((prev) => prev.map((g) => (g.budgetGroupId === id ? { ...g, budgetGroupId: "" } : g)));
+    setCostCenters((prev) => prev.map((c) => (c.budgetGroupId === id ? { ...c, budgetGroupId: "" } : c)));
+    logActivity?.("Budget Group", "Deleted", `${bg?.name || "Untitled budget group"}${affected > 0 ? ` (unassigned from ${affected} record(s))` : ""}`);
+    return true;
+  };
+
   const navNonceRef = useRef(0);
   const goTo = (nextTab, action, grantId, recordId) => {
     setTab(nextTab);
@@ -8858,7 +8904,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             key={pendingNewGrant ? "grants-new" : pendingExpandGrantId ? `grants-expand-${pendingExpandGrantId}` : "grants"}
             grants={grants} budgets={budgets} reports={reports} tasks={tasks} invoices={invoices} setGrants={setGrants} setBudgets={setBudgets}
             setReports={setReports} setTasks={setTasks} setStaff={setStaff} setInvoices={setInvoices} staff={staff}
-            budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
+            budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} deleteBudgetGroup={deleteBudgetGroup}
             setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             autoOpenNew={pendingNewGrant} initialExpandId={pendingExpandGrantId} goTo={goTo} logActivity={logActivity}
             restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
@@ -8870,7 +8916,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             selectedGrantId={selectedGrantId} setSelectedGrantId={setSelectedGrantId}
             costCenters={costCenters} setCostCenters={setCostCenters}
             selectedCostCenterId={selectedCostCenterId} setSelectedCostCenterId={setSelectedCostCenterId}
-            budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups}
+            budgetGroups={budgetGroups} setBudgetGroups={setBudgetGroups} deleteBudgetGroup={deleteBudgetGroup}
             setTrash={setTrash} currentUserEmail={currentUserEmail || whoami} canEdit={canEdit}
             initialOpenBudgetId={pendingOpenBudgetId} logActivity={logActivity}
           />
