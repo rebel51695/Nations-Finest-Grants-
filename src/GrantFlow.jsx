@@ -1460,7 +1460,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, logActivity, canEdit
 
 // ---------- budget form ----------
 
-function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [], budgets = [] }) {
+function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [], budgets = [], costCenters = [] }) {
   const initial = budget
     ? { ...budget, linkedBudgetIds: budget.linkedBudgetIds || (budget.linkedBudgetId ? [budget.linkedBudgetId] : []) }
     : {
@@ -1469,6 +1469,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       approvedBy: "", approvedAt: "", rejectionReason: "",
     };
   const [form, setForm, undoForm, canUndoForm] = useUndoableState(initial);
+  const [ownerType, setOwnerType] = useState(initial.costCenterId ? "costCenter" : "grant");
   const [approverName, setApproverName] = useState("");
   const [rejectReason, setRejectReason] = useState("");
   const [showRejectBox, setShowRejectBox] = useState(false);
@@ -1636,6 +1637,42 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
       </div>
 
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
+      <div className="mb-4">
+        <span className="block text-xs font-medium mb-1" style={{ color: "#5B6B66" }}>Grant / Cost Center</span>
+        <div className="flex items-center gap-2">
+          <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
+            <button
+              type="button"
+              onClick={() => { setOwnerType("grant"); setForm({ ...form, costCenterId: "" }); }}
+              className="px-3 py-2 text-xs font-medium"
+              style={{ background: ownerType === "grant" ? "#1F5C6B" : "#FFFFFF", color: ownerType === "grant" ? "#FFFFFF" : "#5B6B66" }}
+            >
+              Grant
+            </button>
+            <button
+              type="button"
+              onClick={() => { setOwnerType("costCenter"); setForm({ ...form, grantId: "" }); }}
+              className="px-3 py-2 text-xs font-medium"
+              style={{ background: ownerType === "costCenter" ? "#1F5C6B" : "#FFFFFF", color: ownerType === "costCenter" ? "#FFFFFF" : "#5B6B66" }}
+            >
+              Cost Center
+            </button>
+          </div>
+          {ownerType === "grant" ? (
+            <div className="flex-1">
+              <GrantPicker grants={grants} value={form.grantId} onChange={(v) => setForm({ ...form, grantId: v })} placeholder="Select a grant" />
+            </div>
+          ) : (
+            <select className={inputCls} style={inputStyle} value={form.costCenterId} onChange={(e) => setForm({ ...form, costCenterId: e.target.value })}>
+              <option value="">Select a cost center</option>
+              {costCenters.map((cc) => <option key={cc.id} value={cc.id}>{cc.name}</option>)}
+            </select>
+          )}
+        </div>
+        <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
+          Reassigning this moves the budget to a different grant or cost center — it will stop showing under its current one.
+        </p>
+      </div>
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-4">
         <Field label="Budget title">
           <input className={inputCls} style={inputStyle} value={form.title} onChange={set("title")} placeholder="e.g. FY26 Operating Budget" />
@@ -3109,6 +3146,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           currentUserEmail={currentUserEmail}
           grants={grants}
           budgets={budgets}
+          costCenters={costCenters}
         />
       )}
       {confirm && (
@@ -7028,8 +7066,13 @@ function grantMonthlyExpenseActual(grantId, budgets, year, monthIndex) {
 // producing a real running balance rather than isolated monthly figures,
 // since that's what a restricted-funds ledger actually needs to answer
 // "how much is currently still restricted."
+// Nonprofit TRNA convention for how a restriction is released — matches how
+// the org already thinks about this in its Excel tracker.
+const RESTRICTION_TYPES = ["Time", "Purpose", "Time & Purpose"];
+const isEffectivelyZero = (n) => Math.abs(Math.round((Number(n) || 0) * 100)) < 1;
+
 function computeRestrictedFundsLedger(record, grantId, budgets) {
-  if (!record || !record.beginningBalanceDate) return { rows: [], currentBalance: 0 };
+  if (!record || !record.beginningBalanceDate) return { rows: [], currentBalance: 0, totalAdded: 0, totalReleased: 0 };
   const start = new Date(record.beginningBalanceDate + "T00:00:00");
   let y = start.getUTCFullYear();
   let m = start.getUTCMonth();
@@ -7046,6 +7089,8 @@ function computeRestrictedFundsLedger(record, grantId, budgets) {
 
   const rows = [];
   let balance = Number(record.beginningBalance) || 0;
+  let totalAdded = 0;
+  let totalReleased = 0;
   let guard = 0;
   while ((y < endYear || (y === endYear && m <= endMonth)) && guard < 600) {
     guard++;
@@ -7054,14 +7099,32 @@ function computeRestrictedFundsLedger(record, grantId, budgets) {
     const mode = entry?.releaseMode || "auto";
     const released = mode === "manual" ? (Number(entry?.manualRelease) || 0) : grantMonthlyExpenseActual(grantId, budgets, y, m);
     balance = balance + added - released;
+    totalAdded += added;
+    totalReleased += released;
     rows.push({ year: y, monthIndex: m, added, released, mode, balance });
     m++;
     if (m > 11) { m = 0; y++; }
   }
-  return { rows, currentBalance: balance };
+  return { rows, currentBalance: balance, totalAdded, totalReleased };
 }
 
-function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFunds, canEdit, logActivity }) {
+// "Open" while there's still an unreleased balance; "Fully Released" once
+// it's effectively zero — mirrors the status column in the org's TRNA
+// tracker rather than showing a raw, sometimes-noisy dollar figure alone.
+function restrictedFundsStatus(currentBalance) {
+  return isEffectivelyZero(currentBalance) ? "Fully Released" : "Open";
+}
+
+// Flags a grant whose period has already ended but which still shows an
+// unreleased restricted balance — usually either unspent funds needing
+// attention or a gap in recorded actuals. Matches the org's own tracker's
+// "Past End Date - Review" flag.
+function restrictedFundsNeedsReview(grant, currentBalance) {
+  if (!grant?.end || isEffectivelyZero(currentBalance)) return false;
+  return new Date(grant.end + "T00:00:00") < new Date();
+}
+
+function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFunds, budgetGroups = [], canEdit, logActivity }) {
   const [view, setView] = useState("summary"); // summary | grant
   const [selectedGrantId, setSelectedGrantId] = useState("");
 
@@ -7073,16 +7136,42 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
     .map((g) => {
       const record = recordByGrant[g.id];
       if (!record) return null;
-      const { currentBalance } = computeRestrictedFundsLedger(record, g.id, budgets);
-      return { grant: g, currentBalance };
+      const { currentBalance, totalAdded, totalReleased } = computeRestrictedFundsLedger(record, g.id, budgets);
+      const status = restrictedFundsStatus(currentBalance);
+      const needsReview = restrictedFundsNeedsReview(g, currentBalance);
+      return { grant: g, currentBalance, totalAdded, totalReleased, status, needsReview };
     })
     .filter(Boolean);
   const orgTotal = summaryRows.reduce((a, r) => a + r.currentBalance, 0);
   const untracked = eligibleGrants.filter((g) => !recordByGrant[g.id]);
 
+  // Org-wide dashboard figures, matching the shape of the org's own Excel
+  // TRNA tracker's Dashboard tab.
+  const dashTotals = {
+    beginningBalance: restrictedFunds.reduce((a, r) => a + (Number(r.beginningBalance) || 0), 0),
+    restrictedRevenue: summaryRows.reduce((a, r) => a + r.totalAdded, 0),
+    releases: summaryRows.reduce((a, r) => a + r.totalReleased, 0),
+    endingBalance: orgTotal,
+    openItems: summaryRows.filter((r) => r.status === "Open").length,
+    reviewItems: summaryRows.filter((r) => r.needsReview).length,
+  };
+
+  // Rollup by budget group ("bucket"), the org's equivalent of the
+  // tracker's Program-level breakdown.
+  const programRollup = {};
+  summaryRows.forEach((r) => {
+    const groupId = r.grant.budgetGroupId || "__none__";
+    const groupName = budgetGroups.find((bg) => bg.id === groupId)?.name || "Ungrouped";
+    if (!programRollup[groupName]) programRollup[groupName] = { endingBalance: 0, restrictedRevenue: 0, releases: 0 };
+    programRollup[groupName].endingBalance += r.currentBalance;
+    programRollup[groupName].restrictedRevenue += r.totalAdded;
+    programRollup[groupName].releases += r.totalReleased;
+  });
+
   const selectedGrant = grants.find((g) => g.id === selectedGrantId);
   const selectedRecord = recordByGrant[selectedGrantId];
-  const ledger = selectedRecord ? computeRestrictedFundsLedger(selectedRecord, selectedGrantId, budgets) : { rows: [], currentBalance: 0 };
+  const ledger = selectedRecord ? computeRestrictedFundsLedger(selectedRecord, selectedGrantId, budgets) : { rows: [], currentBalance: 0, totalAdded: 0, totalReleased: 0 };
+  const releasePct = ledger.totalAdded > 0 ? (ledger.totalReleased / ledger.totalAdded) * 100 : 0;
 
   const updateRecord = (patch) => {
     setRestrictedFunds((prev) => prev.map((r) => (r.id === selectedRecord.id ? { ...r, ...patch } : r)));
@@ -7102,6 +7191,7 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
       id: uid(), grantId: selectedGrantId,
       beginningBalance: 0,
       beginningBalanceDate: startDateStr,
+      restrictionType: "Time & Purpose",
       entries: [{ id: uid(), year: d.getUTCFullYear(), monthIndex: d.getUTCMonth(), added: Number(selectedGrant.awardAmount) || 0, releaseMode: "auto", manualRelease: 0 }],
     };
     setRestrictedFunds((prev) => [...prev, record]);
@@ -7113,6 +7203,7 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
       id: uid(), grantId: selectedGrantId,
       beginningBalance: 0,
       beginningBalanceDate: new Date().toISOString().slice(0, 10),
+      restrictionType: "Time & Purpose",
       entries: [],
     };
     setRestrictedFunds((prev) => [...prev, record]);
@@ -7151,27 +7242,70 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
 
       {view === "summary" && (
         <div className="space-y-4">
-          <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-            <div className="text-xs" style={{ color: "#8A8F87" }}>TOTAL RESTRICTED BALANCE, ORG-WIDE</div>
-            <div className="text-2xl font-display mt-1" style={{ color: "#1C2624" }}>{fmt(orgTotal)}</div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+            <StatCard label="Beginning balance" value={fmt(dashTotals.beginningBalance)} />
+            <StatCard label="Restricted revenue" value={fmt(dashTotals.restrictedRevenue)} />
+            <StatCard label="Releases" value={fmt(-dashTotals.releases)} />
+            <StatCard label="Ending balance" value={fmt(dashTotals.endingBalance)} />
+            <StatCard label="Open items" value={dashTotals.openItems} />
+            <StatCard label="Items to review" value={dashTotals.reviewItems} />
           </div>
+
+          {Object.keys(programRollup).length > 0 && (
+            <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+              <div className="px-4 py-2 text-xs font-medium" style={{ background: "#F6F7F3", color: "#5B6B66" }}>By budget group</div>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr style={{ background: "#F6F7F3" }}>
+                    <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Budget group</th>
+                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Ending balance</th>
+                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Restricted revenue</th>
+                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Releases</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(programRollup).map(([name, t]) => (
+                    <tr key={name} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                      <td className="px-4 py-2" style={{ color: "#1C2624" }}>{name}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(t.endingBalance)}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(t.restrictedRevenue)}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(-t.releases)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
             <table className="w-full text-sm">
               <thead>
                 <tr style={{ background: "#F6F7F3" }}>
                   <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant</th>
                   <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Current restricted balance</th>
+                  <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Release %</th>
+                  <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {summaryRows.map(({ grant, currentBalance }) => (
-                  <tr key={grant.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: "#E1E5DE" }} onClick={() => { setSelectedGrantId(grant.id); setView("grant"); }}>
-                    <td className="px-4 py-2" style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</td>
-                    <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(currentBalance)}</td>
-                  </tr>
-                ))}
+                {summaryRows.map(({ grant, currentBalance, totalAdded, totalReleased, status, needsReview }) => {
+                  const pct = totalAdded > 0 ? (totalReleased / totalAdded) * 100 : 0;
+                  return (
+                    <tr key={grant.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: "#E1E5DE" }} onClick={() => { setSelectedGrantId(grant.id); setView("grant"); }}>
+                      <td className="px-4 py-2" style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(currentBalance)}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{pct.toFixed(0)}%</td>
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          <Badge color={status === "Fully Released" ? "#8A8F87" : "#2F6F53"}>{status}</Badge>
+                          {needsReview && <Badge color="#B5443A">Past End Date - Review</Badge>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
                 {summaryRows.length === 0 && (
-                  <tr><td colSpan={2} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
+                  <tr><td colSpan={4} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
                 )}
               </tbody>
             </table>
@@ -7209,17 +7343,27 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
           ) : (
             <div className="space-y-4">
               <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-4">
                   <Field label="Beginning balance">
                     <input type="number" disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.beginningBalance} onChange={(e) => updateRecord({ beginningBalance: e.target.value })} />
                   </Field>
                   <Field label="As-of date">
                     <input type="date" disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.beginningBalanceDate} onChange={(e) => updateRecord({ beginningBalanceDate: e.target.value })} />
                   </Field>
+                  <Field label="Restriction type">
+                    <select disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.restrictionType || "Time & Purpose"} onChange={(e) => updateRecord({ restrictionType: e.target.value })}>
+                      {RESTRICTION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </Field>
                   <div>
                     <div className="text-xs font-medium mb-1" style={{ color: "#5B6B66" }}>Current restricted balance</div>
                     <div className="text-xl font-display" style={{ color: "#1C2624" }}>{fmt(ledger.currentBalance)}</div>
                   </div>
+                </div>
+                <div className="flex items-center gap-2 mb-4">
+                  <Badge color={restrictedFundsStatus(ledger.currentBalance) === "Fully Released" ? "#8A8F87" : "#2F6F53"}>{restrictedFundsStatus(ledger.currentBalance)}</Badge>
+                  {restrictedFundsNeedsReview(selectedGrant, ledger.currentBalance) && <Badge color="#B5443A">Past End Date - Review</Badge>}
+                  <span className="text-xs" style={{ color: "#8A8F87" }}>Release {releasePct.toFixed(0)}% ({fmt(ledger.totalReleased)} of {fmt(ledger.totalAdded)})</span>
                 </div>
                 {canEdit && (
                   addFundsOpen ? (
@@ -7676,9 +7820,13 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
 
     (restrictedFunds || []).forEach((r) => {
       const g = grantById[r.grantId];
+      const label = g ? (g.programCode ? g.programCode + " - " : "") + g.title : "Unknown grant";
       const { currentBalance } = computeRestrictedFundsLedger(r, r.grantId, budgets);
       if (currentBalance < -0.01) {
-        issues.push({ level: "error", area: "Restricted Funds", text: `"${g ? (g.programCode ? g.programCode + " - " : "") + g.title : "Unknown grant"}" has a negative restricted balance (${fmt(currentBalance)}) — more has been released than was ever added.` });
+        issues.push({ level: "error", area: "Restricted Funds", text: `"${label}" has a negative restricted balance (${fmt(currentBalance)}) — more has been released than was ever added.` });
+      }
+      if (restrictedFundsNeedsReview(g, currentBalance)) {
+        issues.push({ level: "warn", area: "Restricted Funds", text: `"${label}"'s grant period has ended but its restricted balance still shows ${fmt(currentBalance)} unreleased — review for unspent funds or missing actuals.` });
       }
     });
 
@@ -8761,7 +8909,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
         ) : tab === "restricted-funds" ? (
           <RestrictedFundsView
             grants={grants} budgets={budgets} restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
-            canEdit={canEdit} logActivity={logActivity}
+            budgetGroups={budgetGroups} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "personnel" ? (
           <PersonnelView
