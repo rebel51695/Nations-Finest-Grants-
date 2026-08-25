@@ -6534,8 +6534,8 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
 
           <div className="mb-4">
             <p className="text-xs font-medium mb-1.5" style={{ color: "#5B6B66" }}>Expected activity this period</p>
-            {!form.grantId || !form.periodStart || !form.periodEnd ? (
-              <p className="text-xs" style={{ color: "#8A8F87" }}>Set the grant and invoice period above to pull expected budget categories.</p>
+            {(!form.grantId && !form.costCenterId) || !form.periodStart || !form.periodEnd ? (
+              <p className="text-xs" style={{ color: "#8A8F87" }}>Set the grant or cost center and invoice period above to pull expected budget categories.</p>
             ) : expectedCategories.length === 0 ? (
               <p className="text-xs" style={{ color: "#8A8F87" }}>No budgeted activity found for this grant in this period.</p>
             ) : (
@@ -6683,7 +6683,7 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
-              onClick={() => { if (!form.grantId) return; onSave(form); }}
+              onClick={() => { if (!form.grantId && !form.costCenterId) return; onSave(form); }}
               className="px-4 py-2 rounded-md text-sm text-white"
               style={{ background: "#1F5C6B" }}
             >
@@ -7399,6 +7399,7 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
                   <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Current restricted balance</th>
                   <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Release %</th>
                   <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Status</th>
+                  <th className="px-4 py-2"></th>
                 </tr>
               </thead>
               <tbody>
@@ -7415,11 +7416,28 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
                           {needsReview && <Badge color="#B5443A">Past End Date - Review</Badge>}
                         </div>
                       </td>
+                      <td className="px-4 py-2 text-right">
+                        {canEdit && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const label = grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title;
+                              if (!window.confirm(`Stop tracking Restricted Funds for "${label}"? This removes its entire ledger — beginning balance, every month's entries, and history. This can't be undone.`)) return;
+                              const record = recordByGrant[grant.id];
+                              setRestrictedFunds((prev) => prev.filter((r) => r.id !== record.id));
+                              logActivity?.("Restricted Funds", "Deleted", label);
+                            }}
+                            title="Delete Restricted Funds tracking for this grant"
+                          >
+                            <Trash2 size={15} style={{ color: "#B5443A" }} />
+                          </button>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}
                 {summaryRows.length === 0 && (
-                  <tr><td colSpan={4} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
+                  <tr><td colSpan={5} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
                 )}
               </tbody>
             </table>
