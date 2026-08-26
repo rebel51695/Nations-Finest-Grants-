@@ -2541,6 +2541,83 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
       return (a.title || "").localeCompare(b.title || "");
     });
 
+  const [exportingGrants, setExportingGrants] = useState(false);
+  const exportGrantsExcel = async () => {
+    setExportingGrants(true);
+    try {
+      const HEADER_FILL = "FFF6F7F3";
+      const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("Grants");
+
+      const header = [
+        "Program Code", "Title", "Stage", "Funding Source", "Budget Group", "Site(s)",
+        "Award Amount", "Award Amount Remaining", "Start Date", "End Date", "Risk", "Renewal",
+        "Reporting Cadence", "Compliance Owner", "Finance Owner", "Internal Owner", "Operations Owner",
+        "Payment Method", "Indirect Cost Rate (%)",
+      ];
+      ws.mergeCells(1, 1, 1, header.length);
+      ws.getCell(1, 1).value = "Nation's Finest — Grants";
+      ws.getCell(1, 1).font = { bold: true, size: 13 };
+      ws.mergeCells(2, 1, 2, header.length);
+      const filterNote = [
+        search ? `search "${search}"` : null,
+        stageFilter !== "All" ? `stage: ${stageFilter}` : null,
+        riskFilter !== "All" ? `risk: ${riskFilter}` : null,
+      ].filter(Boolean).join(", ");
+      ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}${filterNote ? ` — filtered by ${filterNote}` : ""} — ${filtered.length} grant${filtered.length === 1 ? "" : "s"}`;
+      ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+      const headerRowIdx = 4;
+      ws.getRow(headerRowIdx).values = header;
+      ws.getRow(headerRowIdx).eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+      });
+
+      let r = headerRowIdx + 1;
+      filtered.forEach((g) => {
+        const groupName = budgetGroups.find((bg) => bg.id === g.budgetGroupId)?.name || "";
+        ws.getRow(r).values = [
+          g.programCode || "",
+          g.title || "",
+          g.stage || "",
+          g.funding || "",
+          groupName,
+          (g.sites || []).join(", "),
+          round2(g.awardAmount),
+          round2(g.awardAmountRemaining),
+          g.start ? fmtDate(g.start) : "",
+          g.end ? fmtDate(g.end) : "",
+          g.riskStatus || "",
+          g.renewal ? "Yes" : "No",
+          (g.cadence || []).join(", "),
+          g.complianceOwner || "",
+          g.financeOwner || "",
+          g.internalOwner || "",
+          g.operationsOwner || "",
+          g.paymentMethod || "",
+          g.indirectRate || 0,
+        ];
+        ws.getCell(r, 7).numFmt = "$#,##0";
+        ws.getCell(r, 8).numFmt = "$#,##0";
+        r++;
+      });
+
+      ws.columns = [
+        { width: 14 }, { width: 34 }, { width: 12 }, { width: 20 }, { width: 20 }, { width: 20 },
+        { width: 15 }, { width: 17 }, { width: 12 }, { width: 12 }, { width: 8 }, { width: 9 },
+        { width: 18 }, { width: 18 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 14 }, { width: 12 },
+      ];
+      ws.views = [{ state: "frozen", ySplit: headerRowIdx }];
+
+      const buffer = await wb.xlsx.writeBuffer();
+      downloadFile("nations-finest-grants.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } finally {
+      setExportingGrants(false);
+    }
+  };
+
   const saveGrant = (g) => {
     const prevGrant = grants.find((x) => x.id === g.id);
     const justClosed = prevGrant && prevGrant.stage !== "Closed" && g.stage === "Closed";
@@ -2598,11 +2675,16 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Grants</h1>
-        {canEdit && (
-          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-            <Plus size={16} /> New grant
+        <div className="flex items-center gap-2">
+          <button onClick={exportGrantsExcel} disabled={exportingGrants} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exportingGrants ? 0.6 : 1 }}>
+            <Download size={16} /> {exportingGrants ? "Building…" : "Export Excel"}
           </button>
-        )}
+          {canEdit && (
+            <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+              <Plus size={16} /> New grant
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
