@@ -5597,6 +5597,8 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const [statusFilter, setStatusFilter] = useState("All");
   const [sortBy, setSortBy] = useState("name");
   const [showImport, setShowImport] = useState(false);
+  const [costViewMode, setCostViewMode] = useState("summary");
+  const [monthlyGrantId, setMonthlyGrantId] = useState("");
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const visible = staff
@@ -5664,37 +5666,92 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
         <StatCard label="Grants with allocated staff" value={Object.keys(costByGrant).length} />
       </div>
 
-      {Object.keys(costByGrant).length > 0 && (
-        <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Personnel cost by grant</h2>
-          <div className="space-y-1.5 text-sm">
-            {Object.entries(costByGrant).map(([grantId, cost]) => {
-              const g = grants.find((x) => x.id === grantId);
-              return (
-                <div key={grantId} className="flex items-center justify-between">
-                  <span style={{ color: "#1C2624" }}>{g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "Unknown grant"}</span>
-                  <span style={{ color: "#1C2624", fontVariantNumeric: "tabular-nums" }}>{fmt(cost)}</span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
+      <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+        <button onClick={() => setCostViewMode("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: costViewMode === "summary" ? "#1F5C6B" : "#FFFFFF", color: costViewMode === "summary" ? "#FFFFFF" : "#5B6B66" }}>Summary</button>
+        <button onClick={() => setCostViewMode("monthly")} className="px-3 py-2 text-sm font-medium" style={{ background: costViewMode === "monthly" ? "#1F5C6B" : "#FFFFFF", color: costViewMode === "monthly" ? "#FFFFFF" : "#5B6B66" }}>By Grant, Monthly</button>
+      </div>
+
+      {costViewMode === "summary" && (
+        <>
+          {Object.keys(costByGrant).length > 0 && (
+            <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+              <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Personnel cost by grant</h2>
+              <div className="space-y-1.5 text-sm">
+                {Object.entries(costByGrant).map(([grantId, cost]) => {
+                  const g = grants.find((x) => x.id === grantId);
+                  return (
+                    <div key={grantId} className="flex items-center justify-between">
+                      <span style={{ color: "#1C2624" }}>{g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "Unknown grant"}</span>
+                      <span style={{ color: "#1C2624", fontVariantNumeric: "tabular-nums" }}>{fmt(cost)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {Object.keys(costByCostCenter).length > 0 && (
+            <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
+              <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Personnel cost by cost center</h2>
+              <div className="space-y-1.5 text-sm">
+                {Object.entries(costByCostCenter).map(([ccId, cost]) => {
+                  const cc = (costCenters || []).find((x) => x.id === ccId);
+                  return (
+                    <div key={ccId} className="flex items-center justify-between">
+                      <span style={{ color: "#1C2624" }}>{cc ? cc.name : "Unknown cost center"}</span>
+                      <span style={{ color: "#1C2624", fontVariantNumeric: "tabular-nums" }}>{fmt(cost)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
-      {Object.keys(costByCostCenter).length > 0 && (
-        <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-base mb-3" style={{ color: "#1C2624" }}>Personnel cost by cost center</h2>
-          <div className="space-y-1.5 text-sm">
-            {Object.entries(costByCostCenter).map(([ccId, cost]) => {
-              const cc = (costCenters || []).find((x) => x.id === ccId);
-              return (
-                <div key={ccId} className="flex items-center justify-between">
-                  <span style={{ color: "#1C2624" }}>{cc ? cc.name : "Unknown cost center"}</span>
-                  <span style={{ color: "#1C2624", fontVariantNumeric: "tabular-nums" }}>{fmt(cost)}</span>
-                </div>
-              );
-            })}
+      {costViewMode === "monthly" && (
+        <div className="space-y-4">
+          <div className="max-w-md">
+            <GrantPicker grants={grants} value={monthlyGrantId} onChange={setMonthlyGrantId} placeholder="Select a grant" />
           </div>
+          {!monthlyGrantId ? (
+            <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Select a grant to see its fully-loaded personnel cost, month by month.</div>
+          ) : (() => {
+            const months = grantAllMonths(monthlyGrantId, budgets);
+            if (months.length === 0) {
+              return <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>No Grant Budget found for this grant yet.</div>;
+            }
+            return (
+              <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+                <div className="px-4 py-2 text-xs" style={{ background: "#F6F7F3", color: "#5B6B66" }}>
+                  Sourced from "Wages and Benefits" Actuals on this grant's Template budget — the same figures a Paylocity Compensation import writes. No projection; a month with no import yet just shows a dash.
+                </div>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr style={{ background: "#F6F7F3" }}>
+                      <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Month</th>
+                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Wages</th>
+                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Taxes & benefits</th>
+                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Fully-loaded total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {months.map((col) => {
+                      const { wages, taxAndBenefits, total } = grantMonthlyWagesAndBenefits(monthlyGrantId, budgets, col.year, col.monthIndex);
+                      return (
+                        <tr key={`${col.year}-${col.monthIndex}`} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                          <td className="px-4 py-1.5" style={{ color: "#1C2624" }}>{MONTHS[col.monthIndex]} {col.year}</td>
+                          <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{wages ? fmt(wages) : "—"}</td>
+                          <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{taxAndBenefits ? fmt(taxAndBenefits) : "—"}</td>
+                          <td className="px-4 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{total ? fmt(total) : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -7091,6 +7148,47 @@ function grantMonthlyExpenseActual(grantId, budgets, year, monthIndex) {
     });
   });
   return total;
+}
+
+// Fully-loaded personnel cost for one grant, one calendar month — sourced
+// from the "Wages and Benefits" category's real Actuals on that grant's
+// Template budget(s), split into wages vs. taxes & benefits the same way
+// the org-wide Personnel stat cards are. This is what a Paylocity
+// Compensation import actually writes, so it reflects real payroll history
+// exactly as far back as those imports go — no projection, no estimate.
+function grantMonthlyWagesAndBenefits(grantId, budgets, year, monthIndex) {
+  const templateBudgets = budgets.filter((b) => b.grantId === grantId && b.budgetType === "Template" && (b.status === "Active" || b.status === "Awarded"));
+  let wages = 0, taxAndBenefits = 0;
+  templateBudgets.forEach((b) => {
+    if (!b.periodStart || !b.periodEnd) return;
+    const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+    const idx = cols.findIndex((c) => c.year === year && c.monthIndex === monthIndex);
+    if (idx === -1) return;
+    b.lines.forEach((l) => {
+      if (l.category !== "Wages and Benefits") return;
+      const v = Number((l.actuals || [])[idx]) || 0;
+      if (l.subcategory === "5900 - Payroll taxes and benefits") taxAndBenefits += v;
+      else wages += v;
+    });
+  });
+  return { wages, taxAndBenefits, total: wages + taxAndBenefits };
+}
+
+// Every calendar month covered by any of a grant's Template budgets,
+// chronologically — the natural timeline for a month-over-month view, since
+// a grant's history can span more than one budget object over time.
+function grantAllMonths(grantId, budgets) {
+  const templateBudgets = budgets.filter((b) => b.grantId === grantId && b.budgetType === "Template" && (b.status === "Active" || b.status === "Awarded"));
+  const seen = new Set();
+  const months = [];
+  templateBudgets.forEach((b) => {
+    if (!b.periodStart || !b.periodEnd) return;
+    monthColumnsForBudget(b.periodStart, b.periodEnd).forEach((c) => {
+      const key = `${c.year}-${c.monthIndex}`;
+      if (!seen.has(key)) { seen.add(key); months.push(c); }
+    });
+  });
+  return months.sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
 }
 
 // Walks a grant's Restricted Funds record forward, month by month, from its
