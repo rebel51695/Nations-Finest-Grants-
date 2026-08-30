@@ -2858,6 +2858,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [duplicatePrompt, setDuplicatePrompt] = useState(null); // the budget being duplicated, or null
   const [overviewSearch, setOverviewSearch] = useState("");
   const [overviewSort, setOverviewSort] = useState({ key: "title", dir: "asc" });
+  const [overviewTypeFilter, setOverviewTypeFilter] = useState("All");
   const [showExcelImport, setShowExcelImport] = useState(false);
 
   const grant = grants.find((g) => g.id === selectedGrantId);
@@ -3028,7 +3029,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const overviewRows = useMemo(() => {
     const q = overviewSearch.trim().toLowerCase();
     let rows = allBudgetsEnriched.filter((b) =>
-      !q || b.title.toLowerCase().includes(q) || b.ownerName.toLowerCase().includes(q) || (b.fy || "").toLowerCase().includes(q)
+      (!q || b.title.toLowerCase().includes(q) || b.ownerName.toLowerCase().includes(q) || (b.fy || "").toLowerCase().includes(q)) &&
+      (overviewTypeFilter === "All" || b.budgetType === overviewTypeFilter)
     );
     rows = [...rows].sort((a, b) => {
       const dir = overviewSort.dir === "asc" ? 1 : -1;
@@ -3037,7 +3039,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       return ((av ?? 0) - (bv ?? 0)) * dir;
     });
     return rows;
-  }, [allBudgetsEnriched, overviewSearch, overviewSort]);
+  }, [allBudgetsEnriched, overviewSearch, overviewTypeFilter, overviewSort]);
 
   const toggleOverviewSort = (key) => setOverviewSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
 
@@ -3095,13 +3097,24 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
         <div className="flex items-center justify-between mb-3">
           <h2 className="font-display text-sm" style={{ color: "#1C2624" }}>All budgets</h2>
-          <input
-            value={overviewSearch}
-            onChange={(e) => setOverviewSearch(e.target.value)}
-            placeholder="Search by title, grant, or FY…"
-            className={inputCls}
-            style={{ ...inputStyle, maxWidth: 280 }}
-          />
+          <div className="flex items-center gap-2">
+            <select
+              value={overviewTypeFilter}
+              onChange={(e) => setOverviewTypeFilter(e.target.value)}
+              className={inputCls}
+              style={{ ...inputStyle, maxWidth: 160 }}
+            >
+              <option value="All">All types</option>
+              {BUDGET_TYPES.map((t) => <option key={t} value={t}>{budgetTypeLabel(t)}</option>)}
+            </select>
+            <input
+              value={overviewSearch}
+              onChange={(e) => setOverviewSearch(e.target.value)}
+              placeholder="Search by title, grant, or FY…"
+              className={inputCls}
+              style={{ ...inputStyle, maxWidth: 280 }}
+            />
+          </div>
         </div>
         {overviewRows.length === 0 ? (
           <p className="text-sm py-4 text-center" style={{ color: "#8A8F87" }}>No budgets match your search.</p>
