@@ -8304,7 +8304,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [] }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [], setRestrictedFunds, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport }) {
   const [showHealthCheck, setShowHealthCheck] = useState(false);
 
   // Runs the same categories of checks we've done manually against backup
@@ -8329,10 +8329,14 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         return;
       }
       const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      const canonicalCategoryNames = new Set(CATEGORIES.map((c) => c.name));
       (b.lines || []).forEach((l) => {
         const amtLen = (l.amounts || []).length;
         if (amtLen > 0 && amtLen < cols.length) {
           issues.push({ level: "warn", area: "Budgets", text: `"${b.title}" — line "${l.category}${l.subcategory ? "/" + l.subcategory : ""}" has fewer months of data (${amtLen}) than its period (${cols.length}).` });
+        }
+        if (l.category && !canonicalCategoryNames.has(l.category) && lineTotal(l) + lineActualTotal(l) !== 0) {
+          issues.push({ level: "error", area: "Budgets", text: `"${b.title}" — line "${l.category}${l.subcategory ? "/" + l.subcategory : ""}" has real dollars but its category doesn't match GrantFlow's list. It's currently invisible on Org Budget — not shown in any row, and excluded from Total Revenue/Expense/Net entirely. Fix by re-selecting the correct category on this line.` });
         }
         (l.actuals || []).forEach((v, i) => {
           if (Number(v) < 0) issues.push({ level: "info", area: "Budgets", text: `"${b.title}" — "${l.category}${l.subcategory ? "/" + l.subcategory : ""}" has a negative actual in ${cols[i]?.label || `month ${i + 1}`}.` });
@@ -8406,7 +8410,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
@@ -8443,9 +8447,9 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   };
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport]);
 
   const copyBackupText = async () => {
     try {
@@ -8476,8 +8480,11 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.scenarios)) setScenarios(data.scenarios);
         if (Array.isArray(data.trash)) setTrash(data.trash);
         if (Array.isArray(data.activity)) setActivity(data.activity);
+        if (Array.isArray(data.restrictedFunds)) setRestrictedFunds?.(data.restrictedFunds);
+        if (Array.isArray(data.paylocityProgramMap)) setPaylocityProgramMap?.(data.paylocityProgramMap);
+        if (data.paylocityLastImport) setPaylocityLastImport?.(data.paylocityLastImport);
         logActivity?.("Data", "Restored", `Restored from backup file "${file.name}"`);
-        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups, ${data.scenarios?.length || 0} scenarios.`);
+        setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups, ${data.scenarios?.length || 0} scenarios, ${data.restrictedFunds?.length || 0} restricted funds records.`);
       } catch (err) {
         setRestoreError("Couldn't read that file — make sure it's a GrantFlow backup JSON exported from this app.");
       }
@@ -9267,7 +9274,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       } catch (e) { /* no meta yet */ }
       if (meta?.lastBackupDate === today) return; // already backed up today
       try {
-        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity };
+        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport };
         await window.storage.set(`grantflow:autobackup:${today}`, JSON.stringify(payload), true);
         await window.storage.set(metaKey, JSON.stringify({ lastBackupDate: today }), true);
         const list = await window.storage.list("grantflow:autobackup:", true);
@@ -9507,7 +9514,9 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setTrash={setTrash} setActivity={setActivity}
             canEdit={canEdit}
             logActivity={logActivity}
-            restrictedFunds={restrictedFunds}
+            restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
+            paylocityProgramMap={paylocityProgramMap} setPaylocityProgramMap={setPaylocityProgramMap}
+            paylocityLastImport={paylocityLastImport} setPaylocityLastImport={setPaylocityLastImport}
           />
         ) : tab === "user-access" && isAdmin ? (
           <AdminPanel currentUserEmail={currentUserEmail || whoami} />
