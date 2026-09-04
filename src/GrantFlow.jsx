@@ -5694,7 +5694,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
   );
 }
 
-function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity, budgets = [], setBudgets, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport }) {
+function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity, budgets = [], setBudgets, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, paylocitySnapshots = [], setPaylocitySnapshots }) {
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
@@ -5704,6 +5704,9 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const [showImport, setShowImport] = useState(false);
   const [costViewMode, setCostViewMode] = useState("summary");
   const [monthlyGrantId, setMonthlyGrantId] = useState("");
+  const [matrixSnapshotId, setMatrixSnapshotId] = useState("");
+  const [matrixSearch, setMatrixSearch] = useState("");
+  const [matrixTrendStaffId, setMatrixTrendStaffId] = useState("");
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const visible = staff
@@ -5774,6 +5777,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
       <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
         <button onClick={() => setCostViewMode("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: costViewMode === "summary" ? "#1F5C6B" : "#FFFFFF", color: costViewMode === "summary" ? "#FFFFFF" : "#5B6B66" }}>Summary</button>
         <button onClick={() => setCostViewMode("monthly")} className="px-3 py-2 text-sm font-medium" style={{ background: costViewMode === "monthly" ? "#1F5C6B" : "#FFFFFF", color: costViewMode === "monthly" ? "#FFFFFF" : "#5B6B66" }}>By Grant, Monthly</button>
+        <button onClick={() => setCostViewMode("matrix")} className="px-3 py-2 text-sm font-medium" style={{ background: costViewMode === "matrix" ? "#1F5C6B" : "#FFFFFF", color: costViewMode === "matrix" ? "#FFFFFF" : "#5B6B66" }}>Employee Matrix</button>
       </div>
 
       {costViewMode === "summary" && (
@@ -5859,6 +5863,123 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
           })()}
         </div>
       )}
+
+      {costViewMode === "matrix" && (() => {
+        const sortedSnapshots = [...paylocitySnapshots].sort((a, b) => new Date(b.periodEnd) - new Date(a.periodEnd));
+        if (sortedSnapshots.length === 0) {
+          return <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>No allocation snapshots yet — one gets captured automatically the next time you run a Paylocity import with Allocations checked.</div>;
+        }
+        const snapshot = sortedSnapshots.find((s) => s.id === matrixSnapshotId) || sortedSnapshots[0];
+
+        if (matrixTrendStaffId) {
+          const chronological = [...paylocitySnapshots].sort((a, b) => new Date(a.periodEnd) - new Date(b.periodEnd));
+          const trendRows = chronological.map((s) => ({ s, entry: s.entries.find((e) => e.staffId === matrixTrendStaffId) })).filter((r) => r.entry);
+          const staffName = trendRows[0]?.entry.staffName || "Employee";
+          return (
+            <div className="space-y-3">
+              <button onClick={() => setMatrixTrendStaffId("")} className="text-sm" style={{ color: "#1F5C6B" }}>← Back to matrix</button>
+              <h3 className="font-display text-base" style={{ color: "#1C2624" }}>{staffName} — allocation over time</h3>
+              <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr style={{ background: "#F6F7F3" }}>
+                      <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Pay period</th>
+                      <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant / cost center</th>
+                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>%</th>
+                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Fully-loaded $</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trendRows.map(({ s, entry }) => (entry.allocations || []).map((a, i) => {
+                      const g = grants.find((x) => x.id === a.grantId);
+                      const cc = costCenters.find((x) => x.id === a.costCenterId);
+                      const name = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+                      return (
+                        <tr key={`${s.id}-${i}`} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                          {i === 0 && <td className="px-4 py-1.5" style={{ color: "#1C2624" }} rowSpan={(entry.allocations || []).length}>{fmtDate(s.periodStart)} – {fmtDate(s.periodEnd)}</td>}
+                          <td className="px-4 py-1.5" style={{ color: "#1C2624" }}>{name}</td>
+                          <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{Number(a.percent).toFixed(0)}%</td>
+                          <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(entry.fullyLoadedCost * (Number(a.percent) || 0) / 100)}</td>
+                        </tr>
+                      );
+                    }))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        }
+
+        const columnsMap = {};
+        snapshot.entries.forEach((e) => {
+          (e.allocations || []).forEach((a) => {
+            const key = a.grantId || a.costCenterId;
+            if (!key || columnsMap[key]) return;
+            const g = grants.find((x) => x.id === a.grantId);
+            const cc = costCenters.find((x) => x.id === a.costCenterId);
+            columnsMap[key] = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+          });
+        });
+        const columns = Object.entries(columnsMap).sort((a, b) => a[1].localeCompare(b[1]));
+        const filteredEntries = snapshot.entries.filter((e) => !matrixSearch || e.staffName.toLowerCase().includes(matrixSearch.toLowerCase()));
+        const headcountByCol = {};
+        columns.forEach(([key]) => {
+          headcountByCol[key] = snapshot.entries.filter((e) => (e.allocations || []).some((a) => (a.grantId || a.costCenterId) === key && Number(a.percent) > 0)).length;
+        });
+
+        return (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <select className={inputCls} style={{ ...inputStyle, maxWidth: 260 }} value={snapshot.id} onChange={(e) => setMatrixSnapshotId(e.target.value)}>
+                  {sortedSnapshots.map((s) => <option key={s.id} value={s.id}>{fmtDate(s.periodStart)} – {fmtDate(s.periodEnd)}</option>)}
+                </select>
+                <input value={matrixSearch} onChange={(e) => setMatrixSearch(e.target.value)} placeholder="Search employee…" className={inputCls} style={{ ...inputStyle, maxWidth: 200 }} />
+              </div>
+              <p className="text-xs" style={{ color: "#8A8F87" }}>{snapshot.entries.length} staff · {sortedSnapshots.length} pay period{sortedSnapshots.length === 1 ? "" : "s"} on file</p>
+            </div>
+            <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+              <table className="text-sm" style={{ whiteSpace: "nowrap", borderCollapse: "collapse", width: "100%" }}>
+                <thead>
+                  <tr style={{ background: "#F6F7F3" }}>
+                    <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Employee</th>
+                    {columns.map(([key, name]) => <th key={key} className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>{name}</th>)}
+                    <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Total</th>
+                    <th className="px-3 py-2"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredEntries.map((e) => {
+                    const total = (e.allocations || []).reduce((a, al) => a + (Number(al.percent) || 0), 0);
+                    return (
+                      <tr key={e.staffId} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                        <td className="px-3 py-1.5" style={{ color: "#1C2624" }}>{e.staffName}</td>
+                        {columns.map(([key]) => {
+                          const a = (e.allocations || []).find((x) => (x.grantId || x.costCenterId) === key);
+                          return <td key={key} className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: a ? "#1C2624" : "#B4B8B2" }}>{a ? `${Number(a.percent).toFixed(0)}%` : "—"}</td>;
+                        })}
+                        <td className="px-3 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{total.toFixed(0)}%</td>
+                        <td className="px-3 py-1.5 text-right"><button onClick={() => setMatrixTrendStaffId(e.staffId)} className="text-xs" style={{ color: "#1F5C6B" }}>View trend →</button></td>
+                      </tr>
+                    );
+                  })}
+                  {filteredEntries.length === 0 && (
+                    <tr><td colSpan={columns.length + 3} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No matching employees in this pay period.</td></tr>
+                  )}
+                  <tr className="border-t" style={{ borderColor: "#E1E5DE", background: "#F6F7F3" }}>
+                    <td className="px-3 py-1.5 font-medium" style={{ color: "#1C2624" }}>Headcount this period</td>
+                    {columns.map(([key]) => <td key={key} className="px-3 py-1.5 text-right" style={{ color: "#1C2624" }}>{headcountByCol[key]}</td>)}
+                    <td></td><td></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p className="text-xs" style={{ color: "#8A8F87" }}>
+              Captured automatically whenever a Paylocity import updates Allocations — one permanent snapshot per pay period. Nothing here is projected or recomputed after the fact.
+            </p>
+          </div>
+        );
+      })()}
 
       <div className="flex gap-3 flex-wrap">
         <Field label="Filter by department">
@@ -5967,6 +6088,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
           setPaylocityProgramMap={setPaylocityProgramMap}
           paylocityLastImport={paylocityLastImport}
           setPaylocityLastImport={setPaylocityLastImport}
+          setPaylocitySnapshots={setPaylocitySnapshots}
           logActivity={logActivity}
           onClose={() => setShowImport(false)}
           onOpenStaff={(s) => { setShowImport(false); setModal(s); }}
@@ -5976,7 +6098,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   );
 }
 
-function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, setBudgets, paylocityProgramMap, setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, logActivity, onClose, onOpenStaff }) {
+function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, setBudgets, paylocityProgramMap, setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, setPaylocitySnapshots, logActivity, onClose, onOpenStaff }) {
   const [step, setStep] = useState("upload"); // upload -> link -> crosswalk -> review -> done
   const [periodStart, setPeriodStart] = useState(paylocityLastImport ? "" : "2026-01-01");
   const [periodEnd, setPeriodEnd] = useState("");
@@ -6305,6 +6427,28 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
     if (updateComp) {
       setPaylocityLastImport({ periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10) });
     }
+
+    // A permanent, dated record of every matched employee's allocation as
+    // of this exact pay period — captured only when this import actually
+    // touched allocations, since Personnel itself only ever holds the
+    // current state (each import overwrites the last). This is the entire
+    // basis for the Employee Matrix's pay-period-over-pay-period history.
+    if (updateAllocations) {
+      const entries = matchedUpdates
+        .filter((u) => u.patch.allocations)
+        .map((u) => {
+          const existing = staff.find((s) => s.id === u.staffId);
+          const patched = { ...existing, ...u.patch };
+          return {
+            staffId: u.staffId,
+            staffName: existing?.name || "Unknown",
+            allocations: u.patch.allocations,
+            fullyLoadedCost: staffFullyLoadedCost(patched).total,
+          };
+        });
+      setPaylocitySnapshots((prev) => [...prev, { id: uid(), periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10), entries }]);
+    }
+
     const modeTag = updateComp && updateAllocations ? "" : updateComp ? " [Compensation only]" : " [Allocations only]";
     logActivity?.("Personnel", "Updated", `Paylocity import applied — ${matchedUpdates.length} staff updated (${fmtDate(periodStart)}–${fmtDate(periodEnd)})${modeTag}`);
     setStep("done");
@@ -9178,6 +9322,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const [paylocityProgramMap, setPaylocityProgramMap] = useState([]);
   const [paylocityLastImport, setPaylocityLastImport] = useState(null);
   const [restrictedFunds, setRestrictedFunds] = useState([]);
+  const [paylocitySnapshots, setPaylocitySnapshots] = useState([]);
   const [announcement, setAnnouncement] = useState(null);
   const [announcementDismissed, setAnnouncementDismissed] = useState(false);
   const [selectedCostCenterId, setSelectedCostCenterId] = useState("");
@@ -9281,6 +9426,10 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     try {
       const rf = await withTimeout(loadData("grantflow:restrictedfunds"));
       if (rf) setRestrictedFunds(rf);
+    } catch (e) { /* no data yet */ }
+    try {
+      const ps = await withTimeout(loadData("grantflow:paylocitysnapshots"));
+      if (ps) setPaylocitySnapshots(ps);
     } catch (e) { /* no data yet */ }
     try {
       const tr = await withTimeout(loadData("grantflow:trash"));
@@ -9395,6 +9544,11 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     if (!loaded || isSyncingRef.current) return;
     saveKey("grantflow:restrictedfunds", restrictedFunds, "Restricted funds");
   }, [restrictedFunds, loaded]);
+
+  useEffect(() => {
+    if (!loaded || isSyncingRef.current) return;
+    saveKey("grantflow:paylocitysnapshots", paylocitySnapshots, "Paylocity allocation snapshots");
+  }, [paylocitySnapshots, loaded]);
 
   useEffect(() => {
     if (!loaded || isSyncingRef.current) return;
@@ -9653,6 +9807,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             budgets={budgets} setBudgets={setBudgets}
             paylocityProgramMap={paylocityProgramMap} setPaylocityProgramMap={setPaylocityProgramMap}
             paylocityLastImport={paylocityLastImport} setPaylocityLastImport={setPaylocityLastImport}
+            paylocitySnapshots={paylocitySnapshots} setPaylocitySnapshots={setPaylocitySnapshots}
           />
         ) : tab === "activity-log" ? (
           <ActivityLogView activity={activity} />
