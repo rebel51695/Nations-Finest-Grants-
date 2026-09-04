@@ -7303,7 +7303,7 @@ function grantAllMonths(grantId, budgets) {
 // "how much is currently still restricted."
 // Nonprofit TRNA convention for how a restriction is released — matches how
 // the org already thinks about this in its Excel tracker.
-const RESTRICTION_TYPES = ["Purpose", "Time", "Both"];
+const RESTRICTION_TYPES = ["Purpose", "Time", "Time and Purpose"];
 const isEffectivelyZero = (n) => Math.abs(Math.round((Number(n) || 0) * 100)) < 1;
 
 // Legacy month-by-month ledger walk — kept only so migrateRestrictedFundsRecord
@@ -7357,7 +7357,7 @@ function migrateRestrictedFundsRecord(oldRecord, budgets) {
   return {
     id: oldRecord.id,
     grantId: oldRecord.grantId,
-    restrictionType: oldRecord.restrictionType === "Time & Purpose" ? "Both" : (RESTRICTION_TYPES.includes(oldRecord.restrictionType) ? oldRecord.restrictionType : "Both"),
+    restrictionType: (oldRecord.restrictionType === "Time & Purpose" || oldRecord.restrictionType === "Both") ? "Time and Purpose" : (RESTRICTION_TYPES.includes(oldRecord.restrictionType) ? oldRecord.restrictionType : "Time and Purpose"),
     releaseCondition: "",
     notes: "",
     periods: [{
@@ -7544,7 +7544,7 @@ function RestrictedFundsView({ grants, budgets, invoices, restrictedFunds, setRe
           grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title,
           grant.contractNumber || "",
           grant.fundCode || "",
-          record.restrictionType || "Both",
+          record.restrictionType === "Both" ? "Time and Purpose" : (record.restrictionType || "Time and Purpose"),
           record.releaseCondition || "",
           fmtDate(lastRow.periodStart),
           fmtDate(lastRow.periodEnd),
@@ -7590,7 +7590,7 @@ function RestrictedFundsView({ grants, budgets, invoices, restrictedFunds, setRe
     const startDateStr = selectedGrant.start ? selectedGrant.start.slice(0, 7) + "-01" : new Date().toISOString().slice(0, 10);
     const record = {
       id: uid(), grantId: selectedGrantId,
-      restrictionType: "Both", releaseCondition: "", notes: "",
+      restrictionType: "Time and Purpose", releaseCondition: "", notes: "",
       periods: [{
         id: uid(), periodStart: startDateStr, periodEnd: new Date().toISOString().slice(0, 10),
         beginningBalance: 0,
@@ -7733,7 +7733,7 @@ function RestrictedFundsView({ grants, budgets, invoices, restrictedFunds, setRe
                     <td className="px-3 py-2" style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</td>
                     <td className="px-3 py-2" style={{ color: "#8A8F87", fontFamily: "var(--mono-font)" }}>{grant.contractNumber || "—"}</td>
                     <td className="px-3 py-2" style={{ color: "#8A8F87", fontFamily: "var(--mono-font)" }}>{grant.fundCode || "—"}</td>
-                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{record.restrictionType || "Both"}</td>
+                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{record.restrictionType === "Both" ? "Time and Purpose" : (record.restrictionType || "Time and Purpose")}</td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(grant.awardAmount)}</td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.beginningBalance) : "—"}</td>
                     <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.receipts) : "—"}</td>
@@ -7793,7 +7793,7 @@ function RestrictedFundsView({ grants, budgets, invoices, restrictedFunds, setRe
               <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
                 <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-4">
                   <Field label="Restriction type">
-                    <select disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.restrictionType || "Both"} onChange={(e) => updateRecord({ restrictionType: e.target.value })}>
+                    <select disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.restrictionType === "Both" ? "Time and Purpose" : (selectedRecord.restrictionType || "Time and Purpose")} onChange={(e) => updateRecord({ restrictionType: e.target.value })}>
                       {RESTRICTION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                     </select>
                   </Field>
@@ -7972,7 +7972,7 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
           label, code,
           grantNumber: cNumber !== -1 ? row[cNumber] : "",
           fundCode: cFund !== -1 ? row[cFund] : "",
-          restrictionType: cType !== -1 ? row[cType] : "Both",
+          restrictionType: cType !== -1 ? (row[cType] === "Both" ? "Time and Purpose" : row[cType]) : "Time and Purpose",
           releaseCondition: cCondition !== -1 ? row[cCondition] || "" : "",
           notes: cNotes !== -1 ? row[cNotes] || "" : "",
           periodStart: cStart !== -1 ? toDate(row[cStart]) : null,
@@ -8023,7 +8023,7 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
         const record = {
           id: r.existing?.id || uid(),
           grantId: r.grant.id,
-          restrictionType: RESTRICTION_TYPES.includes(r.restrictionType) ? r.restrictionType : "Both",
+          restrictionType: r.restrictionType === "Both" ? "Time and Purpose" : (RESTRICTION_TYPES.includes(r.restrictionType) ? r.restrictionType : "Time and Purpose"),
           releaseCondition: r.releaseCondition || "",
           notes: r.notes || "",
           periods: [{
