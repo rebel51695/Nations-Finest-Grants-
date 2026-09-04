@@ -1298,6 +1298,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
     doclibUrl: "", contractUrl: "", coverPageUrl: "", notes: "",
     budgetPeriodStart: "", budgetPeriodEnd: "", obligatedFunds: 0, obligatedFundsRemaining: 0, paymentMethod: PAYMENT_METHODS[0],
     beds: "", bedRate: 0, grantPoc: "", awardAmountRemaining: 0, budgetGroupId: "", indirectRate: 0,
+    contractNumber: "", fundCode: "",
   });
   const [bgModal, setBgModal] = useState(null);
   const saveBudgetGroup = (bg) => {
@@ -1335,6 +1336,12 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
         </Field>
         <Field label="Funding source">
           <input className={inputCls} style={inputStyle} value={form.funding} onChange={set("funding")} placeholder="e.g. VA, HUD, private foundation" />
+        </Field>
+        <Field label="Grant number">
+          <input className={inputCls} style={inputStyle} value={form.contractNumber} onChange={set("contractNumber")} placeholder="e.g. VA-SSVF-24-001" />
+        </Field>
+        <Field label="Fund code">
+          <input className={inputCls} style={inputStyle} value={form.fundCode} onChange={set("fundCode")} placeholder="Internal GL fund/cost-center code" />
         </Field>
         <div className="col-span-2">
           <Field label={`Site / location${form.sites.length ? ` (${form.sites.length} selected)` : ""}`}>
@@ -2405,7 +2412,10 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, cos
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <StatCard
           label="Restricted funds, org-wide"
-          value={fmt(restrictedFunds.reduce((a, r) => a + computeRestrictedFundsLedger(r, r.grantId, budgets).currentBalance, 0))}
+          value={fmt(restrictedFunds.reduce((a, r) => {
+            const g = grants.find((x) => x.id === r.grantId);
+            return a + restrictedFundsCurrentBalance(r, r.grantId, budgets, invoices, Number(g?.awardAmount) || 0);
+          }, 0))}
           sub={
             <span
               onClick={() => goTo("restricted-funds")}
@@ -7293,30 +7303,29 @@ function grantAllMonths(grantId, budgets) {
 // "how much is currently still restricted."
 // Nonprofit TRNA convention for how a restriction is released — matches how
 // the org already thinks about this in its Excel tracker.
-const RESTRICTION_TYPES = ["Time", "Purpose", "Time & Purpose"];
+const RESTRICTION_TYPES = ["Purpose", "Time", "Both"];
 const isEffectivelyZero = (n) => Math.abs(Math.round((Number(n) || 0) * 100)) < 1;
 
-function computeRestrictedFundsLedger(record, grantId, budgets) {
+// Legacy month-by-month ledger walk — kept only so migrateRestrictedFundsRecord
+// can compute a departing record's exact current balance once, to carry
+// forward unchanged into the new period-based model. Never called for
+// anything else once a record has been migrated.
+function computeRestrictedFundsLedgerLegacy(record, grantId, budgets) {
   if (!record || !record.beginningBalanceDate) return { rows: [], currentBalance: 0, totalAdded: 0, totalReleased: 0 };
   const start = new Date(record.beginningBalanceDate + "T00:00:00");
   let y = start.getUTCFullYear();
   let m = start.getUTCMonth();
-
   const entriesByKey = {};
   (record.entries || []).forEach((e) => { entriesByKey[`${e.year}-${e.monthIndex}`] = e; });
-
   const today = new Date();
   let endYear = today.getFullYear();
   let endMonth = today.getMonth();
   (record.entries || []).forEach((e) => {
     if (e.year > endYear || (e.year === endYear && e.monthIndex > endMonth)) { endYear = e.year; endMonth = e.monthIndex; }
   });
-
   const rows = [];
   let balance = Number(record.beginningBalance) || 0;
-  let totalAdded = 0;
-  let totalReleased = 0;
-  let guard = 0;
+  let totalAdded = 0, totalReleased = 0, guard = 0;
   while ((y < endYear || (y === endYear && m <= endMonth)) && guard < 600) {
     guard++;
     const entry = entriesByKey[`${y}-${m}`];
@@ -7331,6 +7340,92 @@ function computeRestrictedFundsLedger(record, grantId, budgets) {
     if (m > 11) { m = 0; y++; }
   }
   return { rows, currentBalance: balance, totalAdded, totalReleased };
+}
+
+// One-time, in-place conversion from the old entries-based ledger to the new
+// per-reporting-period model (Receipts / Expenditures / Other Releases).
+// Preserves the exact current balance as a single historical reconciliation
+// period — nothing about the number changes, only how it's expressed —
+// since we have no real historical per-period receipt data to reconstruct.
+function migrateRestrictedFundsRecord(oldRecord, budgets) {
+  if (oldRecord.periods) return oldRecord; // already on the new model
+  const { rows, totalAdded, totalReleased } = computeRestrictedFundsLedgerLegacy(oldRecord, oldRecord.grantId, budgets);
+  const lastRow = rows[rows.length - 1];
+  const periodEnd = lastRow
+    ? `${lastRow.year}-${String(lastRow.monthIndex + 1).padStart(2, "0")}-${new Date(lastRow.year, lastRow.monthIndex + 1, 0).getDate()}`
+    : new Date().toISOString().slice(0, 10);
+  return {
+    id: oldRecord.id,
+    grantId: oldRecord.grantId,
+    restrictionType: oldRecord.restrictionType === "Time & Purpose" ? "Both" : (RESTRICTION_TYPES.includes(oldRecord.restrictionType) ? oldRecord.restrictionType : "Both"),
+    releaseCondition: "",
+    notes: "",
+    periods: [{
+      id: uid(),
+      periodStart: oldRecord.beginningBalanceDate || periodEnd,
+      periodEnd,
+      beginningBalance: Number(oldRecord.beginningBalance) || 0,
+      receiptsMode: "manual", manualReceipts: totalAdded,
+      expendituresMode: "manual", manualExpenditures: totalReleased,
+      otherReleases: 0,
+    }],
+  };
+}
+
+// Real expense actuals only (never projected) for a grant's Template
+// budget(s), summed across every calendar month whose 1st falls within
+// [periodStart, periodEnd] — the basis for an auto-computed "Expenditures
+// This Period".
+function grantPeriodExpenditures(grantId, budgets, periodStart, periodEnd) {
+  const templateBudgets = budgets.filter((b) => b.grantId === grantId && b.budgetType === "Template" && isActiveBudget(b.status));
+  const rangeStart = new Date(periodStart + "T00:00:00");
+  const rangeEnd = new Date(periodEnd + "T00:00:00");
+  let total = 0;
+  templateBudgets.forEach((b) => {
+    if (!b.periodStart || !b.periodEnd) return;
+    const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+    cols.forEach((col, i) => {
+      const colDate = new Date(col.year, col.monthIndex, 1);
+      if (colDate < new Date(rangeStart.getFullYear(), rangeStart.getMonth(), 1)) return;
+      if (colDate > new Date(rangeEnd.getFullYear(), rangeEnd.getMonth(), 1)) return;
+      b.lines.forEach((l) => {
+        if (l.type !== "expense") return;
+        total += Number((l.actuals || [])[i]) || 0;
+      });
+    });
+  });
+  return total;
+}
+
+// Sum of Paid invoices for a grant whose paid date falls within the period —
+// the basis for an auto-computed "Receipts This Period".
+function grantPeriodReceipts(grantId, invoices, periodStart, periodEnd) {
+  const start = new Date(periodStart + "T00:00:00");
+  const end = new Date(periodEnd + "T00:00:00");
+  return (invoices || [])
+    .filter((i) => i.grantId === grantId && i.status === "Paid" && i.paidDate)
+    .filter((i) => { const d = new Date(i.paidDate + "T00:00:00"); return d >= start && d <= end; })
+    .reduce((a, i) => a + (Number(i.amount) || 0), 0);
+}
+
+// Walks a grant's reporting periods in order, cascading each period's
+// beginning balance from the prior period's ending balance automatically —
+// only the very first period's beginning balance is ever a direct input.
+function computeRestrictedFundsPeriods(record, grantId, budgets, invoices, awardAmount) {
+  const periods = [...(record?.periods || [])].sort((a, b) => new Date(a.periodStart) - new Date(b.periodStart));
+  let running = 0;
+  const rows = periods.map((p, idx) => {
+    const beginningBalance = idx === 0 ? (Number(p.beginningBalance) || 0) : running;
+    const receipts = p.receiptsMode === "manual" ? (Number(p.manualReceipts) || 0) : grantPeriodReceipts(grantId, invoices, p.periodStart, p.periodEnd);
+    const expenditures = p.expendituresMode === "manual" ? (Number(p.manualExpenditures) || 0) : grantPeriodExpenditures(grantId, budgets, p.periodStart, p.periodEnd);
+    const otherReleases = Number(p.otherReleases) || 0;
+    const totalReleased = expenditures + otherReleases;
+    const endingBalance = beginningBalance + receipts - totalReleased;
+    const pctExpended = awardAmount > 0 ? expenditures / awardAmount : null;
+    running = endingBalance;
+    return { ...p, beginningBalance, receipts, expenditures, otherReleases, totalReleased, endingBalance, pctExpended };
+  });
+  return { rows, currentBalance: running };
 }
 
 // "Open" while there's still an unreleased balance; "Fully Released" once
@@ -7349,52 +7444,74 @@ function restrictedFundsNeedsReview(grant, currentBalance) {
   return new Date(grant.end + "T00:00:00") < new Date();
 }
 
-function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFunds, budgetGroups = [], canEdit, logActivity }) {
+// Current restricted balance for a record regardless of whether it's been
+// migrated to the per-period model yet — RestrictedFundsView migrates
+// records in place on load, but other pages (Dashboard, Data Health Check)
+// may render first and need a balance from whatever shape is in state now.
+function restrictedFundsCurrentBalance(record, grantId, budgets, invoices, awardAmount) {
+  if (record.periods) return computeRestrictedFundsPeriods(record, grantId, budgets, invoices || [], awardAmount || 0).currentBalance;
+  return computeRestrictedFundsLedgerLegacy(record, grantId, budgets).currentBalance;
+}
+
+function RestrictedFundsView({ grants, budgets, invoices, restrictedFunds, setRestrictedFunds, budgetGroups = [], canEdit, logActivity }) {
   const [view, setView] = useState("summary"); // summary | grant
   const [selectedGrantId, setSelectedGrantId] = useState("");
+  const [hideClosedZero, setHideClosedZero] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+
+  // One-time, in-place migration from the old entries-based ledger to the
+  // new per-reporting-period model — runs once per session if any legacy
+  // records are found, preserving every existing balance exactly.
+  const migratedRef = useRef(false);
+  useEffect(() => {
+    if (migratedRef.current) return;
+    const needsMigration = restrictedFunds.some((r) => !r.periods);
+    migratedRef.current = true;
+    if (!needsMigration) return;
+    setRestrictedFunds((prev) => prev.map((r) => migrateRestrictedFundsRecord(r, budgets)));
+    logActivity?.("Restricted Funds", "Updated", "Migrated tracking to the per-period Receipts/Expenditures/Other Releases model — existing balances preserved exactly.");
+  }, [restrictedFunds, budgets]);
 
   const eligibleGrants = grants.filter((g) => g.stage === "Active" || g.stage === "Awarded" || g.stage === "Closing" || g.stage === "Closed");
   const recordByGrant = {};
-  restrictedFunds.forEach((r) => { recordByGrant[r.grantId] = r; });
+  restrictedFunds.forEach((r) => { if (r.periods) recordByGrant[r.grantId] = r; });
 
-  const summaryRows = eligibleGrants
+  const summaryRowsAll = eligibleGrants
     .map((g) => {
       const record = recordByGrant[g.id];
       if (!record) return null;
-      const { currentBalance, totalAdded, totalReleased } = computeRestrictedFundsLedger(record, g.id, budgets);
+      const { rows, currentBalance } = computeRestrictedFundsPeriods(record, g.id, budgets, invoices, Number(g.awardAmount) || 0);
+      const lastRow = rows[rows.length - 1] || null;
       const status = restrictedFundsStatus(currentBalance);
       const needsReview = restrictedFundsNeedsReview(g, currentBalance);
-      return { grant: g, currentBalance, totalAdded, totalReleased, status, needsReview };
+      return { grant: g, record, rows, currentBalance, lastRow, status, needsReview };
     })
     .filter(Boolean);
-  const orgTotal = summaryRows.reduce((a, r) => a + r.currentBalance, 0);
+
+  const summaryRows = summaryRowsAll.filter((r) => !(hideClosedZero && r.grant.stage === "Closed" && isEffectivelyZero(r.currentBalance)));
+  const hiddenClosedCount = summaryRowsAll.length - summaryRows.length;
+  const orgTotal = summaryRowsAll.reduce((a, r) => a + r.currentBalance, 0);
   const untracked = eligibleGrants.filter((g) => !recordByGrant[g.id]);
 
-  // Org-wide dashboard figures, matching the shape of the org's own Excel
-  // TRNA tracker's Dashboard tab.
   const dashTotals = {
-    beginningBalance: restrictedFunds.reduce((a, r) => a + (Number(r.beginningBalance) || 0), 0),
-    restrictedRevenue: summaryRows.reduce((a, r) => a + r.totalAdded, 0),
-    releases: summaryRows.reduce((a, r) => a + r.totalReleased, 0),
+    beginningBalance: summaryRowsAll.reduce((a, r) => a + (r.rows[0]?.beginningBalance || 0), 0),
+    receipts: summaryRowsAll.reduce((a, r) => a + r.rows.reduce((x, p) => x + p.receipts, 0), 0),
+    released: summaryRowsAll.reduce((a, r) => a + r.rows.reduce((x, p) => x + p.totalReleased, 0), 0),
     endingBalance: orgTotal,
-    openItems: summaryRows.filter((r) => r.status === "Open").length,
-    reviewItems: summaryRows.filter((r) => r.needsReview).length,
+    openItems: summaryRowsAll.filter((r) => r.status === "Open").length,
+    reviewItems: summaryRowsAll.filter((r) => r.needsReview).length,
   };
 
-  // Rollup by budget group ("bucket"), the org's equivalent of the
-  // tracker's Program-level breakdown.
   const programRollup = {};
-  summaryRows.forEach((r) => {
+  summaryRowsAll.forEach((r) => {
     const groupId = r.grant.budgetGroupId || "__none__";
     const groupName = budgetGroups.find((bg) => bg.id === groupId)?.name || "Ungrouped";
-    if (!programRollup[groupName]) programRollup[groupName] = { endingBalance: 0, restrictedRevenue: 0, releases: 0 };
+    if (!programRollup[groupName]) programRollup[groupName] = { endingBalance: 0, receipts: 0, released: 0 };
     programRollup[groupName].endingBalance += r.currentBalance;
-    programRollup[groupName].restrictedRevenue += r.totalAdded;
-    programRollup[groupName].releases += r.totalReleased;
+    programRollup[groupName].receipts += r.rows.reduce((x, p) => x + p.receipts, 0);
+    programRollup[groupName].released += r.rows.reduce((x, p) => x + p.totalReleased, 0);
   });
-
-  const [exporting, setExporting] = useState(false);
-  const [showImport, setShowImport] = useState(false);
 
   const exportTrnaExcel = async () => {
     setExporting(true);
@@ -7402,14 +7519,14 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
       const HEADER_FILL = "FFF6F7F3";
       const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
       const wb = new ExcelJS.Workbook();
-      const ws = wb.addWorksheet("TRNA Tracker");
+      const ws = wb.addWorksheet("TRNA Matrix");
 
-      const header = ["Fund / Restriction", "Donor / Source", "Program", "Restriction Type", "Start Date", "End Date", "Beginning Balance", "Restricted Revenue", "Releases from Restriction", "Adjustments", "Ending Balance", "Release %", "Status", "Over/Under Flag"];
+      const header = ["Funder / Grantor", "Grant / Award Name", "Grant Number", "Fund Code", "Restriction Type", "Release Condition", "Period Start", "Period End", "Total Award Amount", "Beginning Balance", "Receipts This Period", "Expenditures This Period", "Other Releases", "Total Released", "Ending TRNA Balance", "% of Award Expended", "Notes / Status"];
       ws.mergeCells(1, 1, 1, header.length);
-      ws.getCell(1, 1).value = "Nation's Finest — TRNA Rollforward Detail";
+      ws.getCell(1, 1).value = "Nation's Finest — TRNA Matrix";
       ws.getCell(1, 1).font = { bold: true, size: 13 };
       ws.mergeCells(2, 1, 2, header.length);
-      ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}`;
+      ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))} — most recent reporting period per grant`;
       ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
 
       const headerRowIdx = 4;
@@ -7420,39 +7537,37 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
       });
 
       let r = headerRowIdx + 1;
-      summaryRows.forEach(({ grant, currentBalance, totalAdded, totalReleased, status, needsReview }) => {
-        const record = recordByGrant[grant.id];
-        const sortedEntries = [...(record.entries || [])].sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
-        const seedAdded = sortedEntries[0]?.added || 0;
-        const adjustments = totalAdded - seedAdded;
-        const pct = totalAdded > 0 ? totalReleased / totalAdded : 0;
-        const groupName = budgetGroups.find((bg) => bg.id === grant.budgetGroupId)?.name || "";
+      summaryRows.forEach(({ grant, record, lastRow }) => {
+        if (!lastRow) return;
         ws.getRow(r).values = [
-          grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title,
           grant.funding || "",
-          groupName,
-          record.restrictionType || "Time & Purpose",
-          grant.start ? fmtDate(grant.start) : "",
-          grant.end ? fmtDate(grant.end) : "",
-          round2(record.beginningBalance),
-          round2(seedAdded),
-          round2(-totalReleased),
-          round2(adjustments),
-          round2(currentBalance),
-          pct,
-          status,
-          needsReview ? "Past End Date - Review" : "OK",
+          grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title,
+          grant.contractNumber || "",
+          grant.fundCode || "",
+          record.restrictionType || "Both",
+          record.releaseCondition || "",
+          fmtDate(lastRow.periodStart),
+          fmtDate(lastRow.periodEnd),
+          round2(grant.awardAmount),
+          round2(lastRow.beginningBalance),
+          round2(lastRow.receipts),
+          round2(lastRow.expenditures),
+          round2(lastRow.otherReleases),
+          round2(lastRow.totalReleased),
+          round2(lastRow.endingBalance),
+          lastRow.pctExpended,
+          record.notes || "",
         ];
-        [7, 8, 9, 10, 11].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
-        ws.getCell(r, 12).numFmt = "0%";
+        [9, 10, 11, 12, 13, 14, 15].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
+        ws.getCell(r, 16).numFmt = "0%";
         r++;
       });
 
-      ws.columns = [{ width: 36 }, { width: 16 }, { width: 28 }, { width: 16 }, { width: 12 }, { width: 12 }, { width: 15 }, { width: 15 }, { width: 18 }, { width: 14 }, { width: 15 }, { width: 10 }, { width: 15 }, { width: 20 }];
+      ws.columns = [{ width: 24 }, { width: 34 }, { width: 16 }, { width: 14 }, { width: 12 }, { width: 30 }, { width: 12 }, { width: 12 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 16 }, { width: 13 }, { width: 14 }, { width: 15 }, { width: 12 }, { width: 30 }];
       ws.views = [{ state: "frozen", ySplit: headerRowIdx }];
 
       const buffer = await wb.xlsx.writeBuffer();
-      downloadFile("nations-finest-trna-tracker.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      downloadFile("nations-finest-trna-matrix.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     } finally {
       setExporting(false);
     }
@@ -7460,75 +7575,74 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
 
   const selectedGrant = grants.find((g) => g.id === selectedGrantId);
   const selectedRecord = recordByGrant[selectedGrantId];
-  const ledger = selectedRecord ? computeRestrictedFundsLedger(selectedRecord, selectedGrantId, budgets) : { rows: [], currentBalance: 0, totalAdded: 0, totalReleased: 0 };
-  const releasePct = ledger.totalAdded > 0 ? (ledger.totalReleased / ledger.totalAdded) * 100 : 0;
+  const periodsResult = selectedRecord
+    ? computeRestrictedFundsPeriods(selectedRecord, selectedGrantId, budgets, invoices, Number(selectedGrant?.awardAmount) || 0)
+    : { rows: [], currentBalance: 0 };
 
   const updateRecord = (patch) => {
     setRestrictedFunds((prev) => prev.map((r) => (r.id === selectedRecord.id ? { ...r, ...patch } : r)));
   };
-  const updateEntry = (year, monthIndex, patch) => {
-    const entries = [...(selectedRecord.entries || [])];
-    const idx = entries.findIndex((e) => e.year === year && e.monthIndex === monthIndex);
-    if (idx === -1) entries.push({ id: uid(), year, monthIndex, added: 0, releaseMode: "auto", manualRelease: 0, ...patch });
-    else entries[idx] = { ...entries[idx], ...patch };
-    updateRecord({ entries });
+  const updatePeriod = (periodId, patch) => {
+    updateRecord({ periods: selectedRecord.periods.map((p) => (p.id === periodId ? { ...p, ...patch } : p)) });
   };
 
   const seedFromAward = () => {
     const startDateStr = selectedGrant.start ? selectedGrant.start.slice(0, 7) + "-01" : new Date().toISOString().slice(0, 10);
-    const d = new Date(startDateStr + "T00:00:00");
     const record = {
       id: uid(), grantId: selectedGrantId,
-      beginningBalance: 0,
-      beginningBalanceDate: startDateStr,
-      restrictionType: "Time & Purpose",
-      entries: [{ id: uid(), year: d.getUTCFullYear(), monthIndex: d.getUTCMonth(), added: Number(selectedGrant.awardAmount) || 0, releaseMode: "auto", manualRelease: 0 }],
+      restrictionType: "Both", releaseCondition: "", notes: "",
+      periods: [{
+        id: uid(), periodStart: startDateStr, periodEnd: new Date().toISOString().slice(0, 10),
+        beginningBalance: 0,
+        receiptsMode: "auto", manualReceipts: 0,
+        expendituresMode: "auto", manualExpenditures: 0,
+        otherReleases: 0,
+      }],
     };
     setRestrictedFunds((prev) => [...prev, record]);
-    logActivity?.("Restricted Funds", "Created", `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title} (seeded from award amount)`);
+    logActivity?.("Restricted Funds", "Created", `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title} (new tracking record)`);
   };
 
-  const startCustom = () => {
-    const record = {
-      id: uid(), grantId: selectedGrantId,
-      beginningBalance: 0,
-      beginningBalanceDate: new Date().toISOString().slice(0, 10),
-      restrictionType: "Time & Purpose",
-      entries: [],
-    };
-    setRestrictedFunds((prev) => [...prev, record]);
-  };
-
-  const [addFundsOpen, setAddFundsOpen] = useState(false);
-  const [addFundsMonth, setAddFundsMonth] = useState(new Date().toISOString().slice(0, 7));
-  const [addFundsAmount, setAddFundsAmount] = useState("");
-  const addFunds = () => {
-    const [y, m] = addFundsMonth.split("-").map(Number);
-    const entries = [...(selectedRecord.entries || [])];
-    const idx = entries.findIndex((e) => e.year === y && e.monthIndex === m - 1);
-    const amt = Number(addFundsAmount) || 0;
-    if (idx === -1) entries.push({ id: uid(), year: y, monthIndex: m - 1, added: amt, releaseMode: "auto", manualRelease: 0 });
-    else entries[idx] = { ...entries[idx], added: (Number(entries[idx].added) || 0) + amt };
-    updateRecord({ entries });
-    logActivity?.("Restricted Funds", "Updated", `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title} — added ${fmt(amt)} restricted funds`);
-    setAddFundsOpen(false);
-    setAddFundsAmount("");
+  const [addPeriodOpen, setAddPeriodOpen] = useState(false);
+  const [addPeriodStart, setAddPeriodStart] = useState("");
+  const [addPeriodEnd, setAddPeriodEnd] = useState("");
+  const addPeriod = () => {
+    if (!addPeriodStart || !addPeriodEnd) return;
+    const newPeriods = [...selectedRecord.periods, {
+      id: uid(), periodStart: addPeriodStart, periodEnd: addPeriodEnd,
+      beginningBalance: 0, // ignored for every period after the first — cascades automatically
+      receiptsMode: "auto", manualReceipts: 0,
+      expendituresMode: "auto", manualExpenditures: 0,
+      otherReleases: 0,
+    }];
+    updateRecord({ periods: newPeriods });
+    logActivity?.("Restricted Funds", "Updated", `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title} — added reporting period ${fmtDate(addPeriodStart)}–${fmtDate(addPeriodEnd)}`);
+    setAddPeriodOpen(false);
+    setAddPeriodStart("");
+    setAddPeriodEnd("");
   };
 
   const deleteRecord = () => {
     const label = `${selectedGrant.programCode ? selectedGrant.programCode + " - " : ""}${selectedGrant.title}`;
-    if (!window.confirm(`Stop tracking Restricted Funds for "${label}"? This removes its entire ledger — beginning balance, every month's entries, and history. This can't be undone.`)) return;
+    if (!window.confirm(`Stop tracking Restricted Funds for "${label}"? This removes every reporting period and its full history. This can't be undone.`)) return;
     setRestrictedFunds((prev) => prev.filter((r) => r.id !== selectedRecord.id));
+    logActivity?.("Restricted Funds", "Deleted", label);
+  };
+
+  const deleteRecordFor = (grant, record) => {
+    const label = `${grant.programCode ? grant.programCode + " - " : ""}${grant.title}`;
+    if (!window.confirm(`Stop tracking Restricted Funds for "${label}"? This removes every reporting period and its full history. This can't be undone.`)) return;
+    setRestrictedFunds((prev) => prev.filter((r) => r.id !== record.id));
     logActivity?.("Restricted Funds", "Deleted", label);
   };
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Restricted Funds</h1>
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
-            Temporarily restricted net assets — tracked as a running balance per grant, independent of any single budget's fiscal year. Releases are auto-computed from that month's real grant expense actuals unless manually overridden.
+            Temporarily restricted net assets — tracked per grant, per reporting period. Receipts pull from Paid invoices, Expenditures from real grant expense actuals — both auto by default, both manually overridable per period.
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -7541,7 +7655,7 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
             <Download size={15} /> {exporting ? "Building…" : "Export Excel"}
           </button>
           <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
-            <button onClick={() => setView("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "summary" ? "#1F5C6B" : "#FFFFFF", color: view === "summary" ? "#FFFFFF" : "#5B6B66" }}>Org Summary</button>
+            <button onClick={() => setView("summary")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "summary" ? "#1F5C6B" : "#FFFFFF", color: view === "summary" ? "#FFFFFF" : "#5B6B66" }}>Matrix</button>
             <button onClick={() => setView("grant")} className="px-3 py-2 text-sm font-medium" style={{ background: view === "grant" ? "#1F5C6B" : "#FFFFFF", color: view === "grant" ? "#FFFFFF" : "#5B6B66" }}>By Grant</button>
           </div>
         </div>
@@ -7551,8 +7665,8 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
         <div className="space-y-4">
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
             <StatCard label="Beginning balance" value={fmt(dashTotals.beginningBalance)} />
-            <StatCard label="Restricted revenue" value={fmt(dashTotals.restrictedRevenue)} />
-            <StatCard label="Releases" value={fmt(-dashTotals.releases)} />
+            <StatCard label="Receipts" value={fmt(dashTotals.receipts)} />
+            <StatCard label="Released" value={fmt(-dashTotals.released)} />
             <StatCard label="Ending balance" value={fmt(dashTotals.endingBalance)} />
             <StatCard label="Open items" value={dashTotals.openItems} />
             <StatCard label="Items to review" value={dashTotals.reviewItems} />
@@ -7566,8 +7680,8 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
                   <tr style={{ background: "#F6F7F3" }}>
                     <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Budget group</th>
                     <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Ending balance</th>
-                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Restricted revenue</th>
-                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Releases</th>
+                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Receipts</th>
+                    <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Released</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -7575,8 +7689,8 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
                     <tr key={name} className="border-t" style={{ borderColor: "#E1E5DE" }}>
                       <td className="px-4 py-2" style={{ color: "#1C2624" }}>{name}</td>
                       <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(t.endingBalance)}</td>
-                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(t.restrictedRevenue)}</td>
-                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(-t.releases)}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(t.receipts)}</td>
+                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(-t.released)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -7584,53 +7698,67 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
             </div>
           )}
 
-          <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
-            <table className="w-full text-sm">
+          {hiddenClosedCount > 0 && (
+            <label className="flex items-center gap-2 text-xs" style={{ color: "#8A8F87" }}>
+              <input type="checkbox" checked={hideClosedZero} onChange={(e) => setHideClosedZero(e.target.checked)} />
+              Hide closed grants with a fully-released ($0) balance ({hiddenClosedCount} hidden)
+            </label>
+          )}
+
+          <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-sm" style={{ whiteSpace: "nowrap" }}>
               <thead>
                 <tr style={{ background: "#F6F7F3" }}>
-                  <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant</th>
-                  <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Current restricted balance</th>
-                  <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Release %</th>
-                  <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Status</th>
-                  <th className="px-4 py-2"></th>
+                  <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Funder</th>
+                  <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Grant / award</th>
+                  <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Grant #</th>
+                  <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Fund code</th>
+                  <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Restriction</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Award</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Beginning</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Receipts</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Expenditures</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Other rel.</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Total released</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Ending balance</th>
+                  <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>% expended</th>
+                  <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Status</th>
+                  <th className="px-3 py-2"></th>
                 </tr>
               </thead>
               <tbody>
-                {summaryRows.map(({ grant, currentBalance, totalAdded, totalReleased, status, needsReview }) => {
-                  const pct = totalAdded > 0 ? (totalReleased / totalAdded) * 100 : 0;
-                  return (
-                    <tr key={grant.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: "#E1E5DE" }} onClick={() => { setSelectedGrantId(grant.id); setView("grant"); }}>
-                      <td className="px-4 py-2" style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</td>
-                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(currentBalance)}</td>
-                      <td className="px-4 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{pct.toFixed(0)}%</td>
-                      <td className="px-4 py-2">
-                        <div className="flex items-center gap-2">
-                          <Badge color={status === "Fully Released" ? "#8A8F87" : "#2F6F53"}>{status}</Badge>
-                          {needsReview && <Badge color="#B5443A">Past End Date - Review</Badge>}
-                        </div>
-                      </td>
-                      <td className="px-4 py-2 text-right">
-                        {canEdit && (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const label = grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title;
-                              if (!window.confirm(`Stop tracking Restricted Funds for "${label}"? This removes its entire ledger — beginning balance, every month's entries, and history. This can't be undone.`)) return;
-                              const record = recordByGrant[grant.id];
-                              setRestrictedFunds((prev) => prev.filter((r) => r.id !== record.id));
-                              logActivity?.("Restricted Funds", "Deleted", label);
-                            }}
-                            title="Delete Restricted Funds tracking for this grant"
-                          >
-                            <Trash2 size={15} style={{ color: "#B5443A" }} />
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
+                {summaryRows.map(({ grant, record, lastRow, currentBalance, status, needsReview }) => (
+                  <tr key={grant.id} className="border-t cursor-pointer hover:bg-stone-50" style={{ borderColor: "#E1E5DE" }} onClick={() => { setSelectedGrantId(grant.id); setView("grant"); }}>
+                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{grant.funding || "—"}</td>
+                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{grant.programCode ? `${grant.programCode} - ${grant.title}` : grant.title}</td>
+                    <td className="px-3 py-2" style={{ color: "#8A8F87", fontFamily: "var(--mono-font)" }}>{grant.contractNumber || "—"}</td>
+                    <td className="px-3 py-2" style={{ color: "#8A8F87", fontFamily: "var(--mono-font)" }}>{grant.fundCode || "—"}</td>
+                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>{record.restrictionType || "Both"}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(grant.awardAmount)}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.beginningBalance) : "—"}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.receipts) : "—"}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.expenditures) : "—"}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.otherReleases) : "—"}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{lastRow ? fmt(lastRow.totalReleased) : "—"}</td>
+                    <td className="px-3 py-2 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(currentBalance)}</td>
+                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{lastRow && lastRow.pctExpended !== null ? `${(lastRow.pctExpended * 100).toFixed(0)}%` : "—"}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex items-center gap-2">
+                        <Badge color={status === "Fully Released" ? "#8A8F87" : "#2F6F53"}>{status}</Badge>
+                        {needsReview && <Badge color="#B5443A">Past End Date - Review</Badge>}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      {canEdit && (
+                        <button onClick={(e) => { e.stopPropagation(); deleteRecordFor(grant, record); }} title="Delete Restricted Funds tracking for this grant">
+                          <Trash2 size={15} style={{ color: "#B5443A" }} />
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
                 {summaryRows.length === 0 && (
-                  <tr><td colSpan={5} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
+                  <tr><td colSpan={15} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No grants have Restricted Funds tracking set up yet.</td></tr>
                 )}
               </tbody>
             </table>
@@ -7650,118 +7778,134 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
           </div>
 
           {!selectedGrantId ? (
-            <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Select a grant to view its restricted funds ledger.</div>
+            <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Select a grant to view its restricted funds history.</div>
           ) : !selectedRecord ? (
             <div className="bg-white rounded-lg border p-6" style={{ borderColor: "#E1E5DE" }}>
               <p className="text-sm mb-4" style={{ color: "#5B6B66" }}>No Restricted Funds record exists yet for this grant.</p>
               {canEdit && (
-                <div className="flex flex-wrap gap-2">
-                  <button onClick={seedFromAward} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>
-                    Start from award amount ({fmt(selectedGrant?.awardAmount)})
-                  </button>
-                  <button onClick={startCustom} className="text-sm px-4 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-                    Set a custom beginning balance instead
-                  </button>
-                </div>
+                <button onClick={seedFromAward} className="text-sm px-4 py-2 rounded-md text-white" style={{ background: "#1F5C6B" }}>
+                  Start tracking this grant
+                </button>
               )}
             </div>
           ) : (
             <div className="space-y-4">
               <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
                 <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-4">
-                  <Field label="Beginning balance">
-                    <input type="number" disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.beginningBalance} onChange={(e) => updateRecord({ beginningBalance: e.target.value })} />
-                  </Field>
-                  <Field label="As-of date">
-                    <input type="date" disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.beginningBalanceDate} onChange={(e) => updateRecord({ beginningBalanceDate: e.target.value })} />
-                  </Field>
                   <Field label="Restriction type">
-                    <select disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.restrictionType || "Time & Purpose"} onChange={(e) => updateRecord({ restrictionType: e.target.value })}>
+                    <select disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.restrictionType || "Both"} onChange={(e) => updateRecord({ restrictionType: e.target.value })}>
                       {RESTRICTION_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
                     </select>
                   </Field>
+                  <div className="sm:col-span-2">
+                    <Field label="Release condition">
+                      <input disabled={!canEdit} className={inputCls} style={inputStyle} value={selectedRecord.releaseCondition || ""} onChange={(e) => updateRecord({ releaseCondition: e.target.value })} placeholder="How the restriction is lifted" />
+                    </Field>
+                  </div>
                   <div>
                     <div className="text-xs font-medium mb-1" style={{ color: "#5B6B66" }}>Current restricted balance</div>
-                    <div className="text-xl font-display" style={{ color: "#1C2624" }}>{fmt(ledger.currentBalance)}</div>
+                    <div className="text-xl font-display" style={{ color: "#1C2624" }}>{fmt(periodsResult.currentBalance)}</div>
                   </div>
                 </div>
-                <div className="flex items-center gap-2 mb-4">
-                  <Badge color={restrictedFundsStatus(ledger.currentBalance) === "Fully Released" ? "#8A8F87" : "#2F6F53"}>{restrictedFundsStatus(ledger.currentBalance)}</Badge>
-                  {restrictedFundsNeedsReview(selectedGrant, ledger.currentBalance) && <Badge color="#B5443A">Past End Date - Review</Badge>}
-                  <span className="text-xs" style={{ color: "#8A8F87" }}>Release {releasePct.toFixed(0)}% ({fmt(ledger.totalReleased)} of {fmt(ledger.totalAdded)})</span>
+                <Field label="Notes / status">
+                  <textarea disabled={!canEdit} className={inputCls} style={{ ...inputStyle, minHeight: 60 }} value={selectedRecord.notes || ""} onChange={(e) => updateRecord({ notes: e.target.value })} placeholder="e.g. Year 2 of 3; closeout pending" />
+                </Field>
+                <div className="flex items-center gap-2 mt-3">
+                  <Badge color={restrictedFundsStatus(periodsResult.currentBalance) === "Fully Released" ? "#8A8F87" : "#2F6F53"}>{restrictedFundsStatus(periodsResult.currentBalance)}</Badge>
+                  {restrictedFundsNeedsReview(selectedGrant, periodsResult.currentBalance) && <Badge color="#B5443A">Past End Date - Review</Badge>}
                 </div>
-                {canEdit && (
-                  addFundsOpen ? (
-                    <div className="flex items-end gap-2 p-3 rounded-md" style={{ background: "#F6F7F3" }}>
-                      <Field label="Month">
-                        <input type="month" className={inputCls} style={inputStyle} value={addFundsMonth} onChange={(e) => setAddFundsMonth(e.target.value)} />
-                      </Field>
-                      <Field label="Amount">
-                        <input type="number" className={inputCls} style={inputStyle} value={addFundsAmount} onChange={(e) => setAddFundsAmount(e.target.value)} />
-                      </Field>
-                      <button onClick={addFunds} className="text-sm px-4 py-2 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Add</button>
-                      <button onClick={() => setAddFundsOpen(false)} className="text-sm px-4 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-                    </div>
-                  ) : (
-                    <button onClick={() => setAddFundsOpen(true)} className="text-sm inline-flex items-center gap-1" style={{ color: "#1F5C6B" }}>
-                      <Plus size={14} /> Add restricted funds (e.g. an amendment or supplemental award)
-                    </button>
-                  )
-                )}
               </div>
 
-              <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
-                <table className="w-full text-sm">
+              {canEdit && (
+                addPeriodOpen ? (
+                  <div className="flex items-end gap-2 p-3 rounded-md bg-white border" style={{ borderColor: "#E1E5DE" }}>
+                    <Field label="Period start">
+                      <input type="date" className={inputCls} style={inputStyle} value={addPeriodStart} onChange={(e) => setAddPeriodStart(e.target.value)} />
+                    </Field>
+                    <Field label="Period end">
+                      <input type="date" className={inputCls} style={inputStyle} value={addPeriodEnd} onChange={(e) => setAddPeriodEnd(e.target.value)} />
+                    </Field>
+                    <button onClick={addPeriod} className="text-sm px-4 py-2 rounded-md text-white shrink-0" style={{ background: "#1F5C6B" }}>Add period</button>
+                    <button onClick={() => setAddPeriodOpen(false)} className="text-sm px-4 py-2 rounded-md border shrink-0" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setAddPeriodOpen(true)} className="text-sm inline-flex items-center gap-1" style={{ color: "#1F5C6B" }}>
+                    <Plus size={14} /> Add reporting period
+                  </button>
+                )
+              )}
+
+              <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+                <table className="w-full text-sm" style={{ whiteSpace: "nowrap" }}>
                   <thead>
                     <tr style={{ background: "#F6F7F3" }}>
-                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Month</th>
-                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Added</th>
-                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Release mode</th>
-                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Released</th>
-                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Running balance</th>
+                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Period</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Beginning</th>
+                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Receipts</th>
+                      <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Expenditures</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Other releases</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Total released</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Ending balance</th>
+                      <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>% expended</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {ledger.rows.map((row) => {
-                      const autoValue = grantMonthlyExpenseActual(selectedGrantId, budgets, row.year, row.monthIndex);
+                    {periodsResult.rows.map((p, idx) => {
+                      const autoReceipts = grantPeriodReceipts(selectedGrantId, invoices, p.periodStart, p.periodEnd);
+                      const autoExpenditures = grantPeriodExpenditures(selectedGrantId, budgets, p.periodStart, p.periodEnd);
                       return (
-                        <tr key={`${row.year}-${row.monthIndex}`} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                          <td className="px-3 py-1.5" style={{ color: "#1C2624" }}>{MONTHS[row.monthIndex]} {row.year}</td>
-                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{row.added ? fmt(row.added) : "—"}</td>
+                        <tr key={p.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                          <td className="px-3 py-1.5" style={{ color: "#1C2624" }}>{fmtDate(p.periodStart)} – {fmtDate(p.periodEnd)}</td>
+                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>
+                            {idx === 0 && canEdit ? (
+                              <input type="number" className="text-xs rounded border px-1.5 py-1 text-right w-28" style={{ borderColor: "#E1E5DE", color: "#1C2624" }} value={p.beginningBalance} onChange={(e) => updatePeriod(p.id, { beginningBalance: e.target.value })} />
+                            ) : fmt(p.beginningBalance)}
+                          </td>
                           <td className="px-3 py-1.5">
-                            <select
-                              disabled={!canEdit}
-                              className="text-xs rounded border px-1.5 py-1"
-                              style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
-                              value={row.mode}
-                              onChange={(e) => updateEntry(row.year, row.monthIndex, { releaseMode: e.target.value, manualRelease: e.target.value === "manual" ? autoValue : 0 })}
-                            >
-                              <option value="auto">Auto</option>
-                              <option value="manual">Manual override</option>
-                            </select>
+                            <div className="flex items-center justify-end gap-1.5">
+                              <select disabled={!canEdit} className="text-xs rounded border px-1 py-1" style={{ borderColor: "#E1E5DE", color: "#1C2624" }} value={p.receiptsMode || "auto"} onChange={(e) => updatePeriod(p.id, { receiptsMode: e.target.value, manualReceipts: e.target.value === "manual" ? autoReceipts : 0 })}>
+                                <option value="auto">Auto</option>
+                                <option value="manual">Manual</option>
+                              </select>
+                              {p.receiptsMode === "manual" && canEdit ? (
+                                <input type="number" className="text-xs rounded border px-1.5 py-1 text-right w-24" style={{ borderColor: "#E1E5DE", color: "#1C2624" }} value={p.receipts} onChange={(e) => updatePeriod(p.id, { manualReceipts: e.target.value })} />
+                              ) : (
+                                <span style={{ fontVariantNumeric: "tabular-nums", color: p.receiptsMode === "manual" ? "#C08A2E" : "#1C2624" }}>{fmt(p.receipts)}</span>
+                              )}
+                            </div>
                           </td>
-                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>
-                            {row.mode === "manual" && canEdit ? (
-                              <input
-                                type="number"
-                                className="text-xs rounded border px-1.5 py-1 text-right w-28"
-                                style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
-                                value={row.released}
-                                onChange={(e) => updateEntry(row.year, row.monthIndex, { manualRelease: e.target.value })}
-                              />
-                            ) : (
-                              <span style={{ color: row.mode === "manual" ? "#C08A2E" : "#1C2624" }}>{row.released ? fmt(row.released) : "—"}</span>
-                            )}
+                          <td className="px-3 py-1.5">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <select disabled={!canEdit} className="text-xs rounded border px-1 py-1" style={{ borderColor: "#E1E5DE", color: "#1C2624" }} value={p.expendituresMode || "auto"} onChange={(e) => updatePeriod(p.id, { expendituresMode: e.target.value, manualExpenditures: e.target.value === "manual" ? autoExpenditures : 0 })}>
+                                <option value="auto">Auto</option>
+                                <option value="manual">Manual</option>
+                              </select>
+                              {p.expendituresMode === "manual" && canEdit ? (
+                                <input type="number" className="text-xs rounded border px-1.5 py-1 text-right w-24" style={{ borderColor: "#E1E5DE", color: "#1C2624" }} value={p.expenditures} onChange={(e) => updatePeriod(p.id, { manualExpenditures: e.target.value })} />
+                              ) : (
+                                <span style={{ fontVariantNumeric: "tabular-nums", color: p.expendituresMode === "manual" ? "#C08A2E" : "#1C2624" }}>{fmt(p.expenditures)}</span>
+                              )}
+                            </div>
                           </td>
-                          <td className="px-3 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(row.balance) ? "#2F6F53" : "#B5443A" }}>{fmt(row.balance)}</td>
+                          <td className="px-3 py-1.5 text-right">
+                            {canEdit ? (
+                              <input type="number" className="text-xs rounded border px-1.5 py-1 text-right w-24" style={{ borderColor: "#E1E5DE", color: "#1C2624" }} value={p.otherReleases} onChange={(e) => updatePeriod(p.id, { otherReleases: e.target.value })} />
+                            ) : fmt(p.otherReleases)}
+                          </td>
+                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(p.totalReleased)}</td>
+                          <td className="px-3 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(p.endingBalance) ? "#2F6F53" : "#B5443A" }}>{fmt(p.endingBalance)}</td>
+                          <td className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{p.pctExpended !== null ? `${(p.pctExpended * 100).toFixed(0)}%` : "—"}</td>
                         </tr>
                       );
                     })}
+                    {periodsResult.rows.length === 0 && (
+                      <tr><td colSpan={8} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No reporting periods yet.</td></tr>
+                    )}
                   </tbody>
                 </table>
               </div>
               <p className="text-xs" style={{ color: "#8A8F87" }}>
-                "Auto" pulls that month's real expense actuals from this grant's Grant Budget(s) — not a projection. Switch a month to "Manual override" to enter the release yourself.
+                "Auto" pulls Receipts from Paid invoices and Expenditures from real grant expense actuals — never a projection. Switch either to "Manual" on any period to enter it yourself. Beginning balance carries forward automatically from the prior period's ending balance, except on the first period.
               </p>
               {canEdit && (
                 <div className="pt-2 border-t" style={{ borderColor: "#E1E5DE" }}>
@@ -7790,9 +7934,9 @@ function RestrictedFundsView({ grants, budgets, restrictedFunds, setRestrictedFu
 function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFunds, logActivity, onClose }) {
   const [step, setStep] = useState("upload"); // upload -> link -> review -> done
   const [error, setError] = useState("");
-  const [rows, setRows] = useState(null); // parsed rows from the sheet
-  const [linkDraft, setLinkDraft] = useState({}); // row index -> grantId | "__skip__"
-  const [conflictDraft, setConflictDraft] = useState({}); // grantId -> "replace" | "skip"
+  const [rows, setRows] = useState(null);
+  const [linkDraft, setLinkDraft] = useState({});
+  const [conflictDraft, setConflictDraft] = useState({});
 
   const parseFile = async (file) => {
     setError("");
@@ -7800,55 +7944,60 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
     try {
       const buf = await file.arrayBuffer();
       const wb = XLSX.read(buf, { type: "array", cellDates: true });
-      const dataSheetName = wb.SheetNames.find((n) => /tracker1|detail/i.test(n)) || wb.SheetNames.find((n) => n !== "Lists" && n !== "Dashboard") || wb.SheetNames[0];
+      const dataSheetName = wb.SheetNames.find((n) => /matrix|tracker1|detail/i.test(n)) || wb.SheetNames.find((n) => n !== "Lists" && n !== "Field Definitions" && n !== "Dashboard") || wb.SheetNames[0];
       const sheet = wb.Sheets[dataSheetName];
       const aoa = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
-      const headerRowIdx = aoa.findIndex((row) => row && row.some((c) => typeof c === "string" && c.trim() === "Fund / Restriction"));
+      const headerRowIdx = aoa.findIndex((row) => row && row.some((c) => typeof c === "string" && c.replace(/\s+/g, " ").trim().startsWith("Grant / Award Name")));
       if (headerRowIdx === -1) {
-        setError('Couldn\'t find the "Fund / Restriction" header row — make sure this is the TRNA Tracker detail sheet.');
+        setError('Couldn\'t find a "Grant / Award Name" header row — make sure this is the TRNA Matrix sheet.');
         return;
       }
-      const header = aoa[headerRowIdx];
+      const header = aoa[headerRowIdx].map((c) => (typeof c === "string" ? c.replace(/\s+/g, " ").trim() : c));
       const col = (name) => header.findIndex((c) => c === name);
-      const cFund = col("Fund / Restriction"), cType = col("Restriction Type"), cBeg = col("Beginning Balance"),
-        cRev = col("Restricted Revenue"), cRel = col("Releases from Restriction"), cAdj = col("Adjustments");
+      const cName = col("Grant / Award Name"), cNumber = col("Grant Number"), cFund = col("Fund Code"),
+        cType = col("Restriction Type (Purpose/Time/Both)") !== -1 ? col("Restriction Type (Purpose/Time/Both)") : col("Restriction Type"),
+        cCondition = col("Release Condition"), cAward = col("Total Award Amount"), cBeg = col("Beginning Balance"),
+        cReceipts = col("Receipts This Period"), cExpend = col("Expenditures This Period"), cOther = col("Other Releases"),
+        cStart = col("Period Start"), cEnd = col("Period End"), cNotes = col("Notes / Status");
 
       const parsed = [];
       for (let i = headerRowIdx + 1; i < aoa.length; i++) {
         const row = aoa[i];
-        if (!row || !row[cFund]) continue;
-        const fundLabel = String(row[cFund]).trim();
-        const code = fundLabel.split(" - ")[0].trim();
-        const restrictedRevenue = Number(row[cRev]) || 0;
-        const releases = Math.abs(Number(row[cRel]) || 0);
-        const adjustments = Number(row[cAdj]) || 0;
-        const beginningBalance = Number(row[cBeg]) || 0;
-        const restrictionType = RESTRICTION_TYPES.includes(row[cType]) ? row[cType] : "Time & Purpose";
-        parsed.push({ fundLabel, code, restrictedRevenue, releases, adjustments, beginningBalance, restrictionType });
+        if (!row || !row[cName]) continue;
+        const label = String(row[cName]).trim();
+        if (/example row/i.test(label)) continue;
+        const code = label.split(/[-–]/)[0].trim();
+        const toDate = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : (typeof v === "string" && v ? v : null));
+        parsed.push({
+          label, code,
+          grantNumber: cNumber !== -1 ? row[cNumber] : "",
+          fundCode: cFund !== -1 ? row[cFund] : "",
+          restrictionType: cType !== -1 ? row[cType] : "Both",
+          releaseCondition: cCondition !== -1 ? row[cCondition] || "" : "",
+          notes: cNotes !== -1 ? row[cNotes] || "" : "",
+          periodStart: cStart !== -1 ? toDate(row[cStart]) : null,
+          periodEnd: cEnd !== -1 ? toDate(row[cEnd]) : null,
+          totalAward: Number(row[cAward]) || 0,
+          beginningBalance: Number(row[cBeg]) || 0,
+          receipts: Number(row[cReceipts]) || 0,
+          expenditures: Number(row[cExpend]) || 0,
+          otherReleases: Number(row[cOther]) || 0,
+        });
       }
-      if (parsed.length === 0) {
-        setError("No data rows were found under the header row.");
-        return;
-      }
+      if (parsed.length === 0) { setError("No data rows were found under the header row."); return; }
       setRows(parsed);
       setStep("link");
     } catch (e) {
-      setError("Couldn't read that file — make sure it's the TRNA Tracker workbook.");
+      setError("Couldn't read that file — make sure it's the TRNA Matrix workbook.");
     }
   };
 
-  // Match each row to a grant by the leading code in "Fund / Restriction" —
-  // exact match only. A compound reference (e.g. multiple codes combined
-  // into one row) won't match anything and needs a manual pick, same as
-  // every other importer in this app.
-  const suggestedGrant = (code) => grants.find((g) => g.programCode && String(g.programCode).trim() === code);
-  const unmatchedRows = (rows || []).map((r, i) => ({ ...r, index: i })).filter((r) => !suggestedGrant(r.code));
+  const suggestedGrant = (row) => grants.find((g) => (g.programCode && String(g.programCode).trim() === row.code) || (g.title && row.label.includes(g.title)));
+  const unmatchedRows = (rows || []).map((r, i) => ({ ...r, index: i })).filter((r) => !suggestedGrant(r));
 
   const goToReview = () => {
     const finalized = { ...linkDraft };
-    unmatchedRows.forEach((r) => {
-      if (finalized[r.index] === undefined) finalized[r.index] = "__skip__";
-    });
+    unmatchedRows.forEach((r) => { if (finalized[r.index] === undefined) finalized[r.index] = "__skip__"; });
     setLinkDraft(finalized);
     setStep("review");
   };
@@ -7856,7 +8005,7 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
   const resolvedRows = (rows || [])
     .map((r, i) => {
       const linked = linkDraft[i];
-      const grantId = linked && linked !== "__skip__" ? linked : suggestedGrant(r.code)?.id;
+      const grantId = linked && linked !== "__skip__" ? linked : suggestedGrant(r)?.id;
       if (!grantId) return null;
       const grant = grants.find((g) => g.id === grantId);
       const existing = restrictedFunds.find((rf) => rf.grantId === grantId);
@@ -7865,7 +8014,7 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
     .filter(Boolean);
 
   const applyImport = () => {
-    const today = new Date();
+    const today = new Date().toISOString().slice(0, 10);
     let created = 0, updated = 0, skipped = 0;
     setRestrictedFunds((prev) => {
       let next = [...prev];
@@ -7874,12 +8023,17 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
         const record = {
           id: r.existing?.id || uid(),
           grantId: r.grant.id,
-          beginningBalance: r.beginningBalance,
-          beginningBalanceDate: `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-01`,
-          restrictionType: r.restrictionType,
-          entries: [{
-            id: uid(), year: today.getFullYear(), monthIndex: today.getMonth(),
-            added: r.restrictedRevenue + r.adjustments, releaseMode: "manual", manualRelease: r.releases,
+          restrictionType: RESTRICTION_TYPES.includes(r.restrictionType) ? r.restrictionType : "Both",
+          releaseCondition: r.releaseCondition || "",
+          notes: r.notes || "",
+          periods: [{
+            id: uid(),
+            periodStart: r.periodStart || today,
+            periodEnd: r.periodEnd || today,
+            beginningBalance: r.beginningBalance,
+            receiptsMode: "manual", manualReceipts: r.receipts,
+            expendituresMode: "manual", manualExpenditures: r.expenditures,
+            otherReleases: r.otherReleases,
           }],
         };
         if (r.existing) { next = next.map((x) => (x.id === r.existing.id ? record : x)); updated++; }
@@ -7887,18 +8041,18 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
       });
       return next;
     });
-    logActivity?.("Restricted Funds", "Updated", `Imported from TRNA Tracker Excel — ${created} created, ${updated} updated, ${skipped} skipped`);
+    logActivity?.("Restricted Funds", "Updated", `Imported from TRNA Matrix Excel — ${created} created, ${updated} updated, ${skipped} skipped`);
     setStep("done");
   };
 
   return (
-    <Modal title="Import from TRNA Tracker Excel" onClose={onClose} wide>
+    <Modal title="Import from TRNA Matrix Excel" onClose={onClose} wide>
       {step === "upload" && (
         <div className="space-y-4">
           <p className="text-sm" style={{ color: "#5B6B66" }}>
-            Upload the TRNA Tracker workbook. Each row becomes a starting snapshot — beginning balance, total restricted revenue, and total releases as of today — with releases marked as a manual entry so nothing here silently recomputes from budget actuals until you choose to.
+            Upload the TRNA Matrix workbook. Each row becomes a single reporting period — beginning balance, receipts, expenditures, and other releases as entered — imported as manual entries so nothing recomputes until you choose to.
           </p>
-          <Field label="TRNA Tracker workbook (.xlsx)">
+          <Field label="TRNA Matrix workbook (.xlsx)">
             <input type="file" accept=".xlsx" className={inputCls} style={inputStyle} onChange={(e) => e.target.files[0] && parseFile(e.target.files[0])} />
           </Field>
           {error && <p className="text-xs" style={{ color: "#B5443A" }}>{error}</p>}
@@ -7911,16 +8065,16 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
       {step === "link" && (
         <div className="space-y-4">
           {unmatchedRows.length === 0 ? (
-            <p className="text-sm" style={{ color: "#5B6B66" }}>Every row matched a grant by its program code. Continue to review.</p>
+            <p className="text-sm" style={{ color: "#5B6B66" }}>Every row matched a grant. Continue to review.</p>
           ) : (
             <>
               <p className="text-sm" style={{ color: "#5B6B66" }}>
-                These rows didn't match a grant's program code exactly (often because the "Fund / Restriction" cell combines more than one code) — pick the right grant, or skip the row.
+                These rows didn't match a grant by program code or title — pick the right grant, or skip the row.
               </p>
               <div className="space-y-2 max-h-96 overflow-y-auto">
                 {unmatchedRows.map((r) => (
                   <div key={r.index} className="flex items-center gap-2 p-2 rounded-md border" style={{ borderColor: "#E1E5DE" }}>
-                    <div className="text-sm flex-1" style={{ color: "#1C2624" }}>{r.fundLabel}</div>
+                    <div className="text-sm flex-1" style={{ color: "#1C2624" }}>{r.label}</div>
                     <select
                       className={inputCls} style={{ ...inputStyle, flex: 1 }}
                       value={linkDraft[r.index] ?? "__skip__"}
@@ -7952,8 +8106,9 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
                 <tr style={{ background: "#F6F7F3", color: "#5B6B66" }}>
                   <th className="text-left px-2 py-1.5">Grant</th>
                   <th className="text-right px-2 py-1.5">Beginning</th>
-                  <th className="text-right px-2 py-1.5">Restricted Rev.</th>
-                  <th className="text-right px-2 py-1.5">Releases</th>
+                  <th className="text-right px-2 py-1.5">Receipts</th>
+                  <th className="text-right px-2 py-1.5">Expenditures</th>
+                  <th className="text-right px-2 py-1.5">Other releases</th>
                   <th className="text-left px-2 py-1.5">If already tracked</th>
                 </tr>
               </thead>
@@ -7962,8 +8117,9 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
                   <tr key={r.index} className="border-t" style={{ borderColor: "#E1E5DE" }}>
                     <td className="px-2 py-1" style={{ color: "#1C2624" }}>{r.grant.programCode ? `${r.grant.programCode} - ${r.grant.title}` : r.grant.title}</td>
                     <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.beginningBalance)}</td>
-                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.restrictedRevenue + r.adjustments)}</td>
-                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.releases)}</td>
+                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.receipts)}</td>
+                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.expenditures)}</td>
+                    <td className="px-2 py-1 text-right" style={{ color: "#1C2624" }}>{fmt(r.otherReleases)}</td>
                     <td className="px-2 py-1">
                       {r.existing ? (
                         <select
@@ -8381,7 +8537,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
     (restrictedFunds || []).forEach((r) => {
       const g = grantById[r.grantId];
       const label = g ? (g.programCode ? g.programCode + " - " : "") + g.title : "Unknown grant";
-      const { currentBalance } = computeRestrictedFundsLedger(r, r.grantId, budgets);
+      const currentBalance = restrictedFundsCurrentBalance(r, r.grantId, budgets, invoices, Number(g?.awardAmount) || 0);
       if (currentBalance < -0.01) {
         issues.push({ level: "error", area: "Restricted Funds", text: `"${label}" has a negative restricted balance (${fmt(currentBalance)}) — more has been released than was ever added.` });
       }
@@ -9485,7 +9641,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           <BurnRateView grants={grants} budgets={budgets} />
         ) : tab === "restricted-funds" ? (
           <RestrictedFundsView
-            grants={grants} budgets={budgets} restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
+            grants={grants} budgets={budgets} invoices={invoices} restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
             budgetGroups={budgetGroups} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "personnel" ? (
