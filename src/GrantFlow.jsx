@@ -400,7 +400,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -8604,7 +8604,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [], setRestrictedFunds, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [], setRestrictedFunds, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, paylocitySnapshots = [], setPaylocitySnapshots }) {
   const [showHealthCheck, setShowHealthCheck] = useState(false);
 
   // Runs the same categories of checks we've done manually against backup
@@ -8710,7 +8710,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
@@ -8747,9 +8747,9 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   };
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots]);
 
   const copyBackupText = async () => {
     try {
@@ -8783,6 +8783,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.restrictedFunds)) setRestrictedFunds?.(data.restrictedFunds);
         if (Array.isArray(data.paylocityProgramMap)) setPaylocityProgramMap?.(data.paylocityProgramMap);
         if (data.paylocityLastImport) setPaylocityLastImport?.(data.paylocityLastImport);
+        if (Array.isArray(data.paylocitySnapshots)) setPaylocitySnapshots?.(data.paylocitySnapshots);
         logActivity?.("Data", "Restored", `Restored from backup file "${file.name}"`);
         setRestoreSummary(`Restored ${data.grants?.length || 0} grants, ${data.budgets?.length || 0} budgets, ${data.reports?.length || 0} reports, ${data.staff?.length || 0} staff, ${data.tasks?.length || 0} tasks, ${data.invoices?.length || 0} invoices, ${data.costCenters?.length || 0} cost centers, ${data.budgetGroups?.length || 0} budget groups, ${data.scenarios?.length || 0} scenarios, ${data.restrictedFunds?.length || 0} restricted funds records.`);
       } catch (err) {
@@ -9584,7 +9585,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       } catch (e) { /* no meta yet */ }
       if (meta?.lastBackupDate === today) return; // already backed up today
       try {
-        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport };
+        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
         await window.storage.set(`grantflow:autobackup:${today}`, JSON.stringify(payload), true);
         await window.storage.set(metaKey, JSON.stringify({ lastBackupDate: today }), true);
         const list = await window.storage.list("grantflow:autobackup:", true);
@@ -9828,6 +9829,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             restrictedFunds={restrictedFunds} setRestrictedFunds={setRestrictedFunds}
             paylocityProgramMap={paylocityProgramMap} setPaylocityProgramMap={setPaylocityProgramMap}
             paylocityLastImport={paylocityLastImport} setPaylocityLastImport={setPaylocityLastImport}
+            paylocitySnapshots={paylocitySnapshots} setPaylocitySnapshots={setPaylocitySnapshots}
           />
         ) : tab === "user-access" && isAdmin ? (
           <AdminPanel currentUserEmail={currentUserEmail || whoami} />
