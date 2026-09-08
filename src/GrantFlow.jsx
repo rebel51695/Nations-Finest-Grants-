@@ -5707,6 +5707,13 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const [matrixSnapshotId, setMatrixSnapshotId] = useState("");
   const [matrixSearch, setMatrixSearch] = useState("");
   const [matrixTrendStaffId, setMatrixTrendStaffId] = useState("");
+  const [matrixSubView, setMatrixSubView] = useState("snapshot"); // snapshot | delta | rollup
+  const [deltaStaffId, setDeltaStaffId] = useState("");
+  const [deltaFromId, setDeltaFromId] = useState("");
+  const [deltaToId, setDeltaToId] = useState("");
+  const [rollupGrantId, setRollupGrantId] = useState("");
+  const [rollupFromId, setRollupFromId] = useState("");
+  const [rollupToId, setRollupToId] = useState("");
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const visible = staff
@@ -5869,114 +5876,298 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
         if (sortedSnapshots.length === 0) {
           return <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>No allocation snapshots yet — one gets captured automatically the next time you run a Paylocity import with Allocations checked.</div>;
         }
-        const snapshot = sortedSnapshots.find((s) => s.id === matrixSnapshotId) || sortedSnapshots[0];
-
-        if (matrixTrendStaffId) {
-          const chronological = [...paylocitySnapshots].sort((a, b) => new Date(a.periodEnd) - new Date(b.periodEnd));
-          const trendRows = chronological.map((s) => ({ s, entry: s.entries.find((e) => e.staffId === matrixTrendStaffId) })).filter((r) => r.entry);
-          const staffName = trendRows[0]?.entry.staffName || "Employee";
-          return (
-            <div className="space-y-3">
-              <button onClick={() => setMatrixTrendStaffId("")} className="text-sm" style={{ color: "#1F5C6B" }}>← Back to matrix</button>
-              <h3 className="font-display text-base" style={{ color: "#1C2624" }}>{staffName} — allocation over time</h3>
-              <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr style={{ background: "#F6F7F3" }}>
-                      <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Pay period</th>
-                      <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant / cost center</th>
-                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>%</th>
-                      <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Fully-loaded $</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {trendRows.map(({ s, entry }) => (entry.allocations || []).map((a, i) => {
-                      const g = grants.find((x) => x.id === a.grantId);
-                      const cc = costCenters.find((x) => x.id === a.costCenterId);
-                      const name = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
-                      return (
-                        <tr key={`${s.id}-${i}`} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                          {i === 0 && <td className="px-4 py-1.5" style={{ color: "#1C2624" }} rowSpan={(entry.allocations || []).length}>{fmtDate(s.periodStart)} – {fmtDate(s.periodEnd)}</td>}
-                          <td className="px-4 py-1.5" style={{ color: "#1C2624" }}>{name}</td>
-                          <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{Number(a.percent).toFixed(0)}%</td>
-                          <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(entry.fullyLoadedCost * (Number(a.percent) || 0) / 100)}</td>
-                        </tr>
-                      );
-                    }))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          );
-        }
-
-        const columnsMap = {};
-        snapshot.entries.forEach((e) => {
-          (e.allocations || []).forEach((a) => {
-            const key = a.grantId || a.costCenterId;
-            if (!key || columnsMap[key]) return;
-            const g = grants.find((x) => x.id === a.grantId);
-            const cc = costCenters.find((x) => x.id === a.costCenterId);
-            columnsMap[key] = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
-          });
-        });
-        const columns = Object.entries(columnsMap).sort((a, b) => a[1].localeCompare(b[1]));
-        const filteredEntries = snapshot.entries.filter((e) => !matrixSearch || e.staffName.toLowerCase().includes(matrixSearch.toLowerCase()));
-        const headcountByCol = {};
-        columns.forEach(([key]) => {
-          headcountByCol[key] = snapshot.entries.filter((e) => (e.allocations || []).some((a) => (a.grantId || a.costCenterId) === key && Number(a.percent) > 0)).length;
-        });
+        const periodLabel = (s) => `${fmtDate(s.periodStart)} – ${fmtDate(s.periodEnd)}`;
 
         return (
           <div className="space-y-3">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <div className="flex items-center gap-2">
-                <select className={inputCls} style={{ ...inputStyle, maxWidth: 260 }} value={snapshot.id} onChange={(e) => setMatrixSnapshotId(e.target.value)}>
-                  {sortedSnapshots.map((s) => <option key={s.id} value={s.id}>{fmtDate(s.periodStart)} – {fmtDate(s.periodEnd)}</option>)}
-                </select>
-                <input value={matrixSearch} onChange={(e) => setMatrixSearch(e.target.value)} placeholder="Search employee…" className={inputCls} style={{ ...inputStyle, maxWidth: 200 }} />
-              </div>
-              <p className="text-xs" style={{ color: "#8A8F87" }}>{snapshot.entries.length} staff · {sortedSnapshots.length} pay period{sortedSnapshots.length === 1 ? "" : "s"} on file</p>
+            <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+              <button onClick={() => setMatrixSubView("snapshot")} className="px-3 py-2 text-sm font-medium" style={{ background: matrixSubView === "snapshot" ? "#1F5C6B" : "#FFFFFF", color: matrixSubView === "snapshot" ? "#FFFFFF" : "#5B6B66" }}>Snapshot</button>
+              <button onClick={() => setMatrixSubView("delta")} className="px-3 py-2 text-sm font-medium" style={{ background: matrixSubView === "delta" ? "#1F5C6B" : "#FFFFFF", color: matrixSubView === "delta" ? "#FFFFFF" : "#5B6B66" }}>Delta</button>
+              <button onClick={() => setMatrixSubView("rollup")} className="px-3 py-2 text-sm font-medium" style={{ background: matrixSubView === "rollup" ? "#1F5C6B" : "#FFFFFF", color: matrixSubView === "rollup" ? "#FFFFFF" : "#5B6B66" }}>Grant Rollup</button>
             </div>
-            <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
-              <table className="text-sm" style={{ whiteSpace: "nowrap", borderCollapse: "collapse", width: "100%" }}>
-                <thead>
-                  <tr style={{ background: "#F6F7F3" }}>
-                    <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Employee</th>
-                    {columns.map(([key, name]) => <th key={key} className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>{name}</th>)}
-                    <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Total</th>
-                    <th className="px-3 py-2"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredEntries.map((e) => {
-                    const total = (e.allocations || []).reduce((a, al) => a + (Number(al.percent) || 0), 0);
-                    return (
-                      <tr key={e.staffId} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                        <td className="px-3 py-1.5" style={{ color: "#1C2624" }}>{e.staffName}</td>
-                        {columns.map(([key]) => {
-                          const a = (e.allocations || []).find((x) => (x.grantId || x.costCenterId) === key);
-                          return <td key={key} className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: a ? "#1C2624" : "#B4B8B2" }}>{a ? `${Number(a.percent).toFixed(0)}%` : "—"}</td>;
+
+            {matrixSubView === "snapshot" && (() => {
+              const snapshot = sortedSnapshots.find((s) => s.id === matrixSnapshotId) || sortedSnapshots[0];
+
+              if (matrixTrendStaffId) {
+                const chronological = [...paylocitySnapshots].sort((a, b) => new Date(a.periodEnd) - new Date(b.periodEnd));
+                const trendRows = chronological.map((s) => ({ s, entry: s.entries.find((e) => e.staffId === matrixTrendStaffId) })).filter((r) => r.entry);
+                const staffName = trendRows[0]?.entry.staffName || "Employee";
+                return (
+                  <div className="space-y-3">
+                    <button onClick={() => setMatrixTrendStaffId("")} className="text-sm" style={{ color: "#1F5C6B" }}>← Back to matrix</button>
+                    <h3 className="font-display text-base" style={{ color: "#1C2624" }}>{staffName} — allocation over time</h3>
+                    <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr style={{ background: "#F6F7F3" }}>
+                            <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Pay period</th>
+                            <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant / cost center</th>
+                            <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>%</th>
+                            <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>Fully-loaded $</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {trendRows.map(({ s, entry }) => (entry.allocations || []).map((a, i) => {
+                            const g = grants.find((x) => x.id === a.grantId);
+                            const cc = costCenters.find((x) => x.id === a.costCenterId);
+                            const name = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+                            return (
+                              <tr key={`${s.id}-${i}`} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                                {i === 0 && <td className="px-4 py-1.5" style={{ color: "#1C2624" }} rowSpan={(entry.allocations || []).length}>{periodLabel(s)}</td>}
+                                <td className="px-4 py-1.5" style={{ color: "#1C2624" }}>{name}</td>
+                                <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{Number(a.percent).toFixed(0)}%</td>
+                                <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(entry.fullyLoadedCost * (Number(a.percent) || 0) / 100)}</td>
+                              </tr>
+                            );
+                          }))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                );
+              }
+
+              const columnsMap = {};
+              snapshot.entries.forEach((e) => {
+                (e.allocations || []).forEach((a) => {
+                  const key = a.grantId || a.costCenterId;
+                  if (!key || columnsMap[key]) return;
+                  const g = grants.find((x) => x.id === a.grantId);
+                  const cc = costCenters.find((x) => x.id === a.costCenterId);
+                  columnsMap[key] = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+                });
+              });
+              const columns = Object.entries(columnsMap).sort((a, b) => a[1].localeCompare(b[1]));
+              const filteredEntries = snapshot.entries.filter((e) => !matrixSearch || e.staffName.toLowerCase().includes(matrixSearch.toLowerCase()));
+              const headcountByCol = {};
+              columns.forEach(([key]) => {
+                headcountByCol[key] = snapshot.entries.filter((e) => (e.allocations || []).some((a) => (a.grantId || a.costCenterId) === key && Number(a.percent) > 0)).length;
+              });
+
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <select className={inputCls} style={{ ...inputStyle, maxWidth: 260 }} value={snapshot.id} onChange={(e) => setMatrixSnapshotId(e.target.value)}>
+                        {sortedSnapshots.map((s) => <option key={s.id} value={s.id}>{periodLabel(s)}</option>)}
+                      </select>
+                      <input value={matrixSearch} onChange={(e) => setMatrixSearch(e.target.value)} placeholder="Search employee…" className={inputCls} style={{ ...inputStyle, maxWidth: 200 }} />
+                    </div>
+                    <p className="text-xs" style={{ color: "#8A8F87" }}>{snapshot.entries.length} staff · {sortedSnapshots.length} pay period{sortedSnapshots.length === 1 ? "" : "s"} on file</p>
+                  </div>
+                  <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+                    <table className="text-sm" style={{ whiteSpace: "nowrap", borderCollapse: "collapse", width: "100%" }}>
+                      <thead>
+                        <tr style={{ background: "#F6F7F3" }}>
+                          <th className="text-left px-3 py-2" style={{ color: "#5B6B66" }}>Employee</th>
+                          {columns.map(([key, name]) => <th key={key} className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>{name}</th>)}
+                          <th className="text-right px-3 py-2" style={{ color: "#5B6B66" }}>Total</th>
+                          <th className="px-3 py-2"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredEntries.map((e) => {
+                          const total = (e.allocations || []).reduce((a, al) => a + (Number(al.percent) || 0), 0);
+                          return (
+                            <tr key={e.staffId} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                              <td className="px-3 py-1.5" style={{ color: "#1C2624" }}>{e.staffName}</td>
+                              {columns.map(([key]) => {
+                                const a = (e.allocations || []).find((x) => (x.grantId || x.costCenterId) === key);
+                                return <td key={key} className="px-3 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: a ? "#1C2624" : "#B4B8B2" }}>{a ? `${Number(a.percent).toFixed(0)}%` : "—"}</td>;
+                              })}
+                              <td className="px-3 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{total.toFixed(0)}%</td>
+                              <td className="px-3 py-1.5 text-right"><button onClick={() => setMatrixTrendStaffId(e.staffId)} className="text-xs" style={{ color: "#1F5C6B" }}>View trend →</button></td>
+                            </tr>
+                          );
                         })}
-                        <td className="px-3 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{total.toFixed(0)}%</td>
-                        <td className="px-3 py-1.5 text-right"><button onClick={() => setMatrixTrendStaffId(e.staffId)} className="text-xs" style={{ color: "#1F5C6B" }}>View trend →</button></td>
-                      </tr>
+                        {filteredEntries.length === 0 && (
+                          <tr><td colSpan={columns.length + 3} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No matching employees in this pay period.</td></tr>
+                        )}
+                        <tr className="border-t" style={{ borderColor: "#E1E5DE", background: "#F6F7F3" }}>
+                          <td className="px-3 py-1.5 font-medium" style={{ color: "#1C2624" }}>Headcount this period</td>
+                          {columns.map(([key]) => <td key={key} className="px-3 py-1.5 text-right" style={{ color: "#1C2624" }}>{headcountByCol[key]}</td>)}
+                          <td></td><td></td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-xs" style={{ color: "#8A8F87" }}>
+                    Captured automatically whenever a Paylocity import updates Allocations — one permanent snapshot per pay period. Nothing here is projected or recomputed after the fact.
+                  </p>
+                </div>
+              );
+            })()}
+
+            {matrixSubView === "delta" && (() => {
+              const chronological = [...paylocitySnapshots].sort((a, b) => new Date(a.periodEnd) - new Date(b.periodEnd));
+              const fromSnap = chronological.find((s) => s.id === deltaFromId) || chronological[0];
+              const toSnap = chronological.find((s) => s.id === deltaToId) || chronological[chronological.length - 1];
+              const allStaffNames = {};
+              chronological.forEach((s) => s.entries.forEach((e) => { allStaffNames[e.staffId] = e.staffName; }));
+              const staffOptions = Object.entries(allStaffNames).sort((a, b) => a[1].localeCompare(b[1]));
+
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <select className={inputCls} style={{ ...inputStyle, maxWidth: 220 }} value={deltaStaffId} onChange={(e) => setDeltaStaffId(e.target.value)}>
+                      <option value="">Select an employee</option>
+                      {staffOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+                    </select>
+                    <select className={inputCls} style={{ ...inputStyle, maxWidth: 220 }} value={fromSnap?.id || ""} onChange={(e) => setDeltaFromId(e.target.value)}>
+                      {chronological.map((s) => <option key={s.id} value={s.id}>From: {periodLabel(s)}</option>)}
+                    </select>
+                    <select className={inputCls} style={{ ...inputStyle, maxWidth: 220 }} value={toSnap?.id || ""} onChange={(e) => setDeltaToId(e.target.value)}>
+                      {chronological.map((s) => <option key={s.id} value={s.id}>To: {periodLabel(s)}</option>)}
+                    </select>
+                  </div>
+
+                  {!deltaStaffId ? (
+                    <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Select an employee to compare their allocation between any two pay periods — they don't need to be adjacent.</div>
+                  ) : (() => {
+                    const fromEntry = fromSnap?.entries.find((e) => e.staffId === deltaStaffId);
+                    const toEntry = toSnap?.entries.find((e) => e.staffId === deltaStaffId);
+                    if (!fromEntry && !toEntry) {
+                      return <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>This employee doesn't appear in either selected pay period.</div>;
+                    }
+                    const fromMap = allocationsByGrantMap(fromEntry);
+                    const toMap = allocationsByGrantMap(toEntry);
+                    const keys = new Set([...Object.keys(fromMap), ...Object.keys(toMap)]);
+                    const rows = [...keys].map((key) => {
+                      const f = fromMap[key], t = toMap[key];
+                      const grantId = f?.grantId || t?.grantId, costCenterId = f?.costCenterId || t?.costCenterId;
+                      const g = grants.find((x) => x.id === grantId);
+                      const cc = costCenters.find((x) => x.id === costCenterId);
+                      const name = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+                      const fPct = f?.percent || 0, tPct = t?.percent || 0;
+                      const fDollar = fromEntry ? fromEntry.fullyLoadedCost * fPct / 100 : 0;
+                      const tDollar = toEntry ? toEntry.fullyLoadedCost * tPct / 100 : 0;
+                      return { key, name, fPct, tPct, fDollar, tDollar, isNew: !f && !!t, isDropped: !!f && !t };
+                    }).sort((a, b) => Math.abs(b.tPct - b.fPct) - Math.abs(a.tPct - a.fPct));
+                    const staffName = fromEntry?.staffName || toEntry?.staffName;
+
+                    return (
+                      <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+                        {(!fromEntry || !toEntry) && (
+                          <div className="px-4 py-2 text-xs" style={{ background: "#FBF3E4", color: "#8A5A0B" }}>
+                            {!fromEntry ? "Not in the \"From\" pay period — likely hired after it." : "Not in the \"To\" pay period — likely no longer active, or not yet imported for that period."}
+                          </div>
+                        )}
+                        <div className="px-4 py-2 border-b text-sm" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>{staffName}</div>
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr style={{ background: "#F6F7F3" }}>
+                              <th className="text-left px-4 py-2" style={{ color: "#5B6B66" }}>Grant / cost center</th>
+                              <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>From</th>
+                              <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>To</th>
+                              <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>% change</th>
+                              <th className="text-right px-4 py-2" style={{ color: "#5B6B66" }}>$ change</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rows.map((r) => (
+                              <tr key={r.key} className="border-t" style={{ borderColor: "#E1E5DE", background: r.isNew ? "#EAF6F1" : undefined }}>
+                                <td className="px-4 py-1.5" style={{ color: "#1C2624" }}>
+                                  {r.name}
+                                  {r.isNew && <span className="ml-2 text-xs px-2 py-0.5 rounded" style={{ background: "#D9F0E5", color: "#2F6F53" }}>New</span>}
+                                  {r.isDropped && <span className="ml-2 text-xs px-2 py-0.5 rounded" style={{ background: "#FBEAE8", color: "#B5443A" }}>Dropped</span>}
+                                </td>
+                                <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{r.isNew ? "—" : `${r.fPct.toFixed(1)}%`}</td>
+                                <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{r.isDropped ? "—" : `${r.tPct.toFixed(1)}%`}</td>
+                                <td className="px-4 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(r.tPct - r.fPct) ? "#2F6F53" : "#B5443A" }}>{(r.tPct - r.fPct) >= 0 ? "+" : ""}{(r.tPct - r.fPct).toFixed(1)}</td>
+                                <td className="px-4 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(r.tDollar - r.fDollar) ? "#2F6F53" : "#B5443A" }}>{(r.tDollar - r.fDollar) >= 0 ? "+" : ""}{fmt(r.tDollar - r.fDollar)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
                     );
-                  })}
-                  {filteredEntries.length === 0 && (
-                    <tr><td colSpan={columns.length + 3} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No matching employees in this pay period.</td></tr>
-                  )}
-                  <tr className="border-t" style={{ borderColor: "#E1E5DE", background: "#F6F7F3" }}>
-                    <td className="px-3 py-1.5 font-medium" style={{ color: "#1C2624" }}>Headcount this period</td>
-                    {columns.map(([key]) => <td key={key} className="px-3 py-1.5 text-right" style={{ color: "#1C2624" }}>{headcountByCol[key]}</td>)}
-                    <td></td><td></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <p className="text-xs" style={{ color: "#8A8F87" }}>
-              Captured automatically whenever a Paylocity import updates Allocations — one permanent snapshot per pay period. Nothing here is projected or recomputed after the fact.
-            </p>
+                  })()}
+                </div>
+              );
+            })()}
+
+            {matrixSubView === "rollup" && (() => {
+              const chronological = [...paylocitySnapshots].sort((a, b) => new Date(a.periodEnd) - new Date(b.periodEnd));
+              const fromSnap = chronological.find((s) => s.id === rollupFromId) || chronological[0];
+              const toSnap = chronological.find((s) => s.id === rollupToId) || chronological[chronological.length - 1];
+
+              const grantCostByPerson = (snap, grantId) => {
+                const out = {};
+                (snap?.entries || []).forEach((e) => {
+                  const pct = (e.allocations || []).filter((a) => a.grantId === grantId).reduce((a, x) => a + (Number(x.percent) || 0), 0);
+                  if (pct > 0) out[e.staffId] = { name: e.staffName, dollar: e.fullyLoadedCost * pct / 100 };
+                });
+                return out;
+              };
+
+              return (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div style={{ minWidth: 260 }}>
+                      <GrantPicker grants={grants} value={rollupGrantId} onChange={setRollupGrantId} placeholder="Select a grant" />
+                    </div>
+                    <select className={inputCls} style={{ ...inputStyle, maxWidth: 220 }} value={fromSnap?.id || ""} onChange={(e) => setRollupFromId(e.target.value)}>
+                      {chronological.map((s) => <option key={s.id} value={s.id}>From: {periodLabel(s)}</option>)}
+                    </select>
+                    <select className={inputCls} style={{ ...inputStyle, maxWidth: 220 }} value={toSnap?.id || ""} onChange={(e) => setRollupToId(e.target.value)}>
+                      {chronological.map((s) => <option key={s.id} value={s.id}>To: {periodLabel(s)}</option>)}
+                    </select>
+                  </div>
+
+                  {!rollupGrantId ? (
+                    <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Select a grant to see how its total personnel cost changed between any two pay periods, and who drove the change.</div>
+                  ) : (() => {
+                    const fromCosts = grantCostByPerson(fromSnap, rollupGrantId);
+                    const toCosts = grantCostByPerson(toSnap, rollupGrantId);
+                    const staffIds = new Set([...Object.keys(fromCosts), ...Object.keys(toCosts)]);
+                    const rows = [...staffIds].map((sid) => {
+                      const f = fromCosts[sid]?.dollar || 0, t = toCosts[sid]?.dollar || 0;
+                      const name = fromCosts[sid]?.name || toCosts[sid]?.name;
+                      return { staffId: sid, name, f, t, diff: t - f, isNew: !fromCosts[sid] && !!toCosts[sid], isDropped: !!fromCosts[sid] && !toCosts[sid] };
+                    }).sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+                    const totalFrom = Object.values(fromCosts).reduce((a, x) => a + x.dollar, 0);
+                    const totalTo = Object.values(toCosts).reduce((a, x) => a + x.dollar, 0);
+
+                    return (
+                      <div className="space-y-3">
+                        <div className="flex gap-3">
+                          <div className="flex-1 bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+                            <div className="text-xs" style={{ color: "#8A8F87" }}>Annualized personnel cost</div>
+                            <div className="text-lg font-display mt-1" style={{ color: "#1C2624" }}>{fmt(totalFrom)} → {fmt(totalTo)}</div>
+                          </div>
+                          <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE", minWidth: 160 }}>
+                            <div className="text-xs" style={{ color: "#8A8F87" }}>Change</div>
+                            <div className="text-lg font-display mt-1" style={{ color: !isNetNegative(totalTo - totalFrom) ? "#2F6F53" : "#B5443A" }}>{(totalTo - totalFrom) >= 0 ? "+" : ""}{fmt(totalTo - totalFrom)}</div>
+                          </div>
+                        </div>
+                        <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+                          <div className="px-4 py-2 text-xs" style={{ background: "#F6F7F3", color: "#5B6B66" }}>Biggest contributors to the change</div>
+                          <table className="w-full text-sm">
+                            <tbody>
+                              {rows.map((r) => (
+                                <tr key={r.staffId} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                                  <td className="px-4 py-1.5" style={{ color: "#1C2624" }}>
+                                    {r.name}
+                                    {r.isNew && <span className="ml-2 text-xs px-2 py-0.5 rounded" style={{ background: "#D9F0E5", color: "#2F6F53" }}>New</span>}
+                                    {r.isDropped && <span className="ml-2 text-xs px-2 py-0.5 rounded" style={{ background: "#FBEAE8", color: "#B5443A" }}>Dropped</span>}
+                                  </td>
+                                  <td className="px-4 py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{r.isNew ? "—" : fmt(r.f)} → {r.isDropped ? "—" : fmt(r.t)}</td>
+                                  <td className="px-4 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(r.diff) ? "#2F6F53" : "#B5443A", width: 130 }}>{r.diff >= 0 ? "+" : ""}{fmt(r.diff)}</td>
+                                </tr>
+                              ))}
+                              {rows.length === 0 && (
+                                <tr><td colSpan={3} className="px-4 py-6 text-center" style={{ color: "#8A8F87" }}>No one was allocated to this grant in either period.</td></tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              );
+            })()}
           </div>
         );
       })()}
@@ -6446,7 +6637,11 @@ function PaylocityImportModal({ staff, setStaff, grants, costCenters, budgets, s
             fullyLoadedCost: staffFullyLoadedCost(patched).total,
           };
         });
-      setPaylocitySnapshots((prev) => [...prev, { id: uid(), periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10), entries }]);
+      setPaylocitySnapshots((prev) => {
+        const existing = prev.find((s) => s.periodStart === periodStart && s.periodEnd === periodEnd);
+        const newSnapshot = { id: existing?.id || uid(), periodStart, periodEnd, importedAt: new Date().toISOString().slice(0, 10), entries };
+        return existing ? prev.map((s) => (s.id === existing.id ? newSnapshot : s)) : [...prev, newSnapshot];
+      });
     }
 
     const modeTag = updateComp && updateAllocations ? "" : updateComp ? " [Compensation only]" : " [Allocations only]";
@@ -7426,6 +7621,20 @@ function grantMonthlyWagesAndBenefits(grantId, budgets, year, monthIndex) {
 // Every calendar month covered by any of a grant's Template budgets,
 // chronologically — the natural timeline for a month-over-month view, since
 // a grant's history can span more than one budget object over time.
+// Sums a single snapshot entry's allocations by grant/cost center — a person
+// can have multiple separate Paylocity rows pointing at the same grant (e.g.
+// different task codes), and any comparison across periods needs one true
+// total per grant, not several confusing duplicate lines.
+function allocationsByGrantMap(entry) {
+  const map = {};
+  (entry?.allocations || []).forEach((a) => {
+    const key = a.grantId || a.costCenterId || "__none__";
+    if (!map[key]) map[key] = { grantId: a.grantId || "", costCenterId: a.costCenterId || "", percent: 0 };
+    map[key].percent += Number(a.percent) || 0;
+  });
+  return map;
+}
+
 function grantAllMonths(grantId, budgets) {
   const templateBudgets = budgets.filter((b) => b.grantId === grantId && b.budgetType === "Template" && (b.status === "Active" || b.status === "Awarded"));
   const seen = new Set();
