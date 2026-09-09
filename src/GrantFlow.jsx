@@ -2869,6 +2869,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [overviewSearch, setOverviewSearch] = useState("");
   const [overviewSort, setOverviewSort] = useState({ key: "title", dir: "asc" });
   const [overviewTypeFilter, setOverviewTypeFilter] = useState("All");
+  const [exportingBudgetsOverview, setExportingBudgetsOverview] = useState(false);
   const [showExcelImport, setShowExcelImport] = useState(false);
 
   const grant = grants.find((g) => g.id === selectedGrantId);
@@ -3051,6 +3052,58 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     return rows;
   }, [allBudgetsEnriched, overviewSearch, overviewTypeFilter, overviewSort]);
 
+  const exportBudgetsOverviewExcel = async () => {
+    setExportingBudgetsOverview(true);
+    try {
+      const HEADER_FILL = "FFF6F7F3";
+      const GREEN = "FF2F6F53";
+      const RED = "FFB5443A";
+      const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet("Budgets");
+
+      const header = ["Grant / Cost Center", "Budget", "FY", "Status", "Type", "Period Start", "Period End", "Revenue", "Expense", "Net"];
+      ws.mergeCells(1, 1, 1, header.length);
+      ws.getCell(1, 1).value = "Nation's Finest — Budgets";
+      ws.getCell(1, 1).font = { bold: true, size: 13 };
+      ws.mergeCells(2, 1, 2, header.length);
+      const filterNote = [
+        overviewSearch ? `search "${overviewSearch}"` : null,
+        overviewTypeFilter !== "All" ? `type: ${budgetTypeLabel(overviewTypeFilter)}` : null,
+      ].filter(Boolean).join(", ");
+      ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}${filterNote ? ` — filtered by ${filterNote}` : ""} — ${overviewRows.length} budget${overviewRows.length === 1 ? "" : "s"}`;
+      ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+
+      const headerRowIdx = 4;
+      ws.getRow(headerRowIdx).values = header;
+      ws.getRow(headerRowIdx).eachCell((cell) => {
+        cell.font = { bold: true };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+      });
+
+      let r = headerRowIdx + 1;
+      overviewRows.forEach((b) => {
+        const t = budgetTotals(b);
+        ws.getRow(r).values = [
+          b.ownerName, b.title, b.fy || "", b.status || "", budgetTypeLabel(b.budgetType),
+          b.periodStart ? fmtDate(b.periodStart) : "", b.periodEnd ? fmtDate(b.periodEnd) : "",
+          round2(t.revenue), round2(t.expense), round2(t.revenue - t.expense),
+        ];
+        [8, 9, 10].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
+        ws.getCell(r, 10).font = { color: { argb: isNetNegative(t.revenue - t.expense) ? RED : GREEN } };
+        r++;
+      });
+
+      ws.columns = [{ width: 34 }, { width: 30 }, { width: 8 }, { width: 12 }, { width: 14 }, { width: 12 }, { width: 12 }, { width: 15 }, { width: 15 }, { width: 15 }];
+      ws.views = [{ state: "frozen", ySplit: headerRowIdx }];
+
+      const buffer = await wb.xlsx.writeBuffer();
+      downloadFile("nations-finest-budgets.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } finally {
+      setExportingBudgetsOverview(false);
+    }
+  };
+
   const toggleOverviewSort = (key) => setOverviewSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
 
   const openBudget = (b) => {
@@ -3108,6 +3161,9 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
         <div className="flex items-center justify-between mb-3">
           <h2 className="font-display text-sm" style={{ color: "#1C2624" }}>All budgets</h2>
           <div className="flex items-center gap-2">
+            <button onClick={exportBudgetsOverviewExcel} disabled={exportingBudgetsOverview} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exportingBudgetsOverview ? 0.6 : 1 }}>
+              <Download size={15} /> {exportingBudgetsOverview ? "Building…" : "Export Excel"}
+            </button>
             <select
               value={overviewTypeFilter}
               onChange={(e) => setOverviewTypeFilter(e.target.value)}
