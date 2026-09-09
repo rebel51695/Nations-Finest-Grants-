@@ -400,7 +400,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.4.1";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -5714,6 +5714,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const [rollupGrantId, setRollupGrantId] = useState("");
   const [rollupFromId, setRollupFromId] = useState("");
   const [rollupToId, setRollupToId] = useState("");
+  const [exportingPersonnel, setExportingPersonnel] = useState(false);
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const visible = staff
@@ -5749,8 +5750,175 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
     setConfirm(null);
   };
 
+  const exportPersonnelExcel = async () => {
+    setExportingPersonnel(true);
+    try {
+      const HEADER_FILL = "FFF6F7F3";
+      const GREEN = "FF2F6F53";
+      const RED = "FFB5443A";
+      const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+      const wb = new ExcelJS.Workbook();
+      const titleRow = (ws, title, cols) => {
+        ws.mergeCells(1, 1, 1, cols);
+        ws.getCell(1, 1).value = title;
+        ws.getCell(1, 1).font = { bold: true, size: 13 };
+        ws.mergeCells(2, 1, 2, cols);
+        ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}`;
+        ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+      };
+      const headerRow = (ws, idx, values) => {
+        ws.getRow(idx).values = values;
+        ws.getRow(idx).eachCell((cell) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } }; });
+      };
+
+      if (costViewMode === "summary") {
+        const ws = wb.addWorksheet("Personnel Summary");
+        titleRow(ws, "Nation's Finest — Personnel Cost Summary", 2);
+        let r = 4;
+        headerRow(ws, r, ["Grant", "Annual personnel cost"]); r++;
+        Object.entries(costByGrant).forEach(([grantId, cost]) => {
+          const g = grants.find((x) => x.id === grantId);
+          ws.getRow(r).values = [g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "Unknown grant", round2(cost)];
+          ws.getCell(r, 2).numFmt = "$#,##0";
+          r++;
+        });
+        r += 1;
+        headerRow(ws, r, ["Cost center", "Annual personnel cost"]); r++;
+        Object.entries(costByCostCenter).forEach(([ccId, cost]) => {
+          const cc = (costCenters || []).find((x) => x.id === ccId);
+          ws.getRow(r).values = [cc ? cc.name : "Unknown cost center", round2(cost)];
+          ws.getCell(r, 2).numFmt = "$#,##0";
+          r++;
+        });
+        ws.columns = [{ width: 40 }, { width: 20 }];
+      } else if (costViewMode === "monthly") {
+        const ws = wb.addWorksheet("Personnel by Grant, Monthly");
+        titleRow(ws, "Nation's Finest — Fully-Loaded Personnel Cost by Grant, Monthly", 4);
+        const g = grants.find((x) => x.id === monthlyGrantId);
+        ws.getCell(3, 1).value = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "No grant selected";
+        ws.getCell(3, 1).font = { size: 10, color: { argb: "FF5B6B66" } };
+        let r = 5;
+        headerRow(ws, r, ["Month", "Wages", "Taxes & benefits", "Fully-loaded total"]); r++;
+        if (monthlyGrantId) {
+          grantAllMonths(monthlyGrantId, budgets).forEach((col) => {
+            const { wages, taxAndBenefits, total } = grantMonthlyWagesAndBenefits(monthlyGrantId, budgets, col.year, col.monthIndex);
+            ws.getRow(r).values = [`${MONTHS[col.monthIndex]} ${col.year}`, round2(wages), round2(taxAndBenefits), round2(total)];
+            [2, 3, 4].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
+            r++;
+          });
+        }
+        ws.columns = [{ width: 16 }, { width: 16 }, { width: 18 }, { width: 18 }];
+      } else if (costViewMode === "matrix") {
+        const chronological = [...paylocitySnapshots].sort((a, b) => new Date(a.periodEnd) - new Date(b.periodEnd));
+        const periodLabel = (s) => `${fmtDate(s.periodStart)} – ${fmtDate(s.periodEnd)}`;
+
+        if (matrixSubView === "snapshot") {
+          const sortedSnapshots = [...paylocitySnapshots].sort((a, b) => new Date(b.periodEnd) - new Date(a.periodEnd));
+          const snapshot = sortedSnapshots.find((s) => s.id === matrixSnapshotId) || sortedSnapshots[0];
+          const ws = wb.addWorksheet("Employee Matrix");
+          if (snapshot) {
+            const columnsMap = {};
+            snapshot.entries.forEach((e) => (e.allocations || []).forEach((a) => {
+              const key = a.grantId || a.costCenterId;
+              if (!key || columnsMap[key]) return;
+              const g = grants.find((x) => x.id === a.grantId);
+              const cc = costCenters.find((x) => x.id === a.costCenterId);
+              columnsMap[key] = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+            }));
+            const columns = Object.entries(columnsMap).sort((a, b) => a[1].localeCompare(b[1]));
+            titleRow(ws, `Nation's Finest — Employee Matrix (${periodLabel(snapshot)})`, columns.length + 2);
+            let r = 4;
+            headerRow(ws, r, ["Employee", ...columns.map((c) => c[1]), "Total"]); r++;
+            snapshot.entries.forEach((e) => {
+              const total = (e.allocations || []).reduce((a, al) => a + (Number(al.percent) || 0), 0);
+              ws.getRow(r).values = [e.staffName, ...columns.map(([key]) => {
+                const a = (e.allocations || []).find((x) => (x.grantId || x.costCenterId) === key);
+                return a ? Number(a.percent) / 100 : null;
+              }), total / 100];
+              for (let c = 2; c <= columns.length + 2; c++) ws.getCell(r, c).numFmt = "0%";
+              r++;
+            });
+            ws.columns = [{ width: 24 }, ...columns.map(() => ({ width: 14 })), { width: 12 }];
+          }
+        } else if (matrixSubView === "delta") {
+          const fromSnap = chronological.find((s) => s.id === deltaFromId) || chronological[0];
+          const toSnap = chronological.find((s) => s.id === deltaToId) || chronological[chronological.length - 1];
+          const fromEntry = fromSnap?.entries.find((e) => e.staffId === deltaStaffId);
+          const toEntry = toSnap?.entries.find((e) => e.staffId === deltaStaffId);
+          const ws = wb.addWorksheet("Allocation Delta");
+          titleRow(ws, `Nation's Finest — Allocation Delta: ${fromEntry?.staffName || toEntry?.staffName || "No employee selected"}`, 5);
+          ws.getCell(3, 1).value = `${periodLabel(fromSnap || {})} → ${periodLabel(toSnap || {})}`;
+          ws.getCell(3, 1).font = { size: 10, color: { argb: "FF5B6B66" } };
+          let r = 5;
+          headerRow(ws, r, ["Grant / cost center", "From %", "To %", "% change", "$ change"]); r++;
+          if (fromEntry || toEntry) {
+            const fromMap = allocationsByGrantMap(fromEntry);
+            const toMap = allocationsByGrantMap(toEntry);
+            const keys = new Set([...Object.keys(fromMap), ...Object.keys(toMap)]);
+            [...keys].forEach((key) => {
+              const f = fromMap[key], t = toMap[key];
+              const gid = f?.grantId || t?.grantId, ccid = f?.costCenterId || t?.costCenterId;
+              const g = grants.find((x) => x.id === gid);
+              const cc = costCenters.find((x) => x.id === ccid);
+              const name = g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown";
+              const fPct = f?.percent || 0, tPct = t?.percent || 0;
+              const fDollar = fromEntry ? fromEntry.fullyLoadedCost * fPct / 100 : 0;
+              const tDollar = toEntry ? toEntry.fullyLoadedCost * tPct / 100 : 0;
+              ws.getRow(r).values = [name, fPct / 100, tPct / 100, (tPct - fPct) / 100, round2(tDollar - fDollar)];
+              ws.getCell(r, 2).numFmt = "0.0%"; ws.getCell(r, 3).numFmt = "0.0%"; ws.getCell(r, 4).numFmt = "0.0%";
+              ws.getCell(r, 4).font = { color: { argb: isNetNegative(tPct - fPct) ? RED : GREEN } };
+              ws.getCell(r, 5).numFmt = "$#,##0";
+              ws.getCell(r, 5).font = { color: { argb: isNetNegative(tDollar - fDollar) ? RED : GREEN } };
+              r++;
+            });
+          }
+          ws.columns = [{ width: 34 }, { width: 12 }, { width: 12 }, { width: 12 }, { width: 14 }];
+        } else if (matrixSubView === "rollup") {
+          const fromSnap = chronological.find((s) => s.id === rollupFromId) || chronological[0];
+          const toSnap = chronological.find((s) => s.id === rollupToId) || chronological[chronological.length - 1];
+          const g = grants.find((x) => x.id === rollupGrantId);
+          const grantCostByPerson = (snap) => {
+            const out = {};
+            (snap?.entries || []).forEach((e) => {
+              const pct = (e.allocations || []).filter((a) => a.grantId === rollupGrantId).reduce((a, x) => a + (Number(x.percent) || 0), 0);
+              if (pct > 0) out[e.staffId] = { name: e.staffName, dollar: e.fullyLoadedCost * pct / 100 };
+            });
+            return out;
+          };
+          const fromCosts = grantCostByPerson(fromSnap);
+          const toCosts = grantCostByPerson(toSnap);
+          const ws = wb.addWorksheet("Grant Rollup");
+          titleRow(ws, `Nation's Finest — Personnel Cost Rollup: ${g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : "No grant selected"}`, 4);
+          ws.getCell(3, 1).value = `${periodLabel(fromSnap || {})} → ${periodLabel(toSnap || {})}`;
+          ws.getCell(3, 1).font = { size: 10, color: { argb: "FF5B6B66" } };
+          let r = 5;
+          headerRow(ws, r, ["Employee", "From $", "To $", "$ change"]); r++;
+          const staffIds = new Set([...Object.keys(fromCosts), ...Object.keys(toCosts)]);
+          [...staffIds].forEach((sid) => {
+            const f = fromCosts[sid]?.dollar || 0, t = toCosts[sid]?.dollar || 0;
+            ws.getRow(r).values = [fromCosts[sid]?.name || toCosts[sid]?.name, round2(f), round2(t), round2(t - f)];
+            ws.getCell(r, 2).numFmt = "$#,##0"; ws.getCell(r, 3).numFmt = "$#,##0"; ws.getCell(r, 4).numFmt = "$#,##0";
+            ws.getCell(r, 4).font = { color: { argb: isNetNegative(t - f) ? RED : GREEN } };
+            r++;
+          });
+          const totalFrom = Object.values(fromCosts).reduce((a, x) => a + x.dollar, 0);
+          const totalTo = Object.values(toCosts).reduce((a, x) => a + x.dollar, 0);
+          ws.getRow(r).values = ["Total", round2(totalFrom), round2(totalTo), round2(totalTo - totalFrom)];
+          ws.getRow(r).eachCell((cell) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } }; });
+          [2, 3, 4].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
+          ws.columns = [{ width: 28 }, { width: 15 }, { width: 15 }, { width: 15 }];
+        }
+      }
+
+      const buffer = await wb.xlsx.writeBuffer();
+      downloadFile("nations-finest-personnel.xlsx", buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } finally {
+      setExportingPersonnel(false);
+    }
+  };
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" id="personnel-print-area">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Personnel & Payroll</h1>
@@ -5761,16 +5929,24 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
             </p>
           )}
         </div>
-        {canEdit && (
-          <div className="flex items-center gap-2">
-            <button onClick={() => setShowImport(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-              <Upload size={16} /> Import from Paylocity
-            </button>
-            <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-              <Plus size={16} /> New staff member
-            </button>
-          </div>
-        )}
+        <div className="flex items-center gap-2 no-print">
+          <button onClick={exportPersonnelExcel} disabled={exportingPersonnel} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exportingPersonnel ? 0.6 : 1 }}>
+            <Download size={16} /> {exportingPersonnel ? "Building…" : "Export Excel"}
+          </button>
+          <button onClick={() => printSection("personnel-print-area", "GrantFlow Personnel & Payroll")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Printer size={15} /> Print / Save PDF
+          </button>
+          {canEdit && (
+            <>
+              <button onClick={() => setShowImport(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+                <Upload size={16} /> Import from Paylocity
+              </button>
+              <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+                <Plus size={16} /> New staff member
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
