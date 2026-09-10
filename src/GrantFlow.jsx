@@ -79,57 +79,33 @@ function computeOrgFYTotals(budgets, grants, costCenters, budgetGroups, calYear)
   const byOwner = {};
   scopedBudgets.forEach((b) => { (byOwner[ownerKey(b)] = byOwner[ownerKey(b)] || []).push(b); });
 
+  // Only real, recorded actuals count here — deliberately no run-rate
+  // projection for months past a budget's "actuals complete through" cutoff.
+  // This differs on purpose from Org Budget's own Actual view (which does
+  // project), since the Dashboard's FY figures should reflect only what's
+  // actually been entered, not an estimate.
   let actualExpense = 0;
   Object.values(byOwner).forEach((ownerBudgets) => {
-    ownerBudgets.sort((a, b) => new Date(a.periodStart) - new Date(b.periodStart));
     const lineMeta = {};
     ownerBudgets.forEach((b) => b.lines.forEach((l) => {
       const key = `${l.category}|||${l.subcategory || ""}`;
       if (!lineMeta[key]) lineMeta[key] = { type: l.type };
     }));
 
-    const budgetLineAvg = {};
-    const budgetLineActuals = {};
-    ownerBudgets.forEach((b) => {
-      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-      Object.keys(lineMeta).forEach((key) => {
+    Object.keys(lineMeta).forEach((key) => {
+      if (lineMeta[key].type !== "expense") return;
+      ownerBudgets.forEach((b) => {
+        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
         const matching = b.lines.filter((l) => `${l.category}|||${l.subcategory || ""}` === key);
         if (matching.length === 0) return;
         const combined = Array(cols.length).fill(0);
         matching.forEach((l) => (l.actuals || []).forEach((v, i) => { if (i < combined.length) combined[i] += Number(v) || 0; }));
-        budgetLineActuals[`${b.id}|||${key}`] = combined;
-        const cutoff = parseActualsThrough(b.actualsThrough);
-        if (!cutoff) return;
-        const vals = cols.map((col, i) => (colIsWithinCutoff(col, cutoff) ? combined[i] : null)).filter((v) => v !== null);
-        budgetLineAvg[`${b.id}|||${key}`] = vals.length ? vals.reduce((a, x) => a + x, 0) / vals.length : 0;
-      });
-    });
-
-    Object.keys(lineMeta).forEach((key) => {
-      if (lineMeta[key].type !== "expense") return;
-      const timeline = [];
-      ownerBudgets.forEach((b) => {
-        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-        const combined = budgetLineActuals[`${b.id}|||${key}`];
         const cutoff = parseActualsThrough(b.actualsThrough);
         cols.forEach((col, i) => {
-          timeline.push({
-            year: col.year,
-            monthIndex: col.monthIndex,
-            isRealEntry: !!(combined && cutoff && colIsWithinCutoff(col, cutoff)),
-            rawValue: combined ? (Number(combined[i]) || 0) : 0,
-            budgetId: b.id,
-            atOrAfterCutoff: cutoff ? !colIsWithinCutoff(col, cutoff) : false,
-          });
+          if (col.year !== calYear) return;
+          const isRealEntry = !!(cutoff && colIsWithinCutoff(col, cutoff));
+          if (isRealEntry) actualExpense += combined[i] || 0;
         });
-      });
-      timeline.sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
-      let basis = null;
-      timeline.forEach((t) => {
-        const avgKey = `${t.budgetId}|||${key}`;
-        if (t.atOrAfterCutoff && budgetLineAvg[avgKey] !== undefined) basis = budgetLineAvg[avgKey];
-        const value = t.isRealEntry ? t.rawValue : (basis !== null ? basis : t.rawValue);
-        if (t.year === calYear) actualExpense += value;
       });
     });
   });
@@ -2406,7 +2382,7 @@ function Dashboard({ grants, budgets, reports, tasks, staff, invoices, goTo, cos
         <h2 className="font-display text-base mb-2" style={{ color: "#1C2624" }}>Fiscal year {fyYear} (Jan–Dec)</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <StatCard label={`FY${fyYear} total award`} value={fmt(fyTotalAward)} sub={`Planned revenue, Org Budget (Template) — ${fyGrants.length} grants active in FY${fyYear}`} />
-          <StatCard label={`FY${fyYear} award remaining`} value={fmt(fyTotalRemaining)} sub="Planned revenue minus actual expense, Org Budget" />
+          <StatCard label={`FY${fyYear} award remaining`} value={fmt(fyTotalRemaining)} sub="Planned revenue minus real recorded expense only — no projection" />
         </div>
       </div>
 
