@@ -541,6 +541,7 @@ function grantCurrentPeriodBudgetTotals(grantId, budgets) {
   const today = new Date();
   const mine = budgets.filter((b) => {
     if (b.grantId !== grantId) return false;
+    if (b.budgetType !== "Operational") return false; // the version actually contracted with the grantor — matches the same fix applied to Burn Rate, to avoid double-counting when a Template budget for the same grant/period also exists
     if (!b.periodStart || !b.periodEnd) return false;
     const start = new Date(b.periodStart);
     const end = new Date(b.periodEnd);
