@@ -2663,6 +2663,9 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Grants</h1>
         <div className="flex items-center gap-2">
+          <a href="https://veteransresourcecenter.sharepoint.com/sites/DataandCompliance-GrantSubmissions/Lists/Grant%20Submissions/AllItems.aspx" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <ExternalLink size={16} /> Grant Submissions Portal
+          </a>
           <button onClick={exportGrantsExcel} disabled={exportingGrants} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exportingGrants ? 0.6 : 1 }}>
             <Download size={16} /> {exportingGrants ? "Building…" : "Export Excel"}
           </button>
