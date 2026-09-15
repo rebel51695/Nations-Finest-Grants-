@@ -566,6 +566,7 @@ function grantBurn(grant, budgets) {
   const mine = budgets.filter((b) => {
     if (b.grantId !== grant.id) return false;
     if (b.budgetType !== "Operational") return false; // pace against what's actually contracted with the grantor, not the internal Template version
+    if (b.status === "Closed") return false; // closed budgets are shown separately, on their own final numbers, not mixed into the live pace view
     if (!b.periodStart || !b.periodEnd) return false;
     return today >= new Date(b.periodStart) && today <= new Date(b.periodEnd);
   });
@@ -598,6 +599,23 @@ function grantBurn(grant, budgets) {
   return {
     totalExpense, toDate, actualToDate, hasActuals, variance, pctTimeElapsed, pctBudgetUsed, monthlyAvg, projectedFullYear,
     status, projectedOverAward: award > 0 && projectedFullYear > award, award, elapsedMonths: maxElapsed, elapsedKnown,
+  };
+}
+
+// Final, retrospective read on one specific Closed Grant Budget — same
+// underlying math as grantBurn, but for a single already-finished budget
+// rather than "how are we pacing right now." budgetElapsedMonths caps at 12
+// once a period has fully passed, so this naturally reads as "100% of time
+// elapsed" and shows the final budget-used percentage, not a live pace.
+function closedBudgetBurn(grant, budget) {
+  const info = budgetBurnInfo(budget);
+  const award = Number(grant.awardAmount) || 0;
+  const finalSpend = info.actualToDate > 0 ? info.actualToDate : info.toDate;
+  const pctBudgetUsed = info.totalExpense > 0 ? finalSpend / info.totalExpense : 0;
+  const variance = info.actualToDate - info.totalExpense;
+  return {
+    totalExpense: info.totalExpense, actualToDate: info.actualToDate, finalSpend, pctBudgetUsed, variance,
+    hasActuals: info.actualToDate > 0, award, overBudget: info.totalExpense > 0 && info.actualToDate > info.totalExpense,
   };
 }
 
@@ -8724,65 +8742,126 @@ function RestrictedFundsImportModal({ grants, restrictedFunds, setRestrictedFund
 }
 
 function BurnRateView({ grants, budgets }) {
-  const withBudgets = grants.filter((g) => budgets.some((b) => b.grantId === g.id && b.budgetType === "Operational"));
+  const [tab, setTab] = useState("active"); // active | closed
+  const withBudgets = grants.filter((g) => budgets.some((b) => b.grantId === g.id && b.budgetType === "Operational" && b.status !== "Closed"));
+  const closedPairs = [];
+  grants.forEach((g) => {
+    budgets.filter((b) => b.grantId === g.id && b.budgetType === "Operational" && b.status === "Closed").forEach((b) => {
+      closedPairs.push({ grant: g, budget: b });
+    });
+  });
+  closedPairs.sort((a, b) => new Date(b.budget.periodEnd || 0) - new Date(a.budget.periodEnd || 0));
 
   return (
     <div className="space-y-4">
-      <div>
-        <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Burn Rate</h1>
-        <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
-          Paced against each grant's Grant Budget — the version actually contracted with the grantor — not the internal Template. Uses recorded actuals where you've entered them (Budgets → Actual). Falls back to the planned schedule for any grant without actuals yet.
-        </p>
+      <div className="flex items-start justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Burn Rate</h1>
+          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>
+            Paced against each grant's Grant Budget — the version actually contracted with the grantor — not the internal Template. Uses recorded actuals where you've entered them (Budgets → Actual). Falls back to the planned schedule for any grant without actuals yet.
+          </p>
+        </div>
+        <div className="inline-flex rounded-md border overflow-hidden shrink-0" style={{ borderColor: "#E1E5DE" }}>
+          <button onClick={() => setTab("active")} className="px-3 py-2 text-sm font-medium" style={{ background: tab === "active" ? "#1F5C6B" : "#FFFFFF", color: tab === "active" ? "#FFFFFF" : "#5B6B66" }}>Active</button>
+          <button onClick={() => setTab("closed")} className="px-3 py-2 text-sm font-medium" style={{ background: tab === "closed" ? "#1F5C6B" : "#FFFFFF", color: tab === "closed" ? "#FFFFFF" : "#5B6B66" }}>Closed</button>
+        </div>
       </div>
 
-      {withBudgets.length === 0 ? (
-        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          No grants with a Grant Budget yet — add one to see burn rate.
-        </div>
-      ) : (
-        <div className="overflow-x-auto border rounded-lg bg-white" style={{ borderColor: "#E1E5DE" }}>
-          <table className="w-full text-sm">
-            <thead>
-              <tr style={{ background: "#F6F7F3" }}>
-                <th className="text-left px-3 py-2 text-xs" style={{ minWidth: 200 }}>Grant</th>
-                <th className="text-right px-3 py-2 text-xs">Award</th>
-                <th className="text-right px-3 py-2 text-xs">Budgeted (current period)</th>
-                <th className="text-right px-3 py-2 text-xs">Planned to date</th>
-                <th className="text-right px-3 py-2 text-xs">Actual to date</th>
-                <th className="text-right px-3 py-2 text-xs">Variance</th>
-                <th className="text-right px-3 py-2 text-xs">% time elapsed</th>
-                <th className="text-right px-3 py-2 text-xs">% budget used</th>
-                <th className="text-left px-3 py-2 text-xs">Pace</th>
-                <th className="text-right px-3 py-2 text-xs">Projected full-term spend</th>
-              </tr>
-            </thead>
-            <tbody>
-              {withBudgets.map((g) => {
-                const b = grantBurn(g, budgets);
-                return (
-                  <tr key={g.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                    <td className="px-3 py-2" style={{ color: "#1C2624" }}>
-                      {g.title}
-                      <div className="text-xs" style={{ color: "#8A8F87" }}>{g.programCode}</div>
-                    </td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(b.award)}</td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(b.totalExpense)}</td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{b.elapsedKnown ? fmt(b.toDate) : "—"}</td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.hasActuals ? "#1C2624" : "#8A8F87" }}>{b.hasActuals ? fmt(b.actualToDate) : "Not entered"}</td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.hasActuals ? (b.variance > 0 ? "#B5443A" : "#2F6F53") : "#8A8F87" }}>{b.hasActuals ? fmt(b.variance) : "—"}</td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{b.elapsedKnown ? `${Math.round(b.pctTimeElapsed * 100)}%` : "—"}</td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{b.elapsedKnown ? `${Math.round(b.pctBudgetUsed * 100)}%` : "—"}</td>
-                    <td className="px-3 py-2"><Badge color={paceColor[b.status]}>{b.status}</Badge></td>
-                    <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.projectedOverAward ? "#B5443A" : "#1C2624" }}>
-                      {b.elapsedKnown ? fmt(b.projectedFullYear) : "—"}
-                      {b.projectedOverAward && <div className="text-xs" style={{ color: "#B5443A" }}>Over award</div>}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+      {tab === "active" && (
+        withBudgets.length === 0 ? (
+          <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
+            No grants with an active Grant Budget yet — add one to see burn rate.
+          </div>
+        ) : (
+          <div className="overflow-x-auto border rounded-lg bg-white" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ background: "#F6F7F3" }}>
+                  <th className="text-left px-3 py-2 text-xs" style={{ minWidth: 200 }}>Grant</th>
+                  <th className="text-right px-3 py-2 text-xs">Award</th>
+                  <th className="text-right px-3 py-2 text-xs">Budgeted (current period)</th>
+                  <th className="text-right px-3 py-2 text-xs">Planned to date</th>
+                  <th className="text-right px-3 py-2 text-xs">Actual to date</th>
+                  <th className="text-right px-3 py-2 text-xs">Variance</th>
+                  <th className="text-right px-3 py-2 text-xs">% time elapsed</th>
+                  <th className="text-right px-3 py-2 text-xs">% budget used</th>
+                  <th className="text-left px-3 py-2 text-xs">Pace</th>
+                  <th className="text-right px-3 py-2 text-xs">Projected full-term spend</th>
+                </tr>
+              </thead>
+              <tbody>
+                {withBudgets.map((g) => {
+                  const b = grantBurn(g, budgets);
+                  return (
+                    <tr key={g.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                      <td className="px-3 py-2" style={{ color: "#1C2624" }}>
+                        {g.title}
+                        <div className="text-xs" style={{ color: "#8A8F87" }}>{g.programCode}</div>
+                      </td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(b.award)}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(b.totalExpense)}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{b.elapsedKnown ? fmt(b.toDate) : "—"}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.hasActuals ? "#1C2624" : "#8A8F87" }}>{b.hasActuals ? fmt(b.actualToDate) : "Not entered"}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.hasActuals ? (b.variance > 0 ? "#B5443A" : "#2F6F53") : "#8A8F87" }}>{b.hasActuals ? fmt(b.variance) : "—"}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{b.elapsedKnown ? `${Math.round(b.pctTimeElapsed * 100)}%` : "—"}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{b.elapsedKnown ? `${Math.round(b.pctBudgetUsed * 100)}%` : "—"}</td>
+                      <td className="px-3 py-2"><Badge color={paceColor[b.status]}>{b.status}</Badge></td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.projectedOverAward ? "#B5443A" : "#1C2624" }}>
+                        {b.elapsedKnown ? fmt(b.projectedFullYear) : "—"}
+                        {b.projectedOverAward && <div className="text-xs" style={{ color: "#B5443A" }}>Over award</div>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+
+      {tab === "closed" && (
+        closedPairs.length === 0 ? (
+          <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
+            No Closed Grant Budgets yet — this is where a grant's final numbers show up once its Grant Budget is marked Closed.
+          </div>
+        ) : (
+          <div className="overflow-x-auto border rounded-lg bg-white" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ background: "#F6F7F3" }}>
+                  <th className="text-left px-3 py-2 text-xs" style={{ minWidth: 200 }}>Grant</th>
+                  <th className="text-left px-3 py-2 text-xs">Budget period</th>
+                  <th className="text-right px-3 py-2 text-xs">Award</th>
+                  <th className="text-right px-3 py-2 text-xs">Budgeted (this period)</th>
+                  <th className="text-right px-3 py-2 text-xs">Actual spent</th>
+                  <th className="text-right px-3 py-2 text-xs">Variance</th>
+                  <th className="text-right px-3 py-2 text-xs">% budget used</th>
+                  <th className="text-left px-3 py-2 text-xs"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {closedPairs.map(({ grant: g, budget: bud }) => {
+                  const b = closedBudgetBurn(g, bud);
+                  return (
+                    <tr key={bud.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
+                      <td className="px-3 py-2" style={{ color: "#1C2624" }}>
+                        {g.title}
+                        <div className="text-xs" style={{ color: "#8A8F87" }}>{g.programCode}</div>
+                      </td>
+                      <td className="px-3 py-2" style={{ color: "#5B6B66" }}>{fmtDate(bud.periodStart)} – {fmtDate(bud.periodEnd)}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(b.award)}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#1C2624" }}>{fmt(b.totalExpense)}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.hasActuals ? "#1C2624" : "#8A8F87" }}>{b.hasActuals ? fmt(b.actualToDate) : "Not entered"}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: b.hasActuals ? (b.variance > 0 ? "#B5443A" : "#2F6F53") : "#8A8F87" }}>{b.hasActuals ? fmt(b.variance) : "—"}</td>
+                      <td className="px-3 py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#5B6B66" }}>{Math.round(b.pctBudgetUsed * 100)}%</td>
+                      <td className="px-3 py-2">{b.overBudget && <Badge color="#B5443A">Over budget</Badge>}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
       )}
     </div>
   );
