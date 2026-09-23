@@ -5752,6 +5752,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
+  const [positionFilter, setPositionFilter] = useState("All");
   const [siteFilter, setSiteFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
   const [sortBy, setSortBy] = useState("name");
@@ -5771,14 +5772,17 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
   const [exportingPersonnel, setExportingPersonnel] = useState(false);
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
+  const positions = ["All", ...new Set(staff.map((s) => s.position).filter(Boolean))].sort((a, b) => (a === "All" ? -1 : b === "All" ? 1 : a.localeCompare(b)));
   const visible = staff
     .filter((s) => deptFilter === "All" || s.department === deptFilter)
+    .filter((s) => positionFilter === "All" || s.position === positionFilter)
     .filter((s) => siteFilter === "All" || s.site === siteFilter)
     .filter((s) => statusFilter === "All" || (s.status || "Active") === statusFilter)
     .slice()
     .sort((a, b) => {
       if (sortBy === "status") return (a.status || "Active").localeCompare(b.status || "Active") || (a.name || "").localeCompare(b.name || "");
       if (sortBy === "department") return (a.department || "").localeCompare(b.department || "") || (a.name || "").localeCompare(b.name || "");
+      if (sortBy === "position") return (a.position || "").localeCompare(b.position || "") || (a.name || "").localeCompare(b.name || "");
       return (a.name || "").localeCompare(b.name || "");
     });
   const activeStaff = staff.filter((s) => (s.status || "Active") !== "Inactive");
@@ -6408,6 +6412,11 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
             {departments.map((d) => <option key={d}>{d}</option>)}
           </select>
         </Field>
+        <Field label="Filter by position">
+          <select value={positionFilter} onChange={(e) => setPositionFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
+            {positions.map((p) => <option key={p}>{p}</option>)}
+          </select>
+        </Field>
         <Field label="Filter by site">
           <select value={siteFilter} onChange={(e) => setSiteFilter(e.target.value)} className={inputCls} style={{ ...inputStyle, maxWidth: 260 }}>
             <option>All</option>
@@ -6425,6 +6434,7 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
             <option value="name">Name</option>
             <option value="status">Status</option>
             <option value="department">Department</option>
+            <option value="position">Position</option>
           </select>
         </Field>
       </div>
