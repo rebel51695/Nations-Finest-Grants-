@@ -2867,6 +2867,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [overviewSearch, setOverviewSearch] = useState("");
   const [overviewSort, setOverviewSort] = useState({ key: "title", dir: "asc" });
   const [overviewTypeFilter, setOverviewTypeFilter] = useState("All");
+  const [overviewStatusFilter, setOverviewStatusFilter] = useState("Active");
   const [exportingBudgetsOverview, setExportingBudgetsOverview] = useState(false);
   const [showExcelImport, setShowExcelImport] = useState(false);
 
@@ -3039,7 +3040,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     const q = overviewSearch.trim().toLowerCase();
     let rows = allBudgetsEnriched.filter((b) =>
       (!q || b.title.toLowerCase().includes(q) || b.ownerName.toLowerCase().includes(q) || (b.fy || "").toLowerCase().includes(q)) &&
-      (overviewTypeFilter === "All" || b.budgetType === overviewTypeFilter)
+      (overviewTypeFilter === "All" || b.budgetType === overviewTypeFilter) &&
+      (overviewStatusFilter === "All" || b.status === overviewStatusFilter)
     );
     rows = [...rows].sort((a, b) => {
       const dir = overviewSort.dir === "asc" ? 1 : -1;
@@ -3048,7 +3050,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       return ((av ?? 0) - (bv ?? 0)) * dir;
     });
     return rows;
-  }, [allBudgetsEnriched, overviewSearch, overviewTypeFilter, overviewSort]);
+  }, [allBudgetsEnriched, overviewSearch, overviewTypeFilter, overviewStatusFilter, overviewSort]);
 
   const exportBudgetsOverviewExcel = async () => {
     setExportingBudgetsOverview(true);
@@ -3068,6 +3070,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       const filterNote = [
         overviewSearch ? `search "${overviewSearch}"` : null,
         overviewTypeFilter !== "All" ? `type: ${budgetTypeLabel(overviewTypeFilter)}` : null,
+        overviewStatusFilter !== "All" ? `status: ${overviewStatusFilter}` : null,
       ].filter(Boolean).join(", ");
       ws.getCell(2, 1).value = `Generated ${fmtDate(new Date().toISOString().slice(0, 10))}${filterNote ? ` — filtered by ${filterNote}` : ""} — ${overviewRows.length} budget${overviewRows.length === 1 ? "" : "s"}`;
       ws.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
@@ -3170,6 +3173,15 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
             >
               <option value="All">All types</option>
               {BUDGET_TYPES.map((t) => <option key={t} value={t}>{budgetTypeLabel(t)}</option>)}
+            </select>
+            <select
+              value={overviewStatusFilter}
+              onChange={(e) => setOverviewStatusFilter(e.target.value)}
+              className={inputCls}
+              style={{ ...inputStyle, maxWidth: 170 }}
+            >
+              <option value="All">All statuses</option>
+              {BUDGET_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
             <input
               value={overviewSearch}
