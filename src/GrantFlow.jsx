@@ -38,6 +38,28 @@ function colIsWithinCutoff(col, cutoff) {
   return col.monthIndex <= cutoff.monthIndex;
 }
 
+// How current a budget's actuals are, measured against the last fully
+// completed calendar month (the month before today). 0 or 1 month behind
+// reads as normal given month-end close lag; 2 is a warning; 3+ is stale.
+// An unset marker is its own state rather than being treated as stale.
+function actualsFreshness(actualsThrough) {
+  const cutoff = parseActualsThrough(actualsThrough);
+  if (!cutoff) return { isSet: false, monthsBehind: null, label: "Not set", monthLabel: "", level: "unset", sortNum: 0 };
+  const now = new Date();
+  const lastCompleted = now.getFullYear() * 12 + now.getMonth() - 1;
+  const marker = cutoff.year * 12 + cutoff.monthIndex;
+  const monthsBehind = Math.max(0, lastCompleted - marker);
+  const level = monthsBehind <= 1 ? "ok" : monthsBehind === 2 ? "warn" : "stale";
+  return {
+    isSet: true,
+    monthsBehind,
+    monthLabel: `${MONTHS[cutoff.monthIndex]} ${cutoff.year}`,
+    label: monthsBehind === 0 ? "Current" : `${monthsBehind} mo behind`,
+    level,
+    sortNum: marker,
+  };
+}
+
 // Copies actuals from a Template budget's lines onto every linked
 // Operational budget, matching by category+subcategory and by actual
 // calendar month — not array position — since periods can start on
@@ -3024,6 +3046,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       ownerName: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "Unknown",
       ownerType: g ? "grant" : "costCenter",
       netTotal: t.revenue - t.expense,
+      actualsSortNum: actualsFreshness(b.actualsThrough).sortNum,
     };
   }), [budgets, grants, costCenters]);
 
@@ -3062,7 +3085,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       const wb = new ExcelJS.Workbook();
       const ws = wb.addWorksheet("Budgets");
 
-      const header = ["Grant / Cost Center", "Budget", "FY", "Status", "Type", "Period Start", "Period End", "Revenue", "Expense", "Net"];
+      const header = ["Grant / Cost Center", "Budget", "FY", "Status", "Type", "Period Start", "Period End", "Actuals Through", "Months Behind", "Revenue", "Expense", "Net"];
       ws.mergeCells(1, 1, 1, header.length);
       ws.getCell(1, 1).value = "Nation's Finest — Budgets";
       ws.getCell(1, 1).font = { bold: true, size: 13 };
@@ -3083,19 +3106,26 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       });
 
       let r = headerRowIdx + 1;
+      const AMBER = "FFC08A2E";
       overviewRows.forEach((b) => {
         const t = budgetTotals(b);
+        const f = actualsFreshness(b.actualsThrough);
         ws.getRow(r).values = [
           b.ownerName, b.title, b.fy || "", b.status || "", budgetTypeLabel(b.budgetType),
           b.periodStart ? fmtDate(b.periodStart) : "", b.periodEnd ? fmtDate(b.periodEnd) : "",
+          f.isSet ? f.monthLabel : "Not set", f.isSet ? f.monthsBehind : "",
           round2(t.revenue), round2(t.expense), round2(t.revenue - t.expense),
         ];
-        [8, 9, 10].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
-        ws.getCell(r, 10).font = { color: { argb: isNetNegative(t.revenue - t.expense) ? RED : GREEN } };
+        if (f.isSet) {
+          const levelColor = f.level === "ok" ? GREEN : f.level === "warn" ? AMBER : RED;
+          ws.getCell(r, 9).font = { color: { argb: levelColor } };
+        }
+        [10, 11, 12].forEach((c) => { ws.getCell(r, c).numFmt = "$#,##0"; });
+        ws.getCell(r, 12).font = { color: { argb: isNetNegative(t.revenue - t.expense) ? RED : GREEN } };
         r++;
       });
 
-      ws.columns = [{ width: 34 }, { width: 30 }, { width: 8 }, { width: 12 }, { width: 14 }, { width: 12 }, { width: 12 }, { width: 15 }, { width: 15 }, { width: 15 }];
+      ws.columns = [{ width: 34 }, { width: 30 }, { width: 8 }, { width: 12 }, { width: 14 }, { width: 12 }, { width: 12 }, { width: 16 }, { width: 14 }, { width: 15 }, { width: 15 }, { width: 15 }];
       ws.views = [{ state: "frozen", ySplit: headerRowIdx }];
 
       const buffer = await wb.xlsx.writeBuffer();
@@ -3204,6 +3234,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                   <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("fy")}>FY</th>
                   <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("status")}>Status</th>
                   <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("budgetType")}>Type</th>
+                  <th className="text-left py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("actualsSortNum")} title="Month through which this budget's actuals are marked complete — click to sort oldest first">Actuals through</th>
                   <th className="text-right py-1.5 font-medium cursor-pointer" onClick={() => toggleOverviewSort("netTotal")}>Net</th>
                 </tr>
               </thead>
@@ -3227,6 +3258,26 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
                       ) : (
                         <span className="text-xs" style={{ color: "#C08A2E" }}>Not set</span>
                       )}
+                    </td>
+                    <td className="py-1.5">
+                      {(() => {
+                        const f = actualsFreshness(b.actualsThrough);
+                        const dotColor = f.level === "ok" ? "#2F6F53" : f.level === "warn" ? "#C08A2E" : f.level === "stale" ? "#B5443A" : "#8A8F87";
+                        const noteColor = f.level === "warn" ? "#C08A2E" : f.level === "stale" ? "#B5443A" : "#8A8F87";
+                        return (
+                          <span className="inline-flex items-center gap-1.5 text-xs" style={{ whiteSpace: "nowrap" }}>
+                            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: dotColor }} />
+                            {f.isSet ? (
+                              <>
+                                <span style={{ color: "#1C2624" }}>{f.monthLabel}</span>
+                                <span style={{ color: noteColor }}>· {f.label}</span>
+                              </>
+                            ) : (
+                              <span style={{ color: "#8A8F87" }}>Not set</span>
+                            )}
+                          </span>
+                        );
+                      })()}
                     </td>
                     <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: !isNetNegative(b.netTotal) ? "#2F6F53" : "#B5443A" }}>{fmt(b.netTotal)}</td>
                   </tr>
