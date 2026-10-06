@@ -398,7 +398,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.4.1";
+const APP_VERSION = "1.5.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -1026,6 +1026,162 @@ async function saveData(baseKey, value) {
   await window.storage.set(baseKey, JSON.stringify(value), true);
 }
 
+async function saveDataJson(baseKey, json) {
+  await window.storage.set(baseKey, json, true);
+}
+
+// Keeps this browser's copy of each shared collection and the server's copy
+// from silently overwriting one another.
+//
+// The old approach switched saving off for the entire duration of every
+// 60-second refresh and let the refresh overwrite local state blindly, so an
+// edit made at the wrong moment was either never written or was replaced by
+// the older server copy. Instead this tracks, per collection, the exact text
+// last read from or written to the server (the baseline). Anything that
+// differs from the baseline is an unsaved edit: it is always written, never
+// dropped, and a refresh will never overwrite it.
+function createSyncEngine({ write, onBusyChange, onKeyWritten, onKeyClean, onKeyError, retryDelayMs = 6000, now = () => Date.now(), schedule = (fn, ms) => setTimeout(fn, ms) }) {
+  const baseline = {};
+  const pending = {};
+  const inFlight = {};
+  const failures = {};
+  const loadedKeys = {};
+  const firstSeen = {};
+  const touched = {};
+  let busy = 0;
+
+  const bump = (delta) => {
+    busy += delta;
+    if (onBusyChange) onBusyChange(busy);
+  };
+
+  function flush(key) {
+    if (inFlight[key]) return;
+    const req = pending[key];
+    if (!req) return;
+    if (req.json === baseline[key]) {
+      delete pending[key];
+      if (onKeyClean) onKeyClean(key);
+      return;
+    }
+    inFlight[key] = true;
+    touched[key] = now();
+    bump(1);
+    let attempt;
+    try { attempt = Promise.resolve(write(key, req.json)); } catch (e) { attempt = Promise.reject(e); }
+    attempt.then(
+        () => {
+          baseline[key] = req.json;
+          inFlight[key] = false;
+          failures[key] = 0;
+          touched[key] = now();
+          bump(-1);
+          if (onKeyWritten) onKeyWritten(key);
+          const next = pending[key];
+          if (next && next.json !== req.json) flush(key);
+          else delete pending[key];
+        },
+        () => {
+          inFlight[key] = false;
+          touched[key] = now();
+          bump(-1);
+          failures[key] = (failures[key] || 0) + 1;
+          if (failures[key] < 2) schedule(() => flush(key), retryDelayMs);
+          else if (onKeyError) onKeyError(key, (pending[key] || req).label, "failed");
+        }
+      );
+  }
+
+  // Called whenever a collection's local state changes.
+  function queueSave(key, value, label) {
+    const json = JSON.stringify(value);
+    if (!loadedKeys[key]) {
+      // This collection never loaded successfully (timed out). Writing now
+      // could replace real stored data with an empty list, so refuse, but
+      // only complain once the user has actually changed something.
+      if (firstSeen[key] === undefined) { firstSeen[key] = json; return; }
+      if (json === firstSeen[key]) return;
+      if (onKeyError) onKeyError(key, label, "unloaded");
+      return;
+    }
+    pending[key] = { json, label };
+    failures[key] = 0;
+    flush(key);
+  }
+
+  // Called with data just read from the server. Applies it only if doing so
+  // cannot erase an unsaved or in-flight local edit.
+  function applyRemote(key, remoteValue, setter, readStartedAt) {
+    const wasLoaded = loadedKeys[key];
+    loadedKeys[key] = true;
+    if (!wasLoaded && onKeyClean) onKeyClean(key);
+    if (inFlight[key]) return false;
+    // A write began or finished after this read started, so what we read may
+    // already be out of date. Ignore it; the next refresh will fetch fresh.
+    if (readStartedAt !== undefined && (touched[key] || 0) >= readStartedAt) return false;
+    const remoteJson = JSON.stringify(remoteValue);
+    const oldBaseline = baseline[key];
+    if (remoteJson === oldBaseline) return false;
+    baseline[key] = remoteJson;
+    setter((prev) => (oldBaseline === undefined || JSON.stringify(prev) === oldBaseline ? remoteValue : prev));
+    return true;
+  }
+
+  // Called when the server has nothing stored yet for a collection.
+  function noteEmpty(key, currentValue) {
+    const wasLoaded = loadedKeys[key];
+    loadedKeys[key] = true;
+    if (!wasLoaded && onKeyClean) onKeyClean(key);
+    if (baseline[key] === undefined) baseline[key] = JSON.stringify(currentValue);
+  }
+
+  // Re-attempts anything still unsaved, e.g. after a failed save.
+  function retryPending() {
+    Object.keys(pending).forEach((key) => {
+      if (loadedKeys[key] && !inFlight[key]) {
+        failures[key] = 0;
+        flush(key);
+      }
+    });
+  }
+
+  function hasUnsaved() {
+    return busy > 0 || Object.keys(pending).length > 0;
+  }
+
+  return { queueSave, applyRemote, noteEmpty, retryPending, hasUnsaved };
+}
+
+// A small global toast, so a screen can tell the user something happened (or
+// didn't) without needing its own state. Any code can call notify(message).
+function notify(message, tone = "error") {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("grantflow:toast", { detail: { message, tone, id: Math.random().toString(36).slice(2) } }));
+}
+
+function ToastHost() {
+  const [toasts, setToasts] = useState([]);
+  useEffect(() => {
+    const onToast = (e) => {
+      const t = e.detail;
+      setToasts((prev) => [...prev.filter((x) => x.message !== t.message), t].slice(-3));
+      setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== t.id)), 7000);
+    };
+    window.addEventListener("grantflow:toast", onToast);
+    return () => window.removeEventListener("grantflow:toast", onToast);
+  }, []);
+  if (toasts.length === 0) return null;
+  return (
+    <div className="no-print" style={{ position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)", zIndex: 100000, display: "flex", flexDirection: "column", gap: 8, alignItems: "center", pointerEvents: "none" }}>
+      {toasts.map((t) => (
+        <div key={t.id} style={{ pointerEvents: "auto", background: t.tone === "error" ? "#7A2A24" : "#1F5C6B", color: "#FFFFFF", padding: "10px 16px", borderRadius: 8, fontSize: 13, boxShadow: "0 4px 16px rgba(0,0,0,0.35)", maxWidth: 520, lineHeight: 1.4 }}>
+          {t.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // Captures a rendered chart's <svg> element as a PNG, so an Excel export can
 // embed an actual picture of the chart rather than just its underlying data
 // — ExcelJS can embed images but has no support for creating live, editable
@@ -1225,7 +1381,7 @@ function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
         <div className="flex gap-2">
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           <button
-            onClick={() => { if (!form.name.trim()) return; onSave(form); }}
+            onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
             className="px-4 py-2 rounded-md text-sm text-white"
             style={{ background: "#1F5C6B" }}
           >
@@ -1282,7 +1438,7 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, deleteBudg
         <div className="flex gap-2">
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           <button
-            onClick={() => { if (!form.name.trim()) return; onSave(form); }}
+            onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
             className="px-4 py-2 rounded-md text-sm text-white"
             style={{ background: "#1F5C6B" }}
           >
@@ -1488,7 +1644,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
         <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
         {canEdit && (
           <button
-            onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+            onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
             className="px-4 py-2 rounded-md text-sm text-white"
             style={{ background: "#1F5C6B" }}
           >
@@ -2122,7 +2278,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
         {canEdit && (
           <button
-            onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+            onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
             className="px-4 py-2 rounded-md text-sm text-white"
             style={{ background: "#1F5C6B" }}
           >
@@ -2290,7 +2446,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
-              onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+              onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
               className="px-4 py-2 rounded-md text-sm text-white"
               style={{ background: "#1F5C6B" }}
             >
@@ -3925,7 +4081,7 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
-              onClick={() => { if (!form.title.trim()) return; onSave(form); }}
+              onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
               className="px-4 py-2 rounded-md text-sm text-white"
               style={{ background: "#1F5C6B" }}
             >
@@ -5799,7 +5955,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
-              onClick={() => { if (!form.name.trim()) return; onSave(form); }}
+              onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
               className="px-4 py-2 rounded-md text-sm text-white"
               style={{ background: "#1F5C6B" }}
             >
@@ -7488,7 +7644,7 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
           <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
-              onClick={() => { if (!form.grantId && !form.costCenterId) return; onSave(form); }}
+              onClick={() => { if (!form.grantId && !form.costCenterId) { notify("Select a grant or cost center before saving."); return; } onSave(form); }}
               className="px-4 py-2 rounded-md text-sm text-white"
               style={{ background: "#1F5C6B" }}
             >
@@ -9914,32 +10070,47 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const [saveErrors, setSaveErrors] = useState({});
   const saveError = Object.keys(saveErrors).length > 0;
 
-  const saveKey = (key, value, label) => {
-    let attempt = 0;
-    const tryOnce = () => {
-      attempt += 1;
-      saveData(key, value)
-        .then(() => {
-          setSaveErrors((prev) => {
-            if (!(key in prev)) return prev;
-            const next = { ...prev };
-            delete next[key];
-            return next;
-          });
-        })
-        .catch(() => {
-          if (attempt < 2) {
-            setTimeout(tryOnce, 6000);
-          } else {
-            setSaveErrors((prev) => ({ ...prev, [key]: label }));
-          }
-        });
-    };
-    tryOnce();
+  const [savingCount, setSavingCount] = useState(0);
+  const [lastSavedAt, setLastSavedAt] = useState(null);
+  const errorKeysRef = useRef({});
+  const clearSaveError = (key) => {
+    delete errorKeysRef.current[key];
+    setSaveErrors((prev) => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+  const syncRef = useRef(null);
+  if (!syncRef.current) {
+    syncRef.current = createSyncEngine({
+      write: (key, json) => saveDataJson(key, json),
+      onBusyChange: (n) => setSavingCount(n),
+      onKeyWritten: (key) => { setLastSavedAt(Date.now()); clearSaveError(key); },
+      onKeyClean: (key) => clearSaveError(key),
+      onKeyError: (key, label, why) => {
+        setSaveErrors((prev) => ({ ...prev, [key]: label }));
+        if (!errorKeysRef.current[key]) {
+          errorKeysRef.current[key] = true;
+          notify(why === "unloaded"
+            ? `${label} didn't finish loading, so your change was not saved (this protects the stored data from being overwritten). Click "Refresh now" and try again.`
+            : `${label} couldn't be saved. Your change is still on screen and the app will keep retrying.`);
+        }
+      },
+    });
+  }
+  const queueSave = (key, value, label) => syncRef.current.queueSave(key, value, label);
+  const latestStateRef = useRef({});
+  latestStateRef.current = {
+    "grantflow:grants": grants, "grantflow:budgets": budgets, "grantflow:reports": reports, "grantflow:staff": staff,
+    "grantflow:activity": activity, "grantflow:tasks": tasks, "grantflow:invoices": invoices, "grantflow:costcenters": costCenters,
+    "grantflow:budgetgroups": budgetGroups, "grantflow:scenarios": scenarios, "grantflow:paylocityprogrammap": paylocityProgramMap,
+    "grantflow:paylocitylastimport": paylocityLastImport, "grantflow:restrictedfunds": restrictedFunds,
+    "grantflow:paylocitysnapshots": paylocitySnapshots, "grantflow:trash": trash,
   };
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const isSyncingRef = useRef(false);
   const [whoami, setWhoami] = useState(null);
   const [whoamiLoaded, setWhoamiLoaded] = useState(false);
   const [editingWhoami, setEditingWhoami] = useState(false);
@@ -9948,71 +10119,41 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const withTimeout = (promise, ms = 8000) =>
     Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(undefined), ms))]);
 
+  const collectionSpecs = () => [
+    ["grantflow:grants", setGrants],
+    ["grantflow:budgets", setBudgets],
+    ["grantflow:reports", setReports],
+    ["grantflow:staff", setStaff],
+    ["grantflow:activity", setActivity, (a) => a.slice(0, 150)],
+    ["grantflow:tasks", setTasks],
+    ["grantflow:invoices", setInvoices],
+    ["grantflow:costcenters", setCostCenters],
+    ["grantflow:budgetgroups", setBudgetGroups],
+    ["grantflow:scenarios", setScenarios],
+    ["grantflow:paylocityprogrammap", setPaylocityProgramMap],
+    ["grantflow:paylocitylastimport", setPaylocityLastImport],
+    ["grantflow:restrictedfunds", setRestrictedFunds],
+    ["grantflow:paylocitysnapshots", setPaylocitySnapshots],
+    ["grantflow:trash", setTrash, (t) => {
+      const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
+      return t.filter((x) => new Date(x.deletedAt).getTime() > cutoff);
+    }],
+  ];
+
+  // Re-reads every shared collection. The sync engine decides what's safe to
+  // apply: nothing here can overwrite a change this browser hasn't finished
+  // saving, and a read that started before one of our own saves is ignored.
   const refreshAll = async () => {
-    isSyncingRef.current = true;
-    try {
-      const g = await withTimeout(loadData("grantflow:grants"));
-      if (g) setGrants(g);
-    } catch (e) { /* no data yet */ }
-    try {
-      const b = await withTimeout(loadData("grantflow:budgets"));
-      if (b) setBudgets(b);
-    } catch (e) { /* no data yet */ }
-    try {
-      const r = await withTimeout(loadData("grantflow:reports"));
-      if (r) setReports(r);
-    } catch (e) { /* no data yet */ }
-    try {
-      const s = await withTimeout(loadData("grantflow:staff"));
-      if (s) setStaff(s);
-    } catch (e) { /* no data yet */ }
-    try {
-      const act = await withTimeout(loadData("grantflow:activity"));
-      if (act) setActivity(act.slice(0, 150));
-    } catch (e) { /* no data yet */ }
-    try {
-      const tk = await withTimeout(loadData("grantflow:tasks"));
-      if (tk) setTasks(tk);
-    } catch (e) { /* no data yet */ }
-    try {
-      const iv = await withTimeout(loadData("grantflow:invoices"));
-      if (iv) setInvoices(iv);
-    } catch (e) { /* no data yet */ }
-    try {
-      const cc = await withTimeout(loadData("grantflow:costcenters"));
-      if (cc) setCostCenters(cc);
-    } catch (e) { /* no data yet */ }
-    try {
-      const bg = await withTimeout(loadData("grantflow:budgetgroups"));
-      if (bg) setBudgetGroups(bg);
-    } catch (e) { /* no data yet */ }
-    try {
-      const sc = await withTimeout(loadData("grantflow:scenarios"));
-      if (sc) setScenarios(sc);
-    } catch (e) { /* no data yet */ }
-    try {
-      const pm = await withTimeout(loadData("grantflow:paylocityprogrammap"));
-      if (pm) setPaylocityProgramMap(pm);
-    } catch (e) { /* no data yet */ }
-    try {
-      const pli = await withTimeout(loadData("grantflow:paylocitylastimport"));
-      if (pli) setPaylocityLastImport(pli);
-    } catch (e) { /* no data yet */ }
-    try {
-      const rf = await withTimeout(loadData("grantflow:restrictedfunds"));
-      if (rf) setRestrictedFunds(rf);
-    } catch (e) { /* no data yet */ }
-    try {
-      const ps = await withTimeout(loadData("grantflow:paylocitysnapshots"));
-      if (ps) setPaylocitySnapshots(ps);
-    } catch (e) { /* no data yet */ }
-    try {
-      const tr = await withTimeout(loadData("grantflow:trash"));
-      if (tr) {
-        const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
-        setTrash(tr.filter((t) => new Date(t.deletedAt).getTime() > cutoff));
-      }
-    } catch (e) { /* no data yet */ }
+    const engine = syncRef.current;
+    for (const [key, setter, transform] of collectionSpecs()) {
+      try {
+        const startedAt = Date.now();
+        const result = await withTimeout(loadData(key));
+        if (result === undefined) continue; // timed out; try again next refresh
+        if (result) engine.applyRemote(key, transform ? transform(result) : result, setter, startedAt);
+        else engine.noteEmpty(key, latestStateRef.current[key]);
+      } catch (e) { /* leave this collection as it is until the next refresh */ }
+    }
     try {
       const annSnap = await withTimeout(getDoc(doc(db, "app_config", "announcement")));
       if (annSnap?.exists?.() && annSnap.data()?.message) {
@@ -10022,7 +10163,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       }
     } catch (e) { /* no announcement set */ }
     setLastSyncedAt(Date.now());
-    setTimeout(() => { isSyncingRef.current = false; }, 500);
+    engine.retryPending();
   };
 
   useEffect(() => {
@@ -10056,78 +10197,90 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   }, [loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:grants", grants, "Grants");
+    const onBeforeUnload = (e) => {
+      if (syncRef.current && syncRef.current.hasUnsaved()) {
+        e.preventDefault();
+        e.returnValue = "";
+        return "";
+      }
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    queueSave("grantflow:grants", grants, "Grants");
   }, [grants, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:budgets", budgets, "Budgets");
+    if (!loaded) return;
+    queueSave("grantflow:budgets", budgets, "Budgets");
   }, [budgets, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:reports", reports, "Grant reports");
+    if (!loaded) return;
+    queueSave("grantflow:reports", reports, "Grant reports");
   }, [reports, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:staff", staff, "Personnel");
+    if (!loaded) return;
+    queueSave("grantflow:staff", staff, "Personnel");
   }, [staff, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:activity", activity, "Activity log");
+    if (!loaded) return;
+    queueSave("grantflow:activity", activity, "Activity log");
   }, [activity, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:tasks", tasks, "Tasks");
+    if (!loaded) return;
+    queueSave("grantflow:tasks", tasks, "Tasks");
   }, [tasks, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:invoices", invoices, "Invoices");
+    if (!loaded) return;
+    queueSave("grantflow:invoices", invoices, "Invoices");
   }, [invoices, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:costcenters", costCenters, "Cost Centers");
+    if (!loaded) return;
+    queueSave("grantflow:costcenters", costCenters, "Cost Centers");
   }, [costCenters, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:budgetgroups", budgetGroups, "Budget Groups");
+    if (!loaded) return;
+    queueSave("grantflow:budgetgroups", budgetGroups, "Budget Groups");
   }, [budgetGroups, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:scenarios", scenarios, "Scenarios");
+    if (!loaded) return;
+    queueSave("grantflow:scenarios", scenarios, "Scenarios");
   }, [scenarios, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:paylocityprogrammap", paylocityProgramMap, "Paylocity program mapping");
+    if (!loaded) return;
+    queueSave("grantflow:paylocityprogrammap", paylocityProgramMap, "Paylocity program mapping");
   }, [paylocityProgramMap, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:paylocitylastimport", paylocityLastImport, "Paylocity last import");
+    if (!loaded) return;
+    queueSave("grantflow:paylocitylastimport", paylocityLastImport, "Paylocity last import");
   }, [paylocityLastImport, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:restrictedfunds", restrictedFunds, "Restricted funds");
+    if (!loaded) return;
+    queueSave("grantflow:restrictedfunds", restrictedFunds, "Restricted funds");
   }, [restrictedFunds, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:paylocitysnapshots", paylocitySnapshots, "Paylocity allocation snapshots");
+    if (!loaded) return;
+    queueSave("grantflow:paylocitysnapshots", paylocitySnapshots, "Paylocity allocation snapshots");
   }, [paylocitySnapshots, loaded]);
 
   useEffect(() => {
-    if (!loaded || isSyncingRef.current) return;
-    saveKey("grantflow:trash", trash, "Trash");
+    if (!loaded) return;
+    queueSave("grantflow:trash", trash, "Trash");
   }, [trash, loaded]);
 
   const logActivity = (entity, action, label) => {
@@ -10209,6 +10362,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
 
   return (
     <div className="min-h-screen flex" style={{ background: "#F6F7F3" }}>
+      <ToastHost />
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
         .font-display { font-family: 'Oswald', sans-serif; text-transform: uppercase; letter-spacing: 0.02em; }
@@ -10268,10 +10422,12 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           {saveError ? (
             <span className="inline-flex items-start gap-1" style={{ color: "#E08A82" }}>
               <AlertCircle size={12} className="mt-0.5 shrink-0" />
-              {Object.values(saveErrors).join(", ")} failed to save after retrying — try "Refresh now" below, or check support.claude.com if this continues.
+              {Object.values(saveErrors).join(", ")} not saved yet — your changes are still on screen and the app keeps retrying. Try "Refresh now" below; if it keeps happening, tell your GrantFlow admin.
             </span>
+          ) : savingCount > 0 ? (
+            <span className="inline-flex items-center gap-1" style={{ color: "#F0B21E" }}><RefreshCw size={12} className="animate-spin" /> Saving…</span>
           ) : (
-            <span className="inline-flex items-center gap-1"><CheckCircle2 size={12} /> Synced (shared)</span>
+            <span className="inline-flex items-center gap-1"><CheckCircle2 size={12} /> {lastSavedAt ? `All changes saved · ${new Date(lastSavedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Synced (shared)"}</span>
           )}
           <button onClick={refreshAll} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
             <RefreshCw size={11} /> Refresh now{lastSyncedAt ? ` · ${Math.max(0, Math.round((Date.now() - lastSyncedAt) / 1000))}s ago` : ""}
