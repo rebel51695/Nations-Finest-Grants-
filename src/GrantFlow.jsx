@@ -2887,7 +2887,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [budgetMode, setBudgetMode] = useState("grant"); // grant | costCenter
   const [duplicatePrompt, setDuplicatePrompt] = useState(null); // the budget being duplicated, or null
   const [overviewSearch, setOverviewSearch] = useState("");
-  const [overviewSort, setOverviewSort] = useState({ key: "title", dir: "asc" });
+  const [overviewSort, setOverviewSort] = useState({ key: "ownerName", dir: "asc" });
   const [overviewTypeFilter, setOverviewTypeFilter] = useState("All");
   const [overviewStatusFilter, setOverviewStatusFilter] = useState("Active");
   const [exportingBudgetsOverview, setExportingBudgetsOverview] = useState(false);
@@ -3069,8 +3069,9 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
     rows = [...rows].sort((a, b) => {
       const dir = overviewSort.dir === "asc" ? 1 : -1;
       const av = a[overviewSort.key], bv = b[overviewSort.key];
-      if (typeof av === "string") return av.localeCompare(bv) * dir;
-      return ((av ?? 0) - (bv ?? 0)) * dir;
+      const primary = typeof av === "string" ? av.localeCompare(bv) * dir : ((av ?? 0) - (bv ?? 0)) * dir;
+      if (primary !== 0) return primary;
+      return (a.title || "").localeCompare(b.title || "");
     });
     return rows;
   }, [allBudgetsEnriched, overviewSearch, overviewTypeFilter, overviewStatusFilter, overviewSort]);
