@@ -6,7 +6,7 @@ import ExcelJS from "exceljs";
 import {
   LayoutDashboard, FileText, Wallet, BarChart3, Plus, X, Pencil, Trash2,
   ExternalLink, Download, Search, ArrowRight, AlertCircle, CheckCircle2,
-  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical, Undo2, Lock,
+  ClipboardList, Circle, CheckCircle, Users, PieChart, TrendingUp, History, CheckSquare, Upload, Printer, RefreshCw, Receipt, Menu, Shield, FlaskConical, Undo2, Lock, AlertTriangle,
 } from "lucide-react";
 import AdminPanel from "./AdminPanel.jsx";
 import {
@@ -1329,19 +1329,126 @@ function GrantPicker({ grants, value, onChange, placeholder = "Select a grant", 
   );
 }
 
-function Modal({ title, onClose, children, wide, size }) {
+// Per-person preference for the "unsaved changes" reminder. Cached at module
+// level so it is only read from storage once per page load.
+let unsavedReminderOff = null;
+async function loadUnsavedReminderPref() {
+  if (unsavedReminderOff !== null) return unsavedReminderOff;
+  try {
+    const r = await window.storage.get("grantflow:hideUnsavedReminder", false);
+    unsavedReminderOff = r?.value === "1";
+  } catch (e) {
+    unsavedReminderOff = false;
+  }
+  return unsavedReminderOff;
+}
+async function setUnsavedReminderOff(off) {
+  unsavedReminderOff = off;
+  try {
+    await window.storage.set("grantflow:hideUnsavedReminder", off ? "1" : "0", false);
+  } catch (e) { /* the choice still applies for this session even if it can't be remembered */ }
+}
+
+// guardUnsaved: for edit forms with a Save button. If the person has changed
+// anything and tries to leave via the X or the form's Cancel button, show a
+// reminder instead of silently discarding their work. "Changed" means the
+// form's fields no longer match how they looked when it opened, so typing
+// something and then putting it back does not count.
+function Modal({ title, onClose, children, wide, size, guardUnsaved }) {
   const widthClass = size === "xl" ? "w-[97vw] max-w-[2000px]" : wide ? "max-w-4xl" : "max-w-lg";
+  const dialogRef = useRef(null);
+  const snapshotRef = useRef(null);
+  const [reminderOpen, setReminderOpen] = useState(false);
+  const [reminderOff, setReminderOff] = useState(unsavedReminderOff === true);
+
+  // Only this modal's own fields, not those of a modal opened on top of it.
+  const readFields = () => {
+    const root = dialogRef.current;
+    if (!root) return null;
+    return Array.from(root.querySelectorAll("input, textarea, select"))
+      .filter((el) => el.closest("[data-modal-dialog]") === root && el.type !== "file" && el.type !== "button")
+      .map((el) => (el.type === "checkbox" || el.type === "radio" ? (el.checked ? "1" : "0") : el.value))
+      .join("\u0001");
+  };
+
+  useEffect(() => {
+    if (!guardUnsaved) return undefined;
+    const frame = requestAnimationFrame(() => { snapshotRef.current = readFields(); });
+    loadUnsavedReminderPref().then((off) => setReminderOff(off));
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  const hasUnsavedChanges = () => snapshotRef.current !== null && readFields() !== snapshotRef.current;
+
+  const attemptClose = () => {
+    if (guardUnsaved && !reminderOff && hasUnsavedChanges()) { setReminderOpen(true); return; }
+    onClose();
+  };
+
+  const interceptCancel = (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest("button[data-modal-cancel]") : null;
+    if (!btn || btn.closest("[data-modal-dialog]") !== dialogRef.current) return;
+    if (!reminderOff && hasUnsavedChanges()) {
+      e.preventDefault();
+      e.stopPropagation();
+      setReminderOpen(true);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto overflow-x-hidden py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
-      <div className={`bg-white rounded-xl shadow-xl w-full min-w-0 ${widthClass} my-auto`}>
+      <div
+        ref={dialogRef}
+        data-modal-dialog="1"
+        onClickCapture={guardUnsaved ? interceptCancel : undefined}
+        className={`bg-white rounded-xl shadow-xl w-full min-w-0 ${widthClass} my-auto`}
+      >
         <div className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "#E1E5DE" }}>
           <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>{title}</h2>
-          <button onClick={onClose} className="p-1 rounded hover:bg-stone-100">
+          <button onClick={attemptClose} className="p-1 rounded hover:bg-stone-100">
             <X size={18} style={{ color: "#5B6B66" }} />
           </button>
         </div>
         <div className="p-6">{children}</div>
       </div>
+      {reminderOpen && (
+        <div className="fixed inset-0 flex items-center justify-center px-4" style={{ background: "rgba(28,38,36,0.55)", zIndex: 60 }}>
+          <div role="alertdialog" aria-modal="true" aria-label="Unsaved changes" className="bg-white rounded-xl shadow-xl w-full max-w-sm p-5">
+            <div className="flex items-start gap-3">
+              <div className="shrink-0 flex items-center justify-center rounded-full" style={{ width: 34, height: 34, background: "#FBF3E4" }}>
+                <AlertTriangle size={18} style={{ color: "#C08A2E" }} />
+              </div>
+              <div>
+                <div className="font-display text-base" style={{ color: "#1C2624" }}>You have unsaved changes</div>
+                <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Click Save before you close this screen, or your changes won't be kept.</p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                onClick={() => { setUnsavedReminderOff(true); setReminderOff(true); setReminderOpen(false); }}
+                className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}
+              >
+                Don't show this again
+              </button>
+              <button
+                autoFocus
+                onClick={() => setReminderOpen(false)}
+                className="px-5 py-2 rounded-md text-sm text-white font-medium" style={{ background: "#1F5C6B" }}
+              >
+                OK
+              </button>
+            </div>
+            <div className="mt-4 pt-3 border-t" style={{ borderColor: "#E1E5DE" }}>
+              <button
+                onClick={() => { setReminderOpen(false); onClose(); }}
+                className="px-3 py-1.5 rounded-md text-xs border border-dashed" style={{ borderColor: "#B5443A", color: "#B5443A" }}
+              >
+                Close without saving
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1365,7 +1472,7 @@ function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal title={budgetGroup ? "Edit budget group" : "New budget group"} onClose={onClose}>
+    <Modal guardUnsaved title={budgetGroup ? "Edit budget group" : "New budget group"} onClose={onClose}>
       <div className="space-y-4">
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Housing Programs, Veteran Support Services" autoFocus />
@@ -1379,7 +1486,7 @@ function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete</button>
         ) : <span />}
         <div className="flex gap-2">
-          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           <button
             onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
             className="px-4 py-2 rounded-md text-sm text-white"
@@ -1410,7 +1517,7 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, deleteBudg
   const currentGroup = budgetGroups?.find((bg) => bg.id === form.budgetGroupId);
 
   return (
-    <Modal title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
+    <Modal guardUnsaved title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
       <div className="space-y-4">
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Administration, Fundraising, Facilities" autoFocus />
@@ -1436,7 +1543,7 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, deleteBudg
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete</button>
         ) : <span />}
         <div className="flex gap-2">
-          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           <button
             onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
             className="px-4 py-2 rounded-md text-sm text-white"
@@ -1498,7 +1605,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
   };
 
   return (
-    <Modal title={grant ? (canEdit ? "Edit grant" : "View grant") : "New grant"} onClose={onClose} wide>
+    <Modal guardUnsaved title={grant ? (canEdit ? "Edit grant" : "View grant") : "New grant"} onClose={onClose} wide>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Grant title">
@@ -1641,7 +1748,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
             <Undo2 size={14} /> Undo
           </button>
         )}
-        <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+        <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
         {canEdit && (
           <button
             onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
@@ -1779,7 +1886,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   });
 
   return (
-    <Modal title={budget ? "Edit budget" : "New budget"} onClose={onClose} size="xl">
+    <Modal guardUnsaved title={budget ? "Edit budget" : "New budget"} onClose={onClose} size="xl">
       {budget?.status === "Closed" && (
         <div className="rounded-md px-3 py-2 mb-4 flex items-start gap-2" style={{ background: "#FBEAE8", border: "1px solid #B5443A" }}>
           <AlertCircle size={15} style={{ color: "#B5443A", marginTop: 1 }} className="shrink-0" />
@@ -2275,7 +2382,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             <Undo2 size={14} /> Undo
           </button>
         )}
-        <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+        <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
         {canEdit && (
           <button
             onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
@@ -2314,7 +2421,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
   const grant = grants.find((g) => g.id === form.grantId);
 
   return (
-    <Modal title={report ? (canEdit ? "Edit report" : "View report") : "New report"} onClose={onClose} wide>
+    <Modal guardUnsaved title={report ? (canEdit ? "Edit report" : "View report") : "New report"} onClose={onClose} wide>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="col-span-2">
@@ -2443,7 +2550,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
               onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
@@ -4028,7 +4135,7 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal title={task ? (canEdit ? "Edit task" : "View task") : "New task"} onClose={onClose}>
+    <Modal guardUnsaved title={task ? (canEdit ? "Edit task" : "View task") : "New task"} onClose={onClose}>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
         <Field label="Task title">
@@ -4078,7 +4185,7 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
               onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
@@ -5771,7 +5878,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
   const allocatedPct = staffAllocatedTotal(form);
 
   return (
-    <Modal title={staff ? (canEdit ? "Edit staff member" : "View staff member") : "New staff member"} onClose={onClose} wide>
+    <Modal guardUnsaved title={staff ? (canEdit ? "Edit staff member" : "View staff member") : "New staff member"} onClose={onClose} wide>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Name">
@@ -5952,7 +6059,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
               onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
@@ -7396,7 +7503,7 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
   const hasOpenDiscrepancy = verification.discrepancies.some((d) => d.status !== "resolved");
 
   return (
-    <Modal title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
+    <Modal guardUnsaved title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
         <Field label="Grant or cost center">
@@ -7641,7 +7748,7 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
           {canEdit && (
             <button
               onClick={() => { if (!form.grantId && !form.costCenterId) { notify("Select a grant or cost center before saving."); return; } onSave(form); }}
@@ -10071,6 +10178,13 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const saveError = Object.keys(saveErrors).length > 0;
 
   const [savingCount, setSavingCount] = useState(0);
+  const [saveReminderOff, setSaveReminderOff] = useState(false);
+  useEffect(() => { loadUnsavedReminderPref().then(setSaveReminderOff); }, []);
+  const toggleSaveReminder = () => {
+    const next = !saveReminderOff;
+    setUnsavedReminderOff(next);
+    setSaveReminderOff(next);
+  };
   const [lastSavedAt, setLastSavedAt] = useState(null);
   const errorKeysRef = useRef({});
   const clearSaveError = (key) => {
@@ -10431,6 +10545,9 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           )}
           <button onClick={refreshAll} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
             <RefreshCw size={11} /> Refresh now{lastSyncedAt ? ` · ${Math.max(0, Math.round((Date.now() - lastSyncedAt) / 1000))}s ago` : ""}
+          </button>
+          <button onClick={toggleSaveReminder} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
+            <AlertTriangle size={11} /> Save reminder: {saveReminderOff ? "off" : "on"}
           </button>
           {currentUserEmail ? (
             <div className="flex items-center justify-between gap-1.5 text-xs" style={{ color: "#B9CBCF" }}>
