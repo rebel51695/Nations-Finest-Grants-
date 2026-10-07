@@ -398,7 +398,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.5.1";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -1000,12 +1000,22 @@ function grantLabel(g) {
   return g.programCode ? `${g.programCode} - ${g.title}` : g.title;
 }
 
+// Tells "this record doesn't exist" apart from "the storage layer failed to
+// answer". The first is a normal empty state; the second must never be taken
+// for it, or a failed read looks exactly like lost data.
+function classifyStorageError(e) {
+  const text = String((e && (e.code || e.message)) || e || "").toLowerCase();
+  return /not.?found|does not exist|no such|no document/.test(text) ? "missing" : "failure";
+}
+
+// Returns the stored data, null if nothing is stored, or undefined if the
+// read itself failed (callers must not treat undefined as "empty").
 async function loadData(baseKey) {
-  // Plain single-key format (the normal, simple case)
+  let readFailed = false;
   try {
     const plain = await window.storage.get(baseKey, true);
     if (plain?.value) return JSON.parse(plain.value);
-  } catch (e) { /* not stored this way, try the chunked fallback below */ }
+  } catch (e) { if (classifyStorageError(e) === "failure") readFailed = true; }
   // Fallback: in case data was ever written in the old chunked format
   try {
     const countRes = await window.storage.get(`${baseKey}:count`, true);
@@ -1018,8 +1028,8 @@ async function loadData(baseKey) {
       }
       return all;
     }
-  } catch (e) { /* nothing stored yet */ }
-  return null;
+  } catch (e) { if (classifyStorageError(e) === "failure") readFailed = true; }
+  return readFailed ? undefined : null;
 }
 
 async function saveData(baseKey, value) {
@@ -1040,10 +1050,12 @@ async function saveDataJson(baseKey, json) {
 // last read from or written to the server (the baseline). Anything that
 // differs from the baseline is an unsaved edit: it is always written, never
 // dropped, and a refresh will never overwrite it.
-function createSyncEngine({ write, onBusyChange, onKeyWritten, onKeyClean, onKeyError, retryDelayMs = 6000, now = () => Date.now(), schedule = (fn, ms) => setTimeout(fn, ms) }) {
+function createSyncEngine({ write, verify, onServerData, onBusyChange, onKeyWritten, onKeyClean, onKeyError, retryDelayMs = 6000, now = () => Date.now(), schedule = (fn, ms) => setTimeout(fn, ms) }) {
   const baseline = {};
   const pending = {};
   const inFlight = {};
+  const verifying = {};
+  const verified = {};
   const failures = {};
   const loadedKeys = {};
   const firstSeen = {};
@@ -1055,13 +1067,45 @@ function createSyncEngine({ write, onBusyChange, onKeyWritten, onKeyClean, onKey
     if (onBusyChange) onBusyChange(busy);
   };
 
+  const isEmptyJson = (j) => j === undefined || j === null || j === "" || j === "[]" || j === "{}" || j === "null";
+
   function flush(key) {
-    if (inFlight[key]) return;
+    if (inFlight[key] || verifying[key]) return;
     const req = pending[key];
     if (!req) return;
     if (req.json === baseline[key]) {
       delete pending[key];
       if (onKeyClean) onKeyClean(key);
+      return;
+    }
+    // A collection that looked empty when this browser loaded it may not be
+    // empty on the server: a read can fail or come back blank. Before the
+    // first write over an empty-looking collection, confirm with the server.
+    // If it actually holds data this browser never saw, do not overwrite it.
+    if (verify && !verified[key] && isEmptyJson(baseline[key])) {
+      verifying[key] = true;
+      bump(1);
+      let check;
+      try { check = Promise.resolve(verify(key)); } catch (e) { check = Promise.reject(e); }
+      check.then(
+        (serverJson) => {
+          verifying[key] = false;
+          bump(-1);
+          if (!isEmptyJson(serverJson) && serverJson !== req.json) {
+            delete pending[key];
+            if (onServerData) onServerData(key, serverJson);
+            if (onKeyError) onKeyError(key, req.label, "conflict");
+            return;
+          }
+          verified[key] = true;
+          flush(key);
+        },
+        () => {
+          verifying[key] = false;
+          bump(-1);
+          if (onKeyError) onKeyError(key, (pending[key] || req).label, "unverified");
+        }
+      );
       return;
     }
     inFlight[key] = true;
@@ -1111,10 +1155,17 @@ function createSyncEngine({ write, onBusyChange, onKeyWritten, onKeyClean, onKey
 
   // Called with data just read from the server. Applies it only if doing so
   // cannot erase an unsaved or in-flight local edit.
-  function applyRemote(key, remoteValue, setter, readStartedAt) {
+  function applyRemote(key, remoteValue, setter, readStartedAt, force) {
     const wasLoaded = loadedKeys[key];
     loadedKeys[key] = true;
     if (!wasLoaded && onKeyClean) onKeyClean(key);
+    if (force) {
+      baseline[key] = JSON.stringify(remoteValue);
+      verified[key] = true;
+      delete pending[key];
+      setter(() => remoteValue);
+      return true;
+    }
     if (inFlight[key]) return false;
     // A write began or finished after this read started, so what we read may
     // already be out of date. Ignore it; the next refresh will fetch fresh.
@@ -1149,8 +1200,13 @@ function createSyncEngine({ write, onBusyChange, onKeyWritten, onKeyClean, onKey
     return busy > 0 || Object.keys(pending).length > 0;
   }
 
-  return { queueSave, applyRemote, noteEmpty, retryPending, hasUnsaved };
+  function isLoaded(key) {
+    return !!loadedKeys[key];
+  }
+
+  return { queueSave, applyRemote, noteEmpty, retryPending, hasUnsaved, isLoaded };
 }
+
 
 // A small global toast, so a screen can tell the user something happened (or
 // didn't) without needing its own state. Any code can call notify(message).
@@ -10186,6 +10242,10 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     setSaveReminderOff(next);
   };
   const [lastSavedAt, setLastSavedAt] = useState(null);
+  const [notLoaded, setNotLoaded] = useState([]);
+  const [loadInfo, setLoadInfo] = useState(null);
+  const quickRetryTimerRef = useRef(null);
+  const quickRetryAttemptRef = useRef(0);
   const errorKeysRef = useRef({});
   const clearSaveError = (key) => {
     delete errorKeysRef.current[key];
@@ -10200,15 +10260,38 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   if (!syncRef.current) {
     syncRef.current = createSyncEngine({
       write: (key, json) => saveDataJson(key, json),
+      verify: async (key) => {
+        try {
+          const r = await window.storage.get(key, true);
+          return r && r.value ? r.value : null;
+        } catch (e) {
+          if (classifyStorageError(e) === "missing") return null;
+          throw e;
+        }
+      },
+      onServerData: (key, json) => {
+        const spec = collectionSpecs().find((c) => c.key === key);
+        if (!spec) return;
+        try {
+          const value = JSON.parse(json);
+          syncRef.current.applyRemote(key, spec.transform ? spec.transform(value) : value, spec.set, Date.now(), true);
+        } catch (e) { /* the message shown to the user already explains what happened */ }
+      },
       onBusyChange: (n) => setSavingCount(n),
       onKeyWritten: (key) => { setLastSavedAt(Date.now()); clearSaveError(key); },
       onKeyClean: (key) => clearSaveError(key),
       onKeyError: (key, label, why) => {
+        if (why === "conflict") {
+          notify(`${label} on the server had data this screen hadn't loaded, so your change was not saved (saving would have replaced that data). The saved data is showing now, so please redo your change.`);
+          return;
+        }
         setSaveErrors((prev) => ({ ...prev, [key]: label }));
         if (!errorKeysRef.current[key]) {
           errorKeysRef.current[key] = true;
           notify(why === "unloaded"
-            ? `${label} didn't finish loading, so your change was not saved (this protects the stored data from being overwritten). Click "Refresh now" and try again.`
+            ? `${label} didn't finish loading, so your change was not saved (this protects the stored data from being overwritten). Wait for it to load, or click "Refresh now", and try again.`
+            : why === "unverified"
+            ? `${label} couldn't be checked against the server, so your change hasn't been saved yet. The app will keep trying.`
             : `${label} couldn't be saved. Your change is still on screen and the app will keep retrying.`);
         }
       },
@@ -10233,51 +10316,86 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const withTimeout = (promise, ms = 8000) =>
     Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(undefined), ms))]);
 
+  const LOAD_TIMEOUT_MS = 15000;
   const collectionSpecs = () => [
-    ["grantflow:grants", setGrants],
-    ["grantflow:budgets", setBudgets],
-    ["grantflow:reports", setReports],
-    ["grantflow:staff", setStaff],
-    ["grantflow:activity", setActivity, (a) => a.slice(0, 150)],
-    ["grantflow:tasks", setTasks],
-    ["grantflow:invoices", setInvoices],
-    ["grantflow:costcenters", setCostCenters],
-    ["grantflow:budgetgroups", setBudgetGroups],
-    ["grantflow:scenarios", setScenarios],
-    ["grantflow:paylocityprogrammap", setPaylocityProgramMap],
-    ["grantflow:paylocitylastimport", setPaylocityLastImport],
-    ["grantflow:restrictedfunds", setRestrictedFunds],
-    ["grantflow:paylocitysnapshots", setPaylocitySnapshots],
-    ["grantflow:trash", setTrash, (t) => {
+    { key: "grantflow:grants", label: "Grants", set: setGrants },
+    { key: "grantflow:budgets", label: "Budgets", set: setBudgets },
+    { key: "grantflow:reports", label: "Grant reports", set: setReports },
+    { key: "grantflow:staff", label: "Personnel", set: setStaff },
+    { key: "grantflow:activity", label: "Activity log", set: setActivity, transform: (a) => a.slice(0, 150) },
+    { key: "grantflow:tasks", label: "Tasks", set: setTasks },
+    { key: "grantflow:invoices", label: "Invoices", set: setInvoices },
+    { key: "grantflow:costcenters", label: "Cost Centers", set: setCostCenters },
+    { key: "grantflow:budgetgroups", label: "Budget Groups", set: setBudgetGroups },
+    { key: "grantflow:scenarios", label: "Scenarios", set: setScenarios },
+    { key: "grantflow:paylocityprogrammap", label: "Paylocity program mapping", set: setPaylocityProgramMap },
+    { key: "grantflow:paylocitylastimport", label: "Paylocity last import", set: setPaylocityLastImport },
+    { key: "grantflow:restrictedfunds", label: "Restricted funds", set: setRestrictedFunds },
+    { key: "grantflow:paylocitysnapshots", label: "Paylocity allocation snapshots", set: setPaylocitySnapshots },
+    { key: "grantflow:trash", label: "Trash", set: setTrash, transform: (t) => {
       const cutoff = Date.now() - 90 * 24 * 60 * 60 * 1000;
       return t.filter((x) => new Date(x.deletedAt).getTime() > cutoff);
-    }],
+    } },
   ];
 
-  // Re-reads every shared collection. The sync engine decides what's safe to
+  // Re-reads the shared collections (all of them, or just the ones named).
+  // The reads run at the same time, so a slow connection costs one wait
+  // rather than fifteen in a row. The sync engine decides what is safe to
   // apply: nothing here can overwrite a change this browser hasn't finished
   // saving, and a read that started before one of our own saves is ignored.
-  const refreshAll = async () => {
+  const refreshAll = async (onlyKeys) => {
     const engine = syncRef.current;
-    for (const [key, setter, transform] of collectionSpecs()) {
-      try {
-        const startedAt = Date.now();
-        const result = await withTimeout(loadData(key));
-        if (result === undefined) continue; // timed out; try again next refresh
-        if (result) engine.applyRemote(key, transform ? transform(result) : result, setter, startedAt);
-        else engine.noteEmpty(key, latestStateRef.current[key]);
-      } catch (e) { /* leave this collection as it is until the next refresh */ }
+    const all = collectionSpecs();
+    const partial = Array.isArray(onlyKeys);
+    const specs = partial ? all.filter((c) => onlyKeys.includes(c.key)) : all;
+    const passStartedAt = Date.now();
+    const timings = {};
+    const announcementRead = partial ? null : (async () => {
+      try { return await withTimeout(getDoc(doc(db, "app_config", "announcement")), LOAD_TIMEOUT_MS); } catch (e) { return undefined; }
+    })();
+    const reads = await Promise.all(specs.map(async (spec) => {
+      const startedAt = Date.now();
+      let result;
+      try { result = await withTimeout(loadData(spec.key), LOAD_TIMEOUT_MS); } catch (e) { result = undefined; }
+      timings[spec.label] = Date.now() - startedAt;
+      return { spec, startedAt, result };
+    }));
+    reads.forEach(({ spec, startedAt, result }) => {
+      if (result === undefined) return; // timed out or failed; the quick retry below tries again
+      if (result) engine.applyRemote(spec.key, spec.transform ? spec.transform(result) : result, spec.set, startedAt);
+      else engine.noteEmpty(spec.key, latestStateRef.current[spec.key]);
+    });
+    if (announcementRead) {
+      const annSnap = await announcementRead;
+      if (annSnap?.exists?.() && annSnap.data()?.message) setAnnouncement(annSnap.data());
+      else if (annSnap !== undefined) setAnnouncement(null);
     }
-    try {
-      const annSnap = await withTimeout(getDoc(doc(db, "app_config", "announcement")));
-      if (annSnap?.exists?.() && annSnap.data()?.message) {
-        setAnnouncement(annSnap.data());
-      } else {
-        setAnnouncement(null);
-      }
-    } catch (e) { /* no announcement set */ }
+
+    const stillMissing = all.filter((c) => !engine.isLoaded(c.key));
+    setNotLoaded(stillMissing.map((c) => c.label));
+    if (!partial) {
+      const info = { totalMs: Date.now() - passStartedAt, timings, at: Date.now() };
+      setLoadInfo(info);
+      console.info("[GrantFlow] loaded in " + info.totalMs + "ms", timings);
+    }
     setLastSyncedAt(Date.now());
     engine.retryPending();
+
+    // Anything that didn't load is retried within seconds instead of waiting
+    // for the next minute-long refresh.
+    if (stillMissing.length === 0) {
+      quickRetryAttemptRef.current = 0;
+    } else if (!quickRetryTimerRef.current) {
+      const delays = [3000, 8000, 20000];
+      const attempt = quickRetryAttemptRef.current;
+      if (attempt < delays.length) {
+        quickRetryTimerRef.current = setTimeout(() => {
+          quickRetryTimerRef.current = null;
+          quickRetryAttemptRef.current = attempt + 1;
+          refreshAll(collectionSpecs().filter((c) => !syncRef.current.isLoaded(c.key)).map((c) => c.key));
+        }, delays[attempt]);
+      }
+    }
   };
 
   useEffect(() => {
@@ -10543,7 +10661,11 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           ) : (
             <span className="inline-flex items-center gap-1"><CheckCircle2 size={12} /> {lastSavedAt ? `All changes saved · ${new Date(lastSavedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Synced (shared)"}</span>
           )}
-          <button onClick={refreshAll} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
+          <button
+            onClick={() => refreshAll()}
+            title={loadInfo ? `Last full load took ${(loadInfo.totalMs / 1000).toFixed(1)}s\n` + Object.entries(loadInfo.timings).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}: ${(v / 1000).toFixed(1)}s`).join("\n") : "Reload everything from the server"}
+            className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}
+          >
             <RefreshCw size={11} /> Refresh now{lastSyncedAt ? ` · ${Math.max(0, Math.round((Date.now() - lastSyncedAt) / 1000))}s ago` : ""}
           </button>
           <button onClick={toggleSaveReminder} className="w-full flex items-center gap-1.5 text-xs hover:underline" style={{ color: "#B9CBCF" }}>
@@ -10581,6 +10703,14 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             <button onClick={() => setAnnouncementDismissed(true)} className="shrink-0 p-0.5 rounded hover:bg-black/5">
               <X size={15} style={{ color: "#8A6D1F" }} />
             </button>
+          </div>
+        )}
+        {loaded && notLoaded.length > 0 && (
+          <div className="no-print px-4 md:px-8 py-2.5 flex items-center gap-2" style={{ background: "#EAF1F3", borderBottom: "1px solid #B9CBCF" }}>
+            <RefreshCw size={14} className="animate-spin shrink-0" style={{ color: "#1F5C6B" }} />
+            <div className="text-sm" style={{ color: "#17313A" }}>
+              Still loading {notLoaded.join(", ")}. What you see for {notLoaded.length === 1 ? "it" : "these"} may be incomplete, so please don't edit {notLoaded.length === 1 ? "it" : "them"} yet. This clears on its own.
+            </div>
           </div>
         )}
         <main className="flex-1 px-4 md:px-8 py-4 md:py-8" style={{ maxWidth: (tab === "grant-reports" || tab === "org-budget" || tab === "burn-rate" || tab === "restricted-funds") ? "100%" : "72rem" }}>
