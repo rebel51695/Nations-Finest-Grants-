@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, Fragment, Component } from "react";
+import { useState, useEffect, useMemo, useRef, Fragment, Component, createContext, useContext } from "react";
 import { doc, getDoc } from "firebase/firestore";
 import { db } from "./firebaseConfig";
 import * as XLSX from "xlsx";
@@ -398,7 +398,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.5.1";
+const APP_VERSION = "1.5.2";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -1060,6 +1060,7 @@ function createSyncEngine({ write, verify, onServerData, onBusyChange, onKeyWrit
   const loadedKeys = {};
   const firstSeen = {};
   const touched = {};
+  const counts = {};
   let busy = 0;
 
   const bump = (delta) => {
@@ -1138,6 +1139,7 @@ function createSyncEngine({ write, verify, onServerData, onBusyChange, onKeyWrit
 
   // Called whenever a collection's local state changes.
   function queueSave(key, value, label) {
+    counts[key] = (counts[key] || 0) + 1;
     const json = JSON.stringify(value);
     if (!loadedKeys[key]) {
       // This collection never loaded successfully (timed out). Writing now
@@ -1204,7 +1206,19 @@ function createSyncEngine({ write, verify, onServerData, onBusyChange, onKeyWrit
     return !!loadedKeys[key];
   }
 
-  return { queueSave, applyRemote, noteEmpty, retryPending, hasUnsaved, isLoaded };
+  // True while anything for this collection is waiting to be written, being
+  // checked against the server, or mid-write.
+  function isKeyDirty(key) {
+    return !!(pending[key] || inFlight[key] || verifying[key]);
+  }
+
+  // How many times this collection's local state has been handed to the
+  // engine. Lets a screen tell "my save reached the engine" from "not yet".
+  function queueCount(key) {
+    return counts[key] || 0;
+  }
+
+  return { queueSave, applyRemote, noteEmpty, retryPending, hasUnsaved, isLoaded, isKeyDirty, queueCount };
 }
 
 
@@ -1405,17 +1419,33 @@ async function setUnsavedReminderOff(off) {
   } catch (e) { /* the choice still applies for this session even if it can't be remembered */ }
 }
 
-// guardUnsaved: for edit forms with a Save button. If the person has changed
-// anything and tries to leave via the X or the form's Cancel button, show a
-// reminder instead of silently discarding their work. "Changed" means the
-// form's fields no longer match how they looked when it opened, so typing
-// something and then putting it back does not count.
-function Modal({ title, onClose, children, wide, size, guardUnsaved }) {
+// Carries the state of the surrounding edit screen to its footer buttons.
+const ModalContext = createContext(null);
+
+// Lets an edit screen ask the app when its own save has actually reached the
+// server. The app plugs the real implementation in on every render.
+const syncBridge = { waitForSaved: async () => "saved" };
+
+// guardUnsaved: for edit forms with a Save button. Saving keeps the screen
+// open and confirms the save; closing (X or the Close button) while the
+// fields differ from the last saved state shows a reminder first. "Changed"
+// means the fields no longer match how they looked when the screen opened or
+// was last saved, so typing something and then putting it back does not count.
+// saveKey: which stored collection this screen saves into, so the screen can
+// tell when that collection has really been written.
+function Modal({ title, onClose, children, wide, size, guardUnsaved, saveKey }) {
   const widthClass = size === "xl" ? "w-[97vw] max-w-[2000px]" : wide ? "max-w-4xl" : "max-w-lg";
   const dialogRef = useRef(null);
   const snapshotRef = useRef(null);
+  const frameRef = useRef(0);
+  const mountedRef = useRef(true);
+  const saveTokenRef = useRef(0);
   const [reminderOpen, setReminderOpen] = useState(false);
   const [reminderOff, setReminderOff] = useState(unsavedReminderOff === true);
+  const [isDirty, setIsDirty] = useState(false);
+  const [phase, setPhase] = useState("idle"); // idle | saving | saved | retrying | rejected
+  const [savedAt, setSavedAt] = useState(null);
+  const [savedOnce, setSavedOnce] = useState(false);
 
   // Only this modal's own fields, not those of a modal opened on top of it.
   const readFields = () => {
@@ -1428,44 +1458,87 @@ function Modal({ title, onClose, children, wide, size, guardUnsaved }) {
   };
 
   useEffect(() => {
-    if (!guardUnsaved) return undefined;
-    const frame = requestAnimationFrame(() => { snapshotRef.current = readFields(); });
-    loadUnsavedReminderPref().then((off) => setReminderOff(off));
-    return () => cancelAnimationFrame(frame);
+    mountedRef.current = true;
+    const frame = guardUnsaved ? requestAnimationFrame(() => { snapshotRef.current = readFields(); }) : 0;
+    if (guardUnsaved) loadUnsavedReminderPref().then((off) => { if (mountedRef.current) setReminderOff(off); });
+    return () => {
+      mountedRef.current = false;
+      if (frame) cancelAnimationFrame(frame);
+      cancelAnimationFrame(frameRef.current);
+    };
   }, []);
 
   const hasUnsavedChanges = () => snapshotRef.current !== null && readFields() !== snapshotRef.current;
+
+  // Re-reads the fields after the next paint, so the footer's status follows
+  // typing, ticking boxes, adding rows, and Undo.
+  const scheduleDirtyCheck = () => {
+    if (!guardUnsaved) return;
+    cancelAnimationFrame(frameRef.current);
+    frameRef.current = requestAnimationFrame(() => { if (mountedRef.current) setIsDirty(hasUnsavedChanges()); });
+  };
+
+  // Also notice fields being added or removed (for example a new row), however
+  // that happens, so the footer's status never goes stale.
+  useEffect(() => {
+    if (!guardUnsaved || !dialogRef.current || typeof MutationObserver === "undefined") return undefined;
+    const isField = (n) => n.nodeType === 1 && ((n.matches && n.matches("input, select, textarea")) || (n.querySelector && n.querySelector("input, select, textarea")));
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.some((m) => Array.from(m.addedNodes).some(isField) || Array.from(m.removedNodes).some(isField))) scheduleDirtyCheck();
+    });
+    observer.observe(dialogRef.current, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, []);
 
   const attemptClose = () => {
     if (guardUnsaved && !reminderOff && hasUnsavedChanges()) { setReminderOpen(true); return; }
     onClose();
   };
 
-  const interceptCancel = (e) => {
-    const btn = e.target && e.target.closest ? e.target.closest("button[data-modal-cancel]") : null;
-    if (!btn || btn.closest("[data-modal-dialog]") !== dialogRef.current) return;
-    if (!reminderOff && hasUnsavedChanges()) {
-      e.preventDefault();
-      e.stopPropagation();
-      setReminderOpen(true);
-    }
+  // Follows a save until the app confirms it reached the server. If it can't
+  // be written yet the app keeps retrying in the background, so keep watching.
+  const track = (token, untilSaved) => {
+    syncBridge.waitForSaved(saveKey, { untilSaved }).then((result) => {
+      if (!mountedRef.current || token !== saveTokenRef.current) return;
+      if (result === "saved") { setPhase("saved"); setSavedAt(Date.now()); }
+      else if (result === "rejected") setPhase("rejected");
+      else { setPhase("retrying"); track(token, true); }
+    });
   };
+
+  // run() validates and hands the form to the screen's save handler; it
+  // returns false if validation stopped the save.
+  const startSave = (run) => {
+    if (run() === false) return;
+    snapshotRef.current = readFields();
+    setIsDirty(false);
+    setSavedOnce(true);
+    setPhase("saving");
+    const token = ++saveTokenRef.current;
+    track(token, false);
+  };
+
+  const shownTitle = savedOnce && typeof title === "string" ? title.replace(/^New /, "Edit ") : title;
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto overflow-x-hidden py-8 px-4" style={{ background: "rgba(28,38,36,0.45)" }}>
       <div
         ref={dialogRef}
         data-modal-dialog="1"
-        onClickCapture={guardUnsaved ? interceptCancel : undefined}
+        onInputCapture={scheduleDirtyCheck}
+        onChangeCapture={scheduleDirtyCheck}
+        onClickCapture={scheduleDirtyCheck}
         className={`bg-white rounded-xl shadow-xl w-full min-w-0 ${widthClass} my-auto`}
       >
         <div className="flex items-center justify-between px-6 py-4 border-b" style={{ borderColor: "#E1E5DE" }}>
-          <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>{title}</h2>
+          <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>{shownTitle}</h2>
           <button onClick={attemptClose} className="p-1 rounded hover:bg-stone-100">
             <X size={18} style={{ color: "#5B6B66" }} />
           </button>
         </div>
-        <div className="p-6">{children}</div>
+        <ModalContext.Provider value={{ phase, savedAt, isDirty, requestClose: attemptClose, startSave }}>
+          <div className="p-6">{children}</div>
+        </ModalContext.Provider>
       </div>
       {reminderOpen && (
         <div className="fixed inset-0 flex items-center justify-center px-4" style={{ background: "rgba(28,38,36,0.55)", zIndex: 60 }}>
@@ -1509,6 +1582,73 @@ function Modal({ title, onClose, children, wide, size, guardUnsaved }) {
   );
 }
 
+// Footer pieces for the edit screens. They read the surrounding Modal's state.
+function CloseButton() {
+  const ctx = useContext(ModalContext);
+  return (
+    <button onClick={ctx.requestClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+      Close
+    </button>
+  );
+}
+
+function SaveButton({ label, onSave }) {
+  const ctx = useContext(ModalContext);
+  if (ctx.phase === "saving") {
+    return (
+      <button disabled className="px-4 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B", opacity: 0.55, cursor: "default" }}>
+        Saving…
+      </button>
+    );
+  }
+  if (ctx.phase === "saved" && !ctx.isDirty) {
+    return (
+      <button disabled className="px-4 py-2 rounded-md text-sm border inline-flex items-center gap-1.5" style={{ borderColor: "#2F6F53", color: "#2F6F53", background: "#EAF6F1", cursor: "default" }}>
+        <CheckCircle2 size={14} /> Saved
+      </button>
+    );
+  }
+  return (
+    <button onClick={() => ctx.startSave(onSave)} className="px-4 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+      {label}
+    </button>
+  );
+}
+
+function SaveStatus() {
+  const ctx = useContext(ModalContext);
+  let icon = null;
+  let text = "";
+  let color = "#8A8F87";
+  if (ctx.phase === "saving") {
+    icon = <RefreshCw size={14} className="animate-spin" />;
+    text = "Saving…";
+    color = "#C08A2E";
+  } else if (ctx.phase === "retrying") {
+    icon = <AlertCircle size={14} />;
+    text = "Couldn't save. Retrying";
+    color = "#B5443A";
+  } else if (ctx.phase === "rejected") {
+    icon = <AlertCircle size={14} />;
+    text = "Not saved. Try again";
+    color = "#B5443A";
+  } else if (ctx.isDirty) {
+    icon = <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#C08A2E" }} />;
+    text = "Unsaved changes";
+    color = "#C08A2E";
+  } else if (ctx.phase === "saved") {
+    icon = <CheckCircle2 size={14} />;
+    text = `All changes saved${ctx.savedAt ? ` · ${new Date(ctx.savedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}`;
+    color = "#2F6F53";
+  }
+  if (!text) return null;
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs self-center mr-1" style={{ color }}>
+      {icon}{text}
+    </span>
+  );
+}
+
 function ConfirmModal({ message, onConfirm, onCancel }) {
   return (
     <Modal title="Confirm delete" onClose={onCancel}>
@@ -1528,7 +1668,7 @@ function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal guardUnsaved title={budgetGroup ? "Edit budget group" : "New budget group"} onClose={onClose}>
+    <Modal guardUnsaved saveKey="grantflow:budgetgroups" title={budgetGroup ? "Edit budget group" : "New budget group"} onClose={onClose}>
       <div className="space-y-4">
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Housing Programs, Veteran Support Services" autoFocus />
@@ -1542,14 +1682,9 @@ function BudgetGroupModal({ budgetGroup, onSave, onClose, onDelete }) {
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete</button>
         ) : <span />}
         <div className="flex gap-2">
-          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button
-            onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save
-          </button>
+          <SaveStatus />
+          <CloseButton />
+          <SaveButton label="Save" onSave={() => { if (!form.name.trim()) { notify("Name is required before saving."); return false; } onSave(form); return true; }} />
         </div>
       </div>
     </Modal>
@@ -1568,12 +1703,11 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, deleteBudg
       return exists ? prev.map((x) => (x.id === bg.id ? bg : x)) : [...prev, bg];
     });
     setForm((f) => ({ ...f, budgetGroupId: bg.id }));
-    setBgModal(null);
   };
   const currentGroup = budgetGroups?.find((bg) => bg.id === form.budgetGroupId);
 
   return (
-    <Modal guardUnsaved title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
+    <Modal guardUnsaved saveKey="grantflow:costcenters" title={costCenter ? "Edit cost center" : "New cost center"} onClose={onClose}>
       <div className="space-y-4">
         <Field label="Name">
           <input className={inputCls} style={inputStyle} value={form.name} onChange={set("name")} placeholder="e.g. Administration, Fundraising, Facilities" autoFocus />
@@ -1599,14 +1733,9 @@ function CostCenterModal({ costCenter, budgetGroups, setBudgetGroups, deleteBudg
           <button onClick={onDelete} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#B5443A" }}>Delete</button>
         ) : <span />}
         <div className="flex gap-2">
-          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button
-            onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save
-          </button>
+          <SaveStatus />
+          <CloseButton />
+          <SaveButton label="Save" onSave={() => { if (!form.name.trim()) { notify("Name is required before saving."); return false; } onSave(form); return true; }} />
         </div>
       </div>
       {bgModal && (
@@ -1644,7 +1773,6 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
       return exists ? prev.map((x) => (x.id === bg.id ? bg : x)) : [...prev, bg];
     });
     setForm((f) => ({ ...f, budgetGroupId: bg.id }));
-    setBgModal(null);
   };
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.type === "checkbox" ? e.target.checked : e.target.value });
   const toggleSite = (site) => {
@@ -1661,7 +1789,7 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
   };
 
   return (
-    <Modal guardUnsaved title={grant ? (canEdit ? "Edit grant" : "View grant") : "New grant"} onClose={onClose} wide>
+    <Modal guardUnsaved saveKey="grantflow:grants" title={grant ? (canEdit ? "Edit grant" : "View grant") : "New grant"} onClose={onClose} wide>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Grant title">
@@ -1804,15 +1932,10 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
             <Undo2 size={14} /> Undo
           </button>
         )}
-        <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+        <SaveStatus />
+          <CloseButton />
         {canEdit && (
-          <button
-            onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save grant
-          </button>
+          <SaveButton label="Save grant" onSave={() => { if (!form.title.trim()) { notify("Title is required before saving."); return false; } onSave(form); return true; }} />
         )}
       </div>
       {bgModal && canEdit && (
@@ -1942,7 +2065,7 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
   });
 
   return (
-    <Modal guardUnsaved title={budget ? "Edit budget" : "New budget"} onClose={onClose} size="xl">
+    <Modal guardUnsaved saveKey="grantflow:budgets" title={budget ? "Edit budget" : "New budget"} onClose={onClose} size="xl">
       {budget?.status === "Closed" && (
         <div className="rounded-md px-3 py-2 mb-4 flex items-start gap-2" style={{ background: "#FBEAE8", border: "1px solid #B5443A" }}>
           <AlertCircle size={15} style={{ color: "#B5443A", marginTop: 1 }} className="shrink-0" />
@@ -2438,15 +2561,10 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
             <Undo2 size={14} /> Undo
           </button>
         )}
-        <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+        <SaveStatus />
+          <CloseButton />
         {canEdit && (
-          <button
-            onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
-            className="px-4 py-2 rounded-md text-sm text-white"
-            style={{ background: "#1F5C6B" }}
-          >
-            Save budget
-          </button>
+          <SaveButton label="Save budget" onSave={() => { if (!form.title.trim()) { notify("Title is required before saving."); return false; } onSave(form); return true; }} />
         )}
       </div>
     </Modal>
@@ -2477,7 +2595,7 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
   const grant = grants.find((g) => g.id === form.grantId);
 
   return (
-    <Modal guardUnsaved title={report ? (canEdit ? "Edit report" : "View report") : "New report"} onClose={onClose} wide>
+    <Modal guardUnsaved saveKey="grantflow:reports" title={report ? (canEdit ? "Edit report" : "View report") : "New report"} onClose={onClose} wide>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="col-span-2">
@@ -2606,15 +2724,10 @@ function ReportModal({ report, grants, canEdit = true, onSave, onClose, onDelete
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <SaveStatus />
+          <CloseButton />
           {canEdit && (
-            <button
-              onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
-              className="px-4 py-2 rounded-md text-sm text-white"
-              style={{ background: "#1F5C6B" }}
-            >
-              Save report
-            </button>
+            <SaveButton label="Save report" onSave={() => { if (!form.title.trim()) { notify("Title is required before saving."); return false; } onSave(form); return true; }} />
           )}
         </div>
       </div>
@@ -2988,7 +3101,6 @@ function GrantsView({ grants, budgets, reports, tasks, invoices, staff, budgetGr
         logActivity?.("Task", "Created", `Reassign staff off closed grant: ${g.title}`);
       }
     }
-    setModal(null);
   };
 
   const deleteGrant = (id) => {
@@ -3226,7 +3338,6 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       return exists ? prev.map((x) => (x.id === cc.id ? cc : x)) : [...prev, cc];
     });
     setSelectedCostCenterId(cc.id);
-    setCcModal(null);
   };
   const deleteCostCenter = (id) => {
     const cc = costCenters.find((x) => x.id === id);
@@ -3251,7 +3362,6 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       });
       return next;
     });
-    setModal(null);
   };
   const deleteBudget = (id) => {
     const b = budgets.find((x) => x.id === id);
@@ -4059,7 +4169,6 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
       logActivity?.("Report", exists ? "Updated" : "Created", r.title || "Untitled report");
       return exists ? prev.map((x) => (x.id === r.id ? r : x)) : [...prev, r];
     });
-    setModal(null);
   };
   const createTaskFromReport = (r) => {
     const newTask = {
@@ -4191,7 +4300,7 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   return (
-    <Modal guardUnsaved title={task ? (canEdit ? "Edit task" : "View task") : "New task"} onClose={onClose}>
+    <Modal guardUnsaved saveKey="grantflow:tasks" title={task ? (canEdit ? "Edit task" : "View task") : "New task"} onClose={onClose}>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
         <Field label="Task title">
@@ -4241,15 +4350,10 @@ function TaskModal({ task, grants, canEdit = true, onSave, onClose, onDelete }) 
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <SaveStatus />
+          <CloseButton />
           {canEdit && (
-            <button
-              onClick={() => { if (!form.title.trim()) { notify("Title is required before saving."); return; } onSave(form); }}
-              className="px-4 py-2 rounded-md text-sm text-white"
-              style={{ background: "#1F5C6B" }}
-            >
-              Save task
-            </button>
+            <SaveButton label="Save task" onSave={() => { if (!form.title.trim()) { notify("Title is required before saving."); return false; } onSave(form); return true; }} />
           )}
         </div>
       </div>
@@ -4281,7 +4385,6 @@ function TasksView({ grants, tasks, setTasks, setTrash, currentUserEmail, canEdi
       logActivity?.("Task", exists ? "Updated" : "Created", t.title || "Untitled task");
       return exists ? prev.map((x) => (x.id === t.id ? t : x)) : [...prev, t];
     });
-    setModal(null);
   };
   const deleteTask = (id) => {
     const t = tasks.find((x) => x.id === id);
@@ -5934,7 +6037,7 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
   const allocatedPct = staffAllocatedTotal(form);
 
   return (
-    <Modal guardUnsaved title={staff ? (canEdit ? "Edit staff member" : "View staff member") : "New staff member"} onClose={onClose} wide>
+    <Modal guardUnsaved saveKey="grantflow:staff" title={staff ? (canEdit ? "Edit staff member" : "View staff member") : "New staff member"} onClose={onClose} wide>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Name">
@@ -6115,15 +6218,10 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <SaveStatus />
+          <CloseButton />
           {canEdit && (
-            <button
-              onClick={() => { if (!form.name.trim()) { notify("Name is required before saving."); return; } onSave(form); }}
-              className="px-4 py-2 rounded-md text-sm text-white"
-              style={{ background: "#1F5C6B" }}
-            >
-              Save staff member
-            </button>
+            <SaveButton label="Save staff member" onSave={() => { if (!form.name.trim()) { notify("Name is required before saving."); return false; } onSave(form); return true; }} />
           )}
         </div>
       </div>
@@ -6181,7 +6279,6 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
       logActivity?.("Staff", exists ? "Updated" : "Created", s.name || "Untitled staff member");
       return exists ? prev.map((x) => (x.id === s.id ? s : x)) : [...prev, s];
     });
-    setModal(null);
   };
   const deleteStaff = (id) => {
     const s = staff.find((x) => x.id === id);
@@ -7559,7 +7656,7 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
   const hasOpenDiscrepancy = verification.discrepancies.some((d) => d.status !== "resolved");
 
   return (
-    <Modal guardUnsaved title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
+    <Modal guardUnsaved saveKey="grantflow:invoices" title={invoice ? (canEdit ? "Edit invoice" : "View invoice") : "New invoice"} onClose={onClose}>
       <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
       <div className="space-y-4">
         <Field label="Grant or cost center">
@@ -7804,15 +7901,10 @@ function InvoiceModal({ invoice, grants, costCenters = [], budgets = [], current
               <Undo2 size={14} /> Undo
             </button>
           )}
-          <button data-modal-cancel="1" onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <SaveStatus />
+          <CloseButton />
           {canEdit && (
-            <button
-              onClick={() => { if (!form.grantId && !form.costCenterId) { notify("Select a grant or cost center before saving."); return; } onSave(form); }}
-              className="px-4 py-2 rounded-md text-sm text-white"
-              style={{ background: "#1F5C6B" }}
-            >
-              Save invoice
-            </button>
+            <SaveButton label="Save invoice" onSave={() => { if (!form.grantId && !form.costCenterId) { notify("Select a grant or cost center before saving."); return false; } onSave(form); return true; }} />
           )}
         </div>
       </div>
@@ -7915,7 +8007,6 @@ function InvoicingView({ grants, invoices, setInvoices, setTrash, currentUserEma
       logActivity?.("Invoice", exists ? "Updated" : "Created", inv.invoiceNumber || "Untitled invoice");
       return exists ? prev.map((x) => (x.id === inv.id ? inv : x)) : [...prev, inv];
     });
-    setModal(null);
   };
   const deleteInvoice = (id) => {
     const inv = invoices.find((x) => x.id === id);
@@ -10247,6 +10338,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const quickRetryTimerRef = useRef(null);
   const quickRetryAttemptRef = useRef(0);
   const errorKeysRef = useRef({});
+  const lastErrorRef = useRef({});
   const clearSaveError = (key) => {
     delete errorKeysRef.current[key];
     setSaveErrors((prev) => {
@@ -10281,6 +10373,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       onKeyWritten: (key) => { setLastSavedAt(Date.now()); clearSaveError(key); },
       onKeyClean: (key) => clearSaveError(key),
       onKeyError: (key, label, why) => {
+        lastErrorRef.current[key] = { why, at: Date.now() };
         if (why === "conflict") {
           notify(`${label} on the server had data this screen hadn't loaded, so your change was not saved (saving would have replaced that data). The saved data is showing now, so please redo your change.`);
           return;
@@ -10298,6 +10391,29 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     });
   }
   const queueSave = (key, value, label) => syncRef.current.queueSave(key, value, label);
+
+  // Resolves when a save made just now has been written to the server:
+  // "saved"; "retrying" if it couldn't be written yet (the engine keeps
+  // trying); or "rejected" if the engine refused it (the collection hadn't
+  // loaded, or the server held newer data). Edit screens use this to confirm
+  // a save honestly instead of just assuming it worked.
+  const waitForSaved = (key, { untilSaved = false } = {}) => new Promise((resolve) => {
+    const eng = syncRef.current;
+    const startedAt = Date.now();
+    const queuedBefore = eng.queueCount(key);
+    const giveUpAfter = untilSaved ? 5 * 60 * 1000 : 25 * 1000;
+    const check = () => {
+      const err = lastErrorRef.current[key];
+      if (err && err.at >= startedAt && (err.why === "conflict" || err.why === "unloaded")) return resolve("rejected");
+      const reachedEngine = untilSaved || eng.queueCount(key) > queuedBefore || Date.now() - startedAt > 1500;
+      if (reachedEngine && !eng.isKeyDirty(key) && !errorKeysRef.current[key]) return resolve("saved");
+      if (!untilSaved && errorKeysRef.current[key]) return resolve("retrying");
+      if (Date.now() - startedAt > giveUpAfter) return resolve("retrying");
+      setTimeout(check, 150);
+    };
+    setTimeout(check, 100);
+  });
+  syncBridge.waitForSaved = waitForSaved;
   const latestStateRef = useRef({});
   latestStateRef.current = {
     "grantflow:grants": grants, "grantflow:budgets": budgets, "grantflow:reports": reports, "grantflow:staff": staff,
