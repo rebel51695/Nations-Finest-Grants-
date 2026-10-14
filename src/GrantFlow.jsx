@@ -184,7 +184,10 @@ function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
       });
     });
 
-    if (changed) results.push({ ...target, lines: newLines });
+    // The marker follows the Template(s) even when no dollar amount changed.
+    const wantedMarker = linkedMarkerFor(target, allBudgets);
+    const markerChanged = !!wantedMarker && target.actualsThrough !== wantedMarker;
+    if (changed || markerChanged) results.push({ ...target, lines: newLines, ...(markerChanged ? { actualsThrough: wantedMarker } : {}) });
   });
 
   return results;
@@ -398,7 +401,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.5.2";
+const APP_VERSION = "1.5.3";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -441,6 +444,135 @@ function varianceInfo(plan, actual) {
   const pct = ((a - p) / Math.abs(p)) * 100;
   const sign = pct >= 0 ? "+" : "";
   return { label: `${sign}${Math.round(pct)}%`, color: pct >= 0 ? "#2F6F53" : "#B5443A" };
+}
+
+// Projection for one budget's Actual view. This is the same rule Org Budget
+// uses, applied to a single budget: the "actuals complete through" month marks
+// what is real; every month after it shows the line's average over the real
+// months, from the budget's first month through the marker (a real month with
+// nothing entered counts as $0). With no marker, nothing is projected.
+//   values       what the totals count: real months as entered, later months
+//                at the line's average
+//   projected    true for months showing the average
+//   enteredAfter true for a later month that has a number typed into it. Org
+//                Budget ignores those until the marker moves, so totals do too.
+function projectBudgetActuals(budget) {
+  const cols = monthColumnsForBudget(budget.periodStart, budget.periodEnd);
+  const cutoff = parseActualsThrough(budget.actualsThrough);
+  const lines = {};
+  (budget.lines || []).forEach((l) => {
+    const raw = cols.map((_, i) => Number((l.actuals || [])[i]) || 0);
+    if (!cutoff) {
+      lines[l.id] = { values: raw, projected: cols.map(() => false), enteredAfter: cols.map(() => false), avg: null };
+      return;
+    }
+    const within = cols.map((c) => colIsWithinCutoff(c, cutoff));
+    const realMonths = within.filter(Boolean).length;
+    const avg = realMonths ? raw.reduce((sum, v, i) => sum + (within[i] ? v : 0), 0) / realMonths : 0;
+    lines[l.id] = {
+      values: raw.map((v, i) => (within[i] ? v : avg)),
+      projected: within.map((w) => !w),
+      enteredAfter: raw.map((v, i) => !within[i] && v !== 0),
+      avg,
+    };
+  });
+  return { cutoff, cols, lines, active: !!cutoff && cols.some((c) => !colIsWithinCutoff(c, cutoff)) };
+}
+
+// Revenue / expense / net for the whole period using the projected values.
+// Balance-sheet lines (Cash, Deferred Revenue) never count toward net.
+function projectedBudgetTotals(budget, proj) {
+  let revenue = 0, expense = 0;
+  (budget.lines || []).forEach((l) => {
+    const lp = proj.lines[l.id];
+    if (!lp) return;
+    const sum = lp.values.reduce((a, b) => a + b, 0);
+    if (l.type === "revenue") revenue += sum;
+    else if (l.type === "expense") expense += sum;
+  });
+  return { revenue, expense, net: revenue - expense };
+}
+
+function linkedIdsOf(templateBudget) {
+  return templateBudget.linkedBudgetIds && templateBudget.linkedBudgetIds.length
+    ? templateBudget.linkedBudgetIds
+    : (templateBudget.linkedBudgetId ? [templateBudget.linkedBudgetId] : []);
+}
+
+// A Grant Budget's actuals are copied from the Template(s) feeding it, so its
+// "actuals complete through" month should follow theirs. If several Templates
+// feed it, the earliest marker wins (a month is only complete once every
+// feeder is). If any feeder has no marker, there is nothing to follow. A Closed
+// budget is a finalized record, so it never follows anything.
+function linkedMarkerFor(target, allBudgets) {
+  if (target.status === "Closed") return null;
+  const feeders = allBudgets.filter((b) => b.budgetType === "Template" && linkedIdsOf(b).includes(target.id));
+  if (feeders.length === 0 || feeders.some((f) => !f.actualsThrough)) return null;
+  return feeders.map((f) => f.actualsThrough).sort()[0];
+}
+
+// One-time catch-up for budgets whose marker already lags the Template that
+// feeds them.
+function alignLinkedMarkers(allBudgets) {
+  const changedIds = [];
+  const next = allBudgets.map((b) => {
+    if (b.budgetType === "Template") return b;
+    const wanted = linkedMarkerFor(b, allBudgets);
+    if (!wanted || b.actualsThrough === wanted) return b;
+    changedIds.push(b.id);
+    return { ...b, actualsThrough: wanted };
+  });
+  return { budgets: changedIds.length ? next : allBudgets, changedIds };
+}
+
+// Adds the Actual sheet to a single-budget workbook: what's recorded, with the
+// rest of the period projected the same way the budget screen shows it (italic
+// gray, counted in the totals). Skipped when the budget has no actuals at all.
+function addActualSheet(wb, budget, label, headerRowIdx, header) {
+  if (!budget.lines.some((l) => (l.actuals || []).some((v) => Number(v) !== 0))) return;
+  const HEADER_FILL = "FFF6F7F3";
+  const GREEN = "FF2F6F53";
+  const RED = "FFB5443A";
+  const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+  const monthLabels = monthColumnsForBudget(budget.periodStart, budget.periodEnd).map((c) => c.label);
+  const proj = projectBudgetActuals(budget);
+  const wsA = wb.addWorksheet(proj.active ? "Actual (with projection)" : "Actual");
+  wsA.mergeCells(1, 1, 1, monthLabels.length + 5);
+  wsA.getCell(1, 1).value = `${label} — ${budget.title}${budget.fy ? ` (${budget.fy})` : ""} · Actual`;
+  wsA.getCell(1, 1).font = { bold: true, size: 13 };
+  wsA.getRow(1).height = 22;
+  wsA.mergeCells(2, 1, 2, monthLabels.length + 5);
+  const markerText = proj.cutoff ? `Actuals complete through ${MONTHS[proj.cutoff.monthIndex]} ${proj.cutoff.year}` : "No \"Actuals complete through\" month set";
+  wsA.getCell(2, 1).value = proj.active ? `${markerText}  •  Italic gray figures are projected from each line's average through that month, not entered data. Totals include them.` : markerText;
+  wsA.getCell(2, 1).font = { italic: true, size: 9, color: { argb: "FF8A8F87" } };
+  wsA.getRow(headerRowIdx).values = header;
+  wsA.getRow(headerRowIdx).eachCell((cell) => {
+    cell.font = { bold: true };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+  });
+  let ra = headerRowIdx + 1;
+  budget.lines.forEach((l) => {
+    const lp = proj.lines[l.id];
+    wsA.getRow(ra).values = [l.category, l.subcategory || "", l.description || "", l.type, ...lp.values.map(round2), round2(lp.values.reduce((x, y) => x + y, 0))];
+    wsA.getRow(ra).eachCell((cell, colNumber) => {
+      if (colNumber >= 5) cell.numFmt = "$#,##0";
+      const monthIdx = colNumber - 5;
+      if (monthIdx >= 0 && monthIdx < lp.projected.length && lp.projected[monthIdx]) cell.font = { italic: true, color: { argb: "FF8A8F87" } };
+    });
+    ra++;
+  });
+  const pt = projectedBudgetTotals(budget, proj);
+  [["Total Revenue", pt.revenue, GREEN], ["Total Expense", pt.expense, null], ["Net", pt.net, isNetNegative(pt.net) ? RED : GREEN]].forEach(([lbl, val, color]) => {
+    wsA.getRow(ra).values = [lbl, "", "", "", ...Array(monthLabels.length).fill(""), round2(val)];
+    wsA.getRow(ra).eachCell((cell, colNumber) => {
+      cell.font = { bold: true, color: color ? { argb: color } : undefined };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEADER_FILL } };
+      if (colNumber === monthLabels.length + 5) cell.numFmt = "$#,##0";
+    });
+    ra++;
+  });
+  wsA.columns = [{ width: 26 }, { width: 28 }, { width: 20 }, { width: 10 }, ...monthLabels.map(() => ({ width: 12 })), { width: 14 }];
+  wsA.views = [{ state: "frozen", xSplit: 2, ySplit: headerRowIdx }];
 }
 
 function resizeMonthlyArray(arr, newLength) {
@@ -1958,8 +2090,11 @@ function GrantModal({ grant, budgetGroups, setBudgetGroups, deleteBudgetGroup, l
 // ---------- budget form ----------
 
 function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, onClose, currentUserEmail, grants = [], budgets = [], costCenters = [] }) {
+  // A Grant Budget's "actuals complete through" month follows the Template(s)
+  // feeding it, so open it already showing that month.
+  const feederMarker = budget ? linkedMarkerFor(budget, budgets) : null;
   const initial = budget
-    ? { ...budget, linkedBudgetIds: budget.linkedBudgetIds || (budget.linkedBudgetId ? [budget.linkedBudgetId] : []) }
+    ? { ...budget, linkedBudgetIds: budget.linkedBudgetIds || (budget.linkedBudgetId ? [budget.linkedBudgetId] : []), ...(feederMarker ? { actualsThrough: feederMarker } : {}) }
     : {
       id: uid(), grantId, costCenterId, title: "", fy: "", periodStart: "", periodEnd: "",
       status: "Draft", notes: "", lines: [newLine()], budgetType: "", linkedBudgetIds: [],
@@ -2056,6 +2191,13 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
 
   const totals = budgetTotals(form);
   const actualTotals = budgetActualTotals(form);
+  // Months after "Actuals complete through" show each line's average so far
+  // (see projectBudgetActuals). Only in the Actual view, and only once a marker
+  // is set and there is something left to project.
+  const proj = useMemo(() => projectBudgetActuals(form), [form.lines, form.actualsThrough, form.periodStart, form.periodEnd]);
+  const showProj = mode === "actual" && proj.active;
+  const projTotals = showProj ? projectedBudgetTotals(form, proj) : null;
+  const anyEnteredAfter = showProj && Object.values(proj.lines).some((lp) => lp.enteredAfter.some(Boolean));
   const sortedLines = [...form.lines].sort((a, b) => {
     if (lineSort === "category") return a.category.localeCompare(b.category);
     if (lineSort === "subcategory") return (a.subcategory || "").localeCompare(b.subcategory || "");
@@ -2275,18 +2417,24 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                 className={inputCls}
                 style={{ ...inputStyle, width: "auto", padding: "4px 8px", fontSize: 12 }}
                 value={form.actualsThrough || ""}
+                disabled={!!feederMarker}
+                title={feederMarker ? "This budget gets its actuals from a Template, so this follows the Template's month. Change it on the Template." : undefined}
                 onChange={(e) => setForm({ ...form, actualsThrough: e.target.value || "" })}
               >
                 <option value="">Not marked</option>
-                {cols
-                  .filter((c) => {
-                    const now = new Date();
-                    return c.year < now.getFullYear() || (c.year === now.getFullYear() && c.monthIndex <= now.getMonth());
-                  })
-                  .map((c, i) => (
-                    <option key={i} value={`${c.year}-${String(c.monthIndex + 1).padStart(2, "0")}`}>{c.label}</option>
-                  ))}
+                {(() => {
+                  const options = cols
+                    .filter((c) => {
+                      const now = new Date();
+                      return c.year < now.getFullYear() || (c.year === now.getFullYear() && c.monthIndex <= now.getMonth());
+                    })
+                    .map((c) => ({ value: `${c.year}-${String(c.monthIndex + 1).padStart(2, "0")}`, label: c.label }));
+                  // keep a marker that falls outside the usual list selectable, so it never shows as blank
+                  if (form.actualsThrough && !options.some((o) => o.value === form.actualsThrough)) options.push({ value: form.actualsThrough, label: form.actualsThrough });
+                  return options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>);
+                })()}
               </select>
+              {feederMarker && <span style={{ color: "#8A8F87" }}>· follows its Template</span>}
             </label>
           )}
           <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
@@ -2458,21 +2606,34 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                     </div>
                   </td>
                   {values.map((amt, idx) => {
-                    const v = mode === "actual" ? varianceInfo(line.amounts?.[idx], line.actuals?.[idx]) : null;
+                    const lp = showProj ? proj.lines[line.id] : null;
+                    const isProj = !!(lp && lp.projected[idx]);
+                    const typedAfter = !!(lp && lp.enteredAfter[idx]);
+                    const showAsProjection = isProj && !typedAfter;
+                    const counted = lp ? lp.values[idx] : amt; // what the totals count for this month
+                    const v = mode === "actual" ? varianceInfo(line.amounts?.[idx], counted) : null;
                     return (
                       <Fragment key={idx}>
                         <td className="px-1 py-1.5">
                           <input
                             type="number"
                             value={amt === 0 ? "" : amt}
-                            placeholder="0"
+                            placeholder={showAsProjection ? Math.round(counted).toLocaleString("en-US") : "0"}
+                            title={showAsProjection
+                              ? "Projected from this line's average through the \"Actuals complete through\" month — not entered data. Type a number to record an actual."
+                              : typedAfter ? "Entered after the \"Actuals complete through\" month, so it isn't counted yet. Move that month forward to count it." : undefined}
                             onChange={(e) => updateAmount(line.id, idx, e.target.value, field)}
                             className="w-full rounded border px-1.5 py-1 text-xs text-right"
-                            style={{ ...inputStyle, fontVariantNumeric: "tabular-nums" }}
+                            style={{
+                              ...inputStyle,
+                              fontVariantNumeric: "tabular-nums",
+                              ...(showAsProjection ? { fontStyle: "italic", color: "#8A8F87" } : {}),
+                              ...(typedAfter ? { borderColor: "#C08A2E", background: "#FBF3E4" } : {}),
+                            }}
                           />
                         </td>
                         {mode === "actual" && (
-                          <td className="px-2 py-1.5 text-right text-xs" style={{ fontVariantNumeric: "tabular-nums", color: v.color }}>
+                          <td className="px-2 py-1.5 text-right text-xs" style={{ fontVariantNumeric: "tabular-nums", color: isProj ? "#8A8F87" : v.color, fontStyle: isProj ? "italic" : "normal" }}>
                             {v.label}
                           </td>
                         )}
@@ -2480,10 +2641,10 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                     );
                   })}
                   <td className="px-2 py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: line.type === "revenue" ? "#2F6F53" : "#1C2624" }}>
-                    {fmt(mode === "plan" ? lineTotal(line) : lineActualTotal(line))}
+                    {fmt(mode === "plan" ? lineTotal(line) : (showProj ? proj.lines[line.id].values.reduce((a, b) => a + b, 0) : lineActualTotal(line)))}
                   </td>
                   {mode === "actual" && (() => {
-                    const overall = varianceInfo(lineTotal(line), lineActualTotal(line));
+                    const overall = varianceInfo(lineTotal(line), showProj ? proj.lines[line.id].values.reduce((a, b) => a + b, 0) : lineActualTotal(line));
                     return (
                       <td className="px-2 py-1.5 text-right text-xs font-medium" style={{ fontVariantNumeric: "tabular-nums", color: overall.color }}>
                         {overall.label}
@@ -2506,14 +2667,15 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                 <td className="px-2 py-1.5" style={{ background: "#F6F7F3" }}></td>
                 {cols.map((_, i) => {
                   const net = form.lines.reduce((sum, l) => {
-                    const v = Number((l[field] || [])[i]) || 0;
+                    const v = showProj ? (proj.lines[l.id]?.values[i] ?? 0) : (Number((l[field] || [])[i]) || 0);
                     if (l.type === "revenue") return sum + v;
                     if (l.type === "expense") return sum - v;
                     return sum; // balance-sheet-type lines aren't income statement activity
                   }, 0);
+                  const monthIsProjected = showProj && !colIsWithinCutoff(cols[i], proj.cutoff);
                   return (
                     <Fragment key={i}>
-                      <td className="px-2 py-1.5 text-right text-xs font-medium" style={{ fontVariantNumeric: "tabular-nums", color: net >= 0 ? "#2F6F53" : "#B5443A", background: "#F6F7F3" }}>
+                      <td className="px-2 py-1.5 text-right text-xs font-medium" style={{ fontVariantNumeric: "tabular-nums", color: monthIsProjected ? "#8A8F87" : (net >= 0 ? "#2F6F53" : "#B5443A"), fontStyle: monthIsProjected ? "italic" : "normal", background: "#F6F7F3" }}>
                         {fmt(net)}
                       </td>
                       {mode === "actual" && <td style={{ background: "#F6F7F3" }}></td>}
@@ -2529,7 +2691,19 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
         </table>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 mt-4 text-sm">
+      {showProj && (
+        <p className="text-xs mt-2" style={{ color: "#8A8F87" }}>
+          <span style={{ fontStyle: "italic" }}>Italic, muted figures</span> are projected from each line's average through the "Actuals complete through" month, not entered data. Totals include them.
+          {anyEnteredAfter && " Highlighted cells hold numbers entered after that month; they aren't counted until you move it forward."}
+        </p>
+      )}
+      {mode === "actual" && !form.actualsThrough && (
+        <p className="text-xs mt-2" style={{ color: "#8A8F87" }}>
+          Set "Actuals complete through" to project the rest of this budget's period from your actuals.
+        </p>
+      )}
+
+      <div className={`grid grid-cols-1 ${showProj ? "sm:grid-cols-4" : "sm:grid-cols-3"} gap-6 mt-4 text-sm`}>
         <div>
           <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>Plan</div>
           <div><span style={{ color: "#5B6B66" }}>Revenue: </span><span className="font-medium" style={{ color: "#2F6F53" }}>{fmt(totals.revenue)}</span></div>
@@ -2537,11 +2711,19 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
           <div><span style={{ color: "#5B6B66" }}>Net: </span><span className="font-medium" style={{ color: !isNetNegative(totals.net) ? "#2F6F53" : "#B5443A" }}>{fmt(totals.net)}</span></div>
         </div>
         <div>
-          <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>Actual</div>
+          <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>{showProj ? "Actual so far" : "Actual"}</div>
           <div><span style={{ color: "#5B6B66" }}>Revenue: </span><span className="font-medium" style={{ color: "#2F6F53" }}>{fmt(actualTotals.revenue)}</span></div>
           <div><span style={{ color: "#5B6B66" }}>Expense: </span><span className="font-medium" style={{ color: "#1C2624" }}>{fmt(actualTotals.expense)}</span></div>
           <div><span style={{ color: "#5B6B66" }}>Net: </span><span className="font-medium" style={{ color: !isNetNegative(actualTotals.net) ? "#2F6F53" : "#B5443A" }}>{fmt(actualTotals.net)}</span></div>
         </div>
+        {showProj && (
+          <div style={{ fontStyle: "italic" }}>
+            <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87", fontStyle: "normal" }}>Projected for the full period</div>
+            <div><span style={{ color: "#8A8F87" }}>Revenue: </span><span className="font-medium" style={{ color: "#8A8F87" }}>{fmt(projTotals.revenue)}</span></div>
+            <div><span style={{ color: "#8A8F87" }}>Expense: </span><span className="font-medium" style={{ color: "#8A8F87" }}>{fmt(projTotals.expense)}</span></div>
+            <div><span style={{ color: "#8A8F87" }}>Net: </span><span className="font-medium" style={{ color: "#8A8F87" }}>{fmt(projTotals.net)}</span></div>
+          </div>
+        )}
         <div>
           <div className="text-xs font-medium mb-1" style={{ color: "#8A8F87" }}>Variance (Actual − Plan)</div>
           <div><span style={{ color: "#5B6B66" }}>Revenue: </span><span className="font-medium" style={{ color: "#1C2624" }}>{fmt(actualTotals.revenue - totals.revenue)}</span></div>
@@ -3460,6 +3642,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
 
     ws.columns = [{ width: 26 }, { width: 28 }, { width: 20 }, { width: 10 }, ...monthLabels.map(() => ({ width: 12 })), { width: 14 }];
     ws.views = [{ state: "frozen", xSplit: 2, ySplit: headerRowIdx }];
+
+    addActualSheet(wb, budget, label, headerRowIdx, header);
 
     const safe = (s) => (s || "budget").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
     const buffer = await wb.xlsx.writeBuffer();
@@ -10645,6 +10829,20 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       logActivity?.("Staff", "Updated", "Set status to Active for all existing staff members (one-time update)");
     }
   }, [loaded]);
+
+  // One-time catch-up: a Grant Budget's "actuals complete through" month follows
+  // the Template feeding it, so bring any that already lag up to date. Waits
+  // until budgets have actually loaded so it never runs against an empty list.
+  const markersAlignedRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || !canEdit || markersAlignedRef.current || notLoaded.includes("Budgets")) return;
+    markersAlignedRef.current = true;
+    const { budgets: aligned, changedIds } = alignLinkedMarkers(budgets);
+    if (changedIds.length) {
+      setBudgets(aligned);
+      logActivity?.("Budget", "Updated", `Aligned "actuals complete through" on ${changedIds.length} Grant Budget${changedIds.length === 1 ? "" : "s"} with the Template feeding ${changedIds.length === 1 ? "it" : "them"} (one-time update)`);
+    }
+  }, [loaded, canEdit, notLoaded]);
 
   const autoBackupRef = useRef(false);
   useEffect(() => {
