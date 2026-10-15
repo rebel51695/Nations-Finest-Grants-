@@ -524,7 +524,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.0.1";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -7582,6 +7582,7 @@ function BudgetPublishModal({ model, rollup, grants, costCenters, budgets, budge
   const [overwrite, setOverwrite] = useState(false);
   const [anyway, setAnyway] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const plan = useMemo(() => planToolPublish({ model, rollup, budgets, grants, costCenters, budgetGroups, opts: { createCostCenters: createCC, overwriteEdited: overwrite, publishAnyway: anyway } }), [model, rollup, budgets, grants, costCenters, budgetGroups, createCC, overwrite, anyway]);
   const drafts = toolPublishedDrafts(model, budgets);
   const doing = plan.counts.create + plan.counts.update;
@@ -7596,6 +7597,11 @@ function BudgetPublishModal({ model, rollup, grants, costCenters, budgets, budge
   const hasDupes = plan.items.some((i) => i.dupeId);
   const hasEdited = plan.items.some((i) => i.edited);
 
+  const askPublish = () => {
+    if (!isAdmin) { notify("Only admins can publish."); return; }
+    if (doing === 0) return;
+    setConfirming(true);
+  };
   const publish = () => {
     if (!isAdmin) { notify("Only admins can publish."); return; }
     const stamp = new Date().toISOString();
@@ -7625,9 +7631,9 @@ function BudgetPublishModal({ model, rollup, grants, costCenters, budgets, budge
         {!isAdmin && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBF3E4", borderColor: "#E9D5A8", color: "#6B4700" }}>Only admins can publish. You can look at what would happen.</div>}
 
         <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm" style={{ color: "#1C2624" }}>
-          <label className="flex items-center gap-2"><input type="checkbox" aria-label="Create cost centers for units with no owner" checked={createCC} onChange={(e) => setCreateCC(e.target.checked)} /> Create a cost center for units GrantFlow doesn't have, so their drafts aren't "Unknown owner"</label>
-          {hasDupes && <label className="flex items-center gap-2"><input type="checkbox" aria-label="Publish where a Template for that year already exists" checked={anyway} onChange={(e) => setAnyway(e.target.checked)} /> Also publish where the owner already has a {model.fy} Template (adds a second one)</label>}
-          {hasEdited && <label className="flex items-center gap-2"><input type="checkbox" aria-label="Overwrite drafts edited by hand" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} /> Overwrite drafts that were edited by hand</label>}
+          <label className="flex items-center gap-2"><input type="checkbox" aria-label="Create cost centers for units with no owner" disabled={confirming} checked={createCC} onChange={(e) => setCreateCC(e.target.checked)} /> Create a cost center for units GrantFlow doesn't have, so their drafts aren't "Unknown owner"</label>
+          {hasDupes && <label className="flex items-center gap-2"><input type="checkbox" aria-label="Publish where a Template for that year already exists" disabled={confirming} checked={anyway} onChange={(e) => setAnyway(e.target.checked)} /> Also publish where the owner already has a {model.fy} Template (adds a second one)</label>}
+          {hasEdited && <label className="flex items-center gap-2"><input type="checkbox" aria-label="Overwrite drafts edited by hand" disabled={confirming} checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} /> Overwrite drafts that were edited by hand</label>}
         </div>
 
         <div className="text-sm" style={{ color: "#1C2624" }}>
@@ -7656,9 +7662,23 @@ function BudgetPublishModal({ model, rollup, grants, costCenters, budgets, budge
           </table>
         </div>
 
+        {confirming && (
+          <div role="alertdialog" aria-label="Confirm publish" className="rounded-lg border p-4" style={{ background: "#FBEAE8", borderColor: "#E8B9B4" }}>
+            <div className="font-medium" style={{ color: "#7A2A24" }}>Are you sure you're ready to publish?</div>
+            <p className="text-sm mt-1" style={{ color: "#7A2A24" }}>
+              <b>This can't be undone.</b> It will create {plan.counts.create} new draft Template{plan.counts.create === 1 ? "" : "s"}{plan.counts.update ? ` and replace what is in ${plan.counts.update} existing draft${plan.counts.update === 1 ? "" : "s"}` : ""}{plan.newCostCenters.length ? `, and add ${plan.newCostCenters.length} cost center${plan.newCostCenters.length === 1 ? "" : "s"}` : ""}.
+              New drafts can be deleted afterwards, but updated drafts can't be put back the way they were, and new cost centers stay.
+            </p>
+            <div className="flex justify-end gap-2 mt-3">
+              <button onClick={() => setConfirming(false)} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", background: "#FFFFFF" }}>Go back</button>
+              <button onClick={publish} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#B5443A" }}>Yes, publish {doing} draft{doing === 1 ? "" : "s"}</button>
+            </div>
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            {drafts.length > 0 && !confirmRemove && <button onClick={() => setConfirmRemove(true)} disabled={!isAdmin} className="text-sm px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A", opacity: isAdmin ? 1 : 0.5 }}>Remove the {drafts.length} published draft{drafts.length === 1 ? "" : "s"}…</button>}
+            {drafts.length > 0 && !confirmRemove && !confirming && <button onClick={() => setConfirmRemove(true)} disabled={!isAdmin} className="text-sm px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A", opacity: isAdmin ? 1 : 0.5 }}>Remove the {drafts.length} published draft{drafts.length === 1 ? "" : "s"}…</button>}
             {confirmRemove && (
               <span className="text-sm" style={{ color: "#B5443A" }}>Remove {drafts.length} draft Template{drafts.length === 1 ? "" : "s"} (still in Draft)? They go to Trash.{" "}
                 <button onClick={removeDrafts} className="px-2 py-1 rounded-md border mx-1" style={{ borderColor: "#B5443A" }}>Remove them</button>
@@ -7668,7 +7688,7 @@ function BudgetPublishModal({ model, rollup, grants, costCenters, budgets, budge
           </div>
           <div className="flex gap-2">
             <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-            <button onClick={publish} disabled={!isAdmin || doing === 0} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#2F6F53", opacity: !isAdmin || doing === 0 ? 0.5 : 1 }}>{doing === 0 ? "Nothing to publish" : `Publish ${doing} draft${doing === 1 ? "" : "s"}`}</button>
+            <button onClick={askPublish} disabled={!isAdmin || doing === 0 || confirming} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#2F6F53", opacity: !isAdmin || doing === 0 ? 0.5 : 1 }}>{doing === 0 ? "Nothing to publish" : `Publish ${doing} draft${doing === 1 ? "" : "s"}`}</button>
           </div>
         </div>
       </div>
