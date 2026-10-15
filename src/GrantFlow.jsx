@@ -524,7 +524,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.8.0";
+const APP_VERSION = "1.9.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -5543,6 +5543,164 @@ function toolPersonnelCheck(model, staff, map) {
 }
 
 // ===========================================================================
+// Revenue methods and the indirect spread for the Budget tool: instead of last
+// year's revenue plus a percentage, revenue follows how each program is paid.
+// Plain calculation, no screens.
+// ===========================================================================
+//   runrate    last year's figures with the percentages (the default)
+//   cost       cost reimbursement: revenue is the unit's direct expenses (plus an
+//              optional markup), months limited by fromMonth / throughMonth
+//   perdiem    beds x days x occupancy x daily rate (a new rate can start in a month)
+//   schedule   an amount for each month
+// For every method an indirect billing rate adds "Indirect Billing" revenue as a
+// percentage of the program revenue.
+
+function toolDaysInMonths(fy) {
+  return Array.from({ length: 12 }, (_, m) => new Date(Date.UTC(fy, m + 1, 0)).getUTCDate());
+}
+
+function toolRevenueParams(unit, model) {
+  const p = ((model.revenue || {}).units || {})[unit.id];
+  return p && p.method && p.method !== "runrate" ? p : null;
+}
+
+const TOOL_REV_METHODS = { runrate: "From last year", cost: "Cost reimbursement", perdiem: "Per diem", schedule: "Monthly schedule" };
+
+// What a unit's revenue is, month by month, under its method.
+//   direct  the unit's direct expenses by month (only the cost method looks at it)
+function toolRevenueArrays(p, direct, fy) {
+  const zeros = () => Array(12).fill(0);
+  let r4100 = zeros();
+  if (p.method === "cost") {
+    const from = typeof p.fromMonth === "number" ? p.fromMonth : 0;
+    const through = typeof p.throughMonth === "number" ? p.throughMonth : 11;
+    const markup = 1 + (Number(p.markupPct) || 0) / 100;
+    r4100 = direct.map((d, m) => (m >= from && m <= through ? d * markup : 0));
+  } else if (p.method === "perdiem") {
+    const days = typeof p.daysPerMonth === "number" ? Array(12).fill(p.daysPerMonth) : toolDaysInMonths(fy);
+    const occ = Array.isArray(p.occupancy) ? p.occupancy : Array(12).fill(Number(p.occupancy) || 0);
+    const beds = Number(p.beds) || 0;
+    r4100 = days.map((d, m) => {
+      const rate = typeof p.rate2 === "number" && typeof p.rate2Month === "number" && m >= p.rate2Month ? p.rate2 : Number(p.rate) || 0;
+      return beds * d * ((Number(occ[m]) || 0) / 100) * rate;
+    });
+  } else if (p.method === "schedule") {
+    r4100 = zeros().map((_, m) => Number((p.amounts || [])[m]) || 0);
+  }
+  const ind = (Number(p.indirectRate) || 0) / 100;
+  return { r4100: r4100.map(toolRound2), r4101: r4100.map((v) => toolRound2(v * ind)) };
+}
+
+// Direct expenses by month: everything except the indirect allocation (6990),
+// depreciation when asked, and in-kind (which has its own matching revenue).
+function toolDirectExpense(lines, excludeDepreciation) {
+  const out = Array(12).fill(0);
+  lines.forEach((l) => {
+    if (l.type !== "expense" || l.category === "In-Kind Expenses") return;
+    if (/^6990\b/.test(l.subcategory)) return;
+    if (excludeDepreciation && /^6700\b/.test(l.subcategory)) return;
+    l.model.forEach((v, i) => { out[i] += v; });
+  });
+  return out;
+}
+
+// Sets a line's next-year figures, unless an exact yearly figure was typed in for it.
+function toolPutLine(model, unit, lines, category, subcategory, type, arr, flag) {
+  const key = `${category}|||${subcategory}`;
+  const own = ((model.adjustments || {}).lines || {})[`${unit.id}|${key}`] || {};
+  if (typeof own.annual === "number" && !isNaN(own.annual)) return;
+  const line = lines.find((l) => l.key === key);
+  if (line) { line.model = arr.map(toolRound2); line.pct = 0; line[flag] = true; }
+  else lines.push({ key, category, subcategory, type, base: Array(12).fill(0), real: Array(12).fill(false), pct: 0, override: null, model: arr.map(toolRound2), manual: false, [flag]: true });
+}
+
+const TOOL_REV_4100 = ["Grants and Contracts", "4100 - Grants and Contracts"];
+const TOOL_REV_4101 = ["Grants and Contracts Indirect Billing", "4101 - Grants and Contracts Indirect Billing"];
+
+// Replaces a unit's program revenue lines when it has a method other than "from last year".
+function toolApplyRevenue(model, b) {
+  const p = toolRevenueParams(b.unit, model);
+  if (!p) return null;
+  const direct = p.method === "cost" ? toolDirectExpense(b.lines, p.excludeDepreciation) : null;
+  const a = toolRevenueArrays(p, direct, model.fy);
+  toolPutLine(model, b.unit, b.lines, TOOL_REV_4100[0], TOOL_REV_4100[1], "revenue", a.r4100, "fromMethod");
+  if ((Number(p.indirectRate) || 0) > 0 || b.lines.some((l) => l.key === `${TOOL_REV_4101[0]}|||${TOOL_REV_4101[1]}`)) toolPutLine(model, b.unit, b.lines, TOOL_REV_4101[0], TOOL_REV_4101[1], "revenue", a.r4101, "fromMethod");
+  return { method: p.method, total4100: toolRound2(a.r4100.reduce((x, y) => x + y, 0)), total4101: toolRound2(a.r4101.reduce((x, y) => x + y, 0)) };
+}
+
+// ---- Indirect spread ----
+function toolIndirectConfig(model) {
+  const ind = model.indirect || {};
+  const pool = ind.poolUnitId || (((model.units || []).find((u) => /indirect allowable/i.test(u.name))) || {}).id || "";
+  return { enabled: ind.enabled === true, poolUnitId: pool, units: ind.units || {} };
+}
+// Corporate and fundraising-side units don't receive the spread, except fundraising itself.
+function toolIndirectDefaultReceives(unit) {
+  return unit.group !== "General admin and fundraising" || /^general - fundraising$/i.test(unit.name);
+}
+function toolIndirectReceives(unit, cfg) {
+  const u = cfg.units[unit.id];
+  return u && typeof u.receives === "boolean" ? u.receives : toolIndirectDefaultReceives(unit);
+}
+// A unit's share of the pool follows its staff: full-time equivalents from the Personnel
+// rows, or a figure you typed in.
+function toolUnitFte(b, cfg) {
+  const u = cfg.units[b.unit.id];
+  if (u && typeof u.fte === "number" && !isNaN(u.fte)) return { fte: u.fte, typed: true };
+  if (!b.pers) return { fte: 0, typed: false };
+  return { fte: b.pers.rows.filter((r) => !r.excluded).reduce((t, r) => t + r.fte * r.share, 0), typed: false };
+}
+
+// The corporate pool is the pool unit's expenses (without its own indirect line);
+// each month it is divided between the receiving units by their FTE, and the
+// result becomes each unit's 6990 expense. Rounding is settled so the pieces add
+// up to the pool exactly.
+function toolApplyIndirect(model, built) {
+  const cfg = toolIndirectConfig(model);
+  if (!cfg.enabled) return null;
+  const warnings = [];
+  const poolRow = built.find((b) => b.unit.id === cfg.poolUnitId);
+  const pool = Array(12).fill(0);
+  if (!poolRow) warnings.push("The unit that holds the corporate costs isn't rolling forward, so there is nothing to spread.");
+  else toolDirectExpense(poolRow.lines, false).forEach((v, i) => { pool[i] = toolRound2(v); });
+  // A corporate unit's FY26 run-rate is net of what was charged out to programs, so it can look
+  // far too small next to what its people cost.
+  if (poolRow && poolRow.pers && !poolRow.persOn) {
+    const poolPeople = (poolRow.pers.wages || []).reduce((x, y) => x + y, 0) + (poolRow.pers.benefits || []).reduce((x, y) => x + y, 0);
+    const poolNow = pool.reduce((x, y) => x + y, 0);
+    if (poolPeople > 0 && poolNow < poolPeople * 0.5) warnings.push(`The corporate unit's costs ($${Math.round(poolNow).toLocaleString("en-US")}) look low next to what its people cost ($${Math.round(poolPeople).toLocaleString("en-US")}). Its FY26 run-rate is usually net of what was charged out, so turn Personnel on for it.`);
+  }
+  const rec = built.filter((b) => b.unit.id !== cfg.poolUnitId && toolIndirectReceives(b.unit, cfg)).map((b) => ({ b, ...toolUnitFte(b, cfg) }));
+  const totalFte = rec.reduce((t, r) => t + r.fte, 0);
+  const out = rec.map((r) => ({ unitId: r.b.unit.id, name: r.b.unit.name, fte: toolRound2(r.fte), share: totalFte > 0 ? r.fte / totalFte : 0, months: Array(12).fill(0), amount: 0 }));
+  if (poolRow && totalFte <= 0) warnings.push("No full-time equivalents are known for the receiving units. Allocate people to them in Personnel, or type each unit's FTE.");
+  if (totalFte > 0) {
+    const lastIdx = (() => { for (let i = out.length - 1; i >= 0; i--) if (out[i].fte > 0) return i; return -1; })();
+    for (let m = 0; m < 12; m++) {
+      let given = 0;
+      out.forEach((o, i) => { if (i === lastIdx) return; o.months[m] = toolRound2(pool[m] * o.share); given += o.months[m]; });
+      if (lastIdx >= 0) out[lastIdx].months[m] = toolRound2(pool[m] - given);
+    }
+    out.forEach((o, i) => { o.amount = toolRound2(o.months.reduce((x, y) => x + y, 0)); toolPutLine(model, rec[i].b.unit, rec[i].b.lines, "Operations", "6990 - Indirect", "expense", o.months, "fromIndirect"); });
+  }
+  const poolTotal = toolRound2(pool.reduce((x, y) => x + y, 0));
+  return { enabled: true, poolUnitId: cfg.poolUnitId, pool, poolTotal, totalFte: toolRound2(totalFte), recipients: out, warnings };
+}
+
+// A plain-words description of a unit's revenue method, for screens and the Excel file.
+function toolRevenueDescription(p) {
+  if (!p || p.method === "runrate") return "From last year";
+  const ind = Number(p.indirectRate) > 0 ? `, indirect billing ${p.indirectRate}%` : "";
+  if (p.method === "cost") return `Cost reimbursement${Number(p.markupPct) ? ` +${p.markupPct}%` : ""}${p.excludeDepreciation ? ", without depreciation" : ""}${ind}`;
+  if (p.method === "perdiem") {
+    const occ = Array.isArray(p.occupancy) ? p.occupancy : Array(12).fill(Number(p.occupancy) || 0);
+    const avg = occ.reduce((x, y) => x + (Number(y) || 0), 0) / 12;
+    return `Per diem: ${p.beds || 0} beds, ${avg.toFixed(0)}% average occupancy, $${Number(p.rate || 0).toFixed(2)} a day${typeof p.rate2 === "number" ? ` ($${p.rate2.toFixed(2)} from ${MONTHS[p.rate2Month || 0]})` : ""}${ind}`;
+  }
+  return `Monthly schedule${ind}`;
+}
+
+// ===========================================================================
 // Budget tool: next year's budget, built from this year's. Replaces Scenarios.
 // Everything in this block is plain calculation (no screens), so it can be
 // tested on its own against real data.
@@ -5558,13 +5716,13 @@ function toolPersonnelCheck(model, staff, map) {
 //   baseline: "import"          GrantFlow only holds the combined figures (SSVF's
 //                               states), so the baseline comes from Sage exports
 const BUDGET_TOOL_SEED = [
-  { group: "1840 SSFG", name: "1840 SSFG", code: "1840", grantCode: "1840" },
+  { group: "1840 SSFG", name: "1840 SSFG", code: "1840", grantCode: "1840", revenue: {method: "cost", indirectRate: 17} },
 
-  { group: "SSVF", name: "1700 SSVF CA", code: "1700", grantCode: "1790", baseline: "import" },
-  { group: "SSVF", name: "1760 SSVF NV", code: "1760", grantCode: "1790", baseline: "import" },
-  { group: "SSVF", name: "1790 SSVF AZ", code: "1790", grantCode: "1790", baseline: "import" },
-  { group: "SSVF", name: "1710 SSVF CA LT", code: "1710", grantCode: "1710" },
-  { group: "SSVF", name: "1715 SSVF NV LT", code: "1715", grantCode: "1715" },
+  { group: "SSVF", name: "1700 SSVF CA", code: "1700", grantCode: "1790", baseline: "import", revenue: {method: "cost", indirectRate: 11, excludeDepreciation: true} },
+  { group: "SSVF", name: "1760 SSVF NV", code: "1760", grantCode: "1790", baseline: "import", revenue: {method: "cost", indirectRate: 11, excludeDepreciation: true} },
+  { group: "SSVF", name: "1790 SSVF AZ", code: "1790", grantCode: "1790", baseline: "import", revenue: {method: "cost", indirectRate: 11, excludeDepreciation: true} },
+  { group: "SSVF", name: "1710 SSVF CA LT", code: "1710", grantCode: "1710", revenue: {method: "cost", indirectRate: 11, excludeDepreciation: true} },
+  { group: "SSVF", name: "1715 SSVF NV LT", code: "1715", grantCode: "1715", revenue: {method: "cost", indirectRate: 11, excludeDepreciation: true} },
 
   { group: "SSVF support", name: "Site donations - CA" },
   { group: "SSVF support", name: "Site donations - AZ" },
@@ -5574,37 +5732,37 @@ const BUDGET_TOOL_SEED = [
   { group: "SSVF support", name: "Site donations - Eureka" },
   { group: "SSVF support", name: "Site donations - Redding" },
 
-  { group: "GPD", name: "GPD NorCal - Mather", code: "1540", grantCode: "1540", templateRe: "mather" },
-  { group: "GPD", name: "GPD NorCal - Sacramento", code: "1540", grantCode: "1540", templateRe: "sac" },
-  { group: "GPD", name: "GPD SF - Eureka", code: "1530", grantCode: "1530" },
+  { group: "GPD", name: "GPD NorCal - Mather", code: "1540", grantCode: "1540", templateRe: "mather", revenue: {method: "perdiem", beds: 46, occupancy: [75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0], rate: 82.73} },
+  { group: "GPD", name: "GPD NorCal - Sacramento", code: "1540", grantCode: "1540", templateRe: "sac", revenue: {method: "perdiem", beds: 42, occupancy: [60, 65, 65, 70, 70, 70, 75, 75, 75, 75, 75, 75], rate: 82.73} },
+  { group: "GPD", name: "GPD SF - Eureka", code: "1530", grantCode: "1530", revenue: {method: "perdiem", beds: 18, occupancy: [60.0, 60.0, 60.0, 70.0, 70.0, 70.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0], rate: 82.73} },
 
-  { group: "HCHV", name: "HCHV Hearn House", code: "1521", grantCode: "1521" },
-  { group: "HCHV", name: "HCHV Eureka", code: "1532", grantCode: "1532" },
+  { group: "HCHV", name: "HCHV Hearn House", code: "1521", grantCode: "1521", revenue: {method: "perdiem", beds: 17, occupancy: [85.0, 85.0, 85.0, 85.0, 85.0, 85.0, 85.0, 85.0, 85.0, 85.0, 85.0, 85.0], rate: 146.76, rate2: 151.9, rate2Month: 1} },
+  { group: "HCHV", name: "HCHV Eureka", code: "1532", grantCode: "1532", revenue: {method: "perdiem", beds: 11, occupancy: [65.0, 65.0, 65.0, 70.0, 70.0, 70.0, 75.0, 75.0, 75.0, 75.0, 75.0, 75.0], rate: 134.97} },
   { group: "HCHV", name: "HCHV Sacramento", code: "1543", grantCode: "1543" },
-  { group: "HCHV", name: "HCHV Reno", code: "1560", grantCode: "1560" },
+  { group: "HCHV", name: "HCHV Reno", code: "1560", grantCode: "1560", revenue: {method: "perdiem", beds: 20, occupancy: [60.0, 60.0, 60.0, 60.0, 60.0, 65.0, 65.0, 65.0, 65.0, 65.0, 65.0, 65.0], rate: 132.04, rate2: 136.0, rate2Month: 9} },
   { group: "HCHV", name: "MP Geriatric", code: "1675", grantCode: "1675" },
 
-  { group: "Residential", name: "3022 Windsor Veterans Village", code: "3022", costCenterCode: "3022" },
-  { group: "Residential", name: "3030 Bayview Heights", code: "3030", costCenterCode: "3030" },
-  { group: "Residential", name: "3041 Mather VV Phase I", code: "3041", costCenterCode: "3041" },
-  { group: "Residential", name: "3043 Mather VV Phase III", code: "3043", costCenterCode: "3043" },
+  { group: "Residential", name: "3022 Windsor Veterans Village", code: "3022", costCenterCode: "3022", revenue: {method: "schedule", amounts: [5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0, 5580.0], indirectRate: 0} },
+  { group: "Residential", name: "3030 Bayview Heights", code: "3030", costCenterCode: "3030", revenue: {method: "schedule", amounts: [7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35, 7972.35], indirectRate: 0} },
+  { group: "Residential", name: "3041 Mather VV Phase I", code: "3041", costCenterCode: "3041", revenue: {method: "schedule", amounts: [8694.52, 8694.52, 8694.52, 8694.52, 9998.67, 8955.35, 8955.35, 8955.35, 8955.35, 8955.35, 8955.35, 8955.35], indirectRate: 0} },
+  { group: "Residential", name: "3043 Mather VV Phase III", code: "3043", costCenterCode: "3043", revenue: {method: "schedule", amounts: [8441.28, 8441.28, 8441.28, 8441.28, 9707.43, 8694.51, 8694.51, 8694.51, 8694.51, 8694.51, 8694.51, 8694.51], indirectRate: 0} },
 
   { group: "Housing support", name: "SLE - Santa Rosa", templateRe: "SLE.*Santa Rosa", searchAllTemplates: true },
   { group: "Housing support", name: "SLE - Park Marina", templateRe: "Park Marina", searchAllTemplates: true },
   { group: "Housing support", name: "Waldon St PH" },
-  { group: "Housing support", name: "1620 VSSR Sonoma", code: "1620", grantCode: "1620", templateRe: "sonoma" },
-  { group: "Housing support", name: "1640 VSSR Sacramento", code: "1640", grantCode: "1640", templateRe: "1640", searchAllTemplates: true },
+  { group: "Housing support", name: "1620 VSSR Sonoma", code: "1620", grantCode: "1620", templateRe: "sonoma", revenue: {method: "schedule", amounts: [47689.22, 95301.63, 68157.03, 58656.47, 63534.25, 66362.44, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], indirectRate: 0} },
+  { group: "Housing support", name: "1640 VSSR Sacramento", code: "1640", grantCode: "1640", templateRe: "1640", searchAllTemplates: true, revenue: {method: "schedule", amounts: [52226.4, 110137.35, 72820.76, 75235.25, 68796.8, 68391.71, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], indirectRate: 0} },
 
-  { group: "Outreach", name: "1613 CAVSA", code: "1613", grantCode: "1613" },
-  { group: "Outreach", name: "1642 TLI", code: "1642", grantCode: "1642" },
-  { group: "Outreach", name: "1655 CVHI", code: "1655", grantCode: "1655" },
-  { group: "Outreach", name: "1626 Marin Outreach", code: "1626", grantCode: "1626" },
-  { group: "Outreach", name: "1661 LIHTF", code: "1661", grantCode: "1661" },
+  { group: "Outreach", name: "1613 CAVSA", code: "1613", grantCode: "1613", revenue: {method: "schedule", amounts: [0.0, 13825.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20225.0, 0.0, 0.0, 0.0], indirectRate: 0} },
+  { group: "Outreach", name: "1642 TLI", code: "1642", grantCode: "1642", revenue: {method: "schedule", amounts: [0.0, 0.0, 0.0, 0.0, 106250.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], indirectRate: 0} },
+  { group: "Outreach", name: "1655 CVHI", code: "1655", grantCode: "1655", revenue: {method: "cost", indirectRate: 17} },
+  { group: "Outreach", name: "1626 Marin Outreach", code: "1626", grantCode: "1626", revenue: {method: "cost", indirectRate: 0} },
+  { group: "Outreach", name: "1661 LIHTF", code: "1661", grantCode: "1661", revenue: {method: "cost", indirectRate: 0} },
 
-  { group: "Other programs", name: "1630 CalFresh", code: "1630", grantCode: "1630" },
-  { group: "Other programs", name: "1624 SRJC", code: "1624", grantCode: "1624" },
-  { group: "Other programs", name: "1691 Pathways", code: "1691", grantCode: "1691" },
-  { group: "Other programs", name: "1830 CalAim", code: "1830", grantCode: "1830" },
+  { group: "Other programs", name: "1630 CalFresh", code: "1630", grantCode: "1630", revenue: {method: "schedule", amounts: [0.0, 0.0, 12000.0, 0.0, 0.0, 12000.0, 0.0, 0.0, 12000.0, 0.0, 0.0, 12000.0], indirectRate: 0} },
+  { group: "Other programs", name: "1624 SRJC", code: "1624", grantCode: "1624", revenue: {method: "schedule", amounts: [0.0, 4650.0, 0.0, 4650.0, 0.0, 4650.0, 0.0, 4650.0, 0.0, 4650.0, 0.0, 4650.0], indirectRate: 0} },
+  { group: "Other programs", name: "1691 Pathways", code: "1691", grantCode: "1691", revenue: {method: "schedule", amounts: [9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0, 9000.0], indirectRate: 17} },
+  { group: "Other programs", name: "1830 CalAim", code: "1830", grantCode: "1830", revenue: {method: "schedule", amounts: [55000.0, 60000.0, 65000.0, 70000.0, 72000.0, 75000.0, 75000.0, 75000.0, 75000.0, 70000.0, 75000.0, 70000.0], indirectRate: 0} },
 
   { group: "General admin and fundraising", name: "Corp - indirect allowable", code: "1100", costCenterCode: "1100" },
   { group: "General admin and fundraising", name: "Corp - indirect unallowable", code: "1110", costCenterCode: "1110" },
@@ -5615,7 +5773,7 @@ const BUDGET_TOOL_SEED = [
   { group: "General admin and fundraising", name: "1300 Sisterhood", code: "1300", grantCode: "1300" },
   { group: "General admin and fundraising", name: "Corporate improvements" },
   { group: "General admin and fundraising", name: "MSU contributions" },
-  { group: "General admin and fundraising", name: "1549 GPD Daughters", code: "1549", grantCode: "1549" },
+  { group: "General admin and fundraising", name: "1549 GPD Daughters", code: "1549", grantCode: "1549", revenue: {method: "schedule", amounts: [40000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], indirectRate: 0} },
 ];
 
 function toolNorm(s) {
@@ -5635,7 +5793,7 @@ function resolveToolUnits(grants, costCenters, budgets) {
   const activeTemplates = budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status));
   const ccCode = (c) => { const m = String(c.name || "").match(/^\s*(\d{4})/); return m ? m[1] : ""; };
   return BUDGET_TOOL_SEED.map((seed) => {
-    const unit = { id: toolUnitId(seed), code: seed.code || "", name: seed.name, group: seed.group, kind: "new", grantId: "", costCenterId: "", templateIds: [], baseline: "none", include: true };
+    const unit = { id: toolUnitId(seed), code: seed.code || "", name: seed.name, group: seed.group, kind: "new", grantId: "", costCenterId: "", templateIds: [], baseline: "none", include: true, revenueSeed: seed.revenue || null };
 
     let grant = null;
     if (seed.grantCode) {
@@ -5913,12 +6071,21 @@ function toolRollup(model, budgets, staff) {
   const pcfg = toolPersonnelConfig(model);
   const pmap = staff ? toolStaffUnitMap(model, staff) : null;
 
+  // Build every unit first, since the indirect spread and the revenue methods depend on other units' expenses.
+  const built = [];
   (model.units || []).forEach((unit) => {
     if (!unit.include) return;
     const baseline = toolUnitBaseline(unit, model, budgets);
     const pers = pmap ? toolPersonnelForUnit(unit, pmap.units[unit.id] || [], pcfg, model.fy) : null;
     const persOn = !!pers && toolPersonnelEnabled(unit, pcfg) && pers.count > 0;
     const lines = toolUnitModel(unit, baseline, model, persOn ? pers : null);
+    built.push({ unit, baseline, pers, persOn, lines });
+  });
+  const indirect = toolApplyIndirect(model, built);
+  built.forEach((b) => { b.revenue = toolApplyRevenue(model, b); });
+
+  built.forEach((b) => {
+    const { unit, baseline, pers, persOn, lines } = b;
     const monthly = emptyTotals();
     lines.forEach((l) => {
       addInto(monthly, l);
@@ -5931,7 +6098,8 @@ function toolRollup(model, budgets, staff) {
     });
     const needsData = baseline.basis === "none";
     if (needsData) issues.push({ unitId: unit.id, name: unit.name, kind: unit.baseline === "import" ? "import" : "none" });
-    const row = { unit, baseline, lines, monthly, totals: summarize(monthly), needsData, personnel: pers, personnelOn: persOn };
+    const share = indirect ? indirect.recipients.find((r) => r.unitId === unit.id) : null;
+    const row = { unit, baseline, lines, monthly, totals: summarize(monthly), needsData, personnel: pers, personnelOn: persOn, revenue: b.revenue, indirectShare: share || null };
     units.push(row);
     if (!groupMap[unit.group]) { groupMap[unit.group] = { name: unit.group, units: [], monthly: emptyTotals() }; groupOrder.push(unit.group); }
     const g = groupMap[unit.group];
@@ -5940,7 +6108,7 @@ function toolRollup(model, budgets, staff) {
   });
 
   const groups = groupOrder.map((name) => ({ ...groupMap[name], totals: summarize(groupMap[name].monthly) }));
-  return { units, groups, org: { monthly: org, totals: summarize(org) }, categories, issues, personnelCheck: pmap ? toolPersonnelCheck(model, staff, pmap) : null };
+  return { units, groups, org: { monthly: org, totals: summarize(org) }, categories, issues, indirect, personnelCheck: pmap ? toolPersonnelCheck(model, staff, pmap) : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -6356,6 +6524,38 @@ function buildBudgetToolWorkbook(rollup, model) {
     wp.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
   }
 
+  // ---- Revenue methods and the indirect spread, when either is used ----
+  const withMethod = rollup.units.filter((u) => u.revenue || u.indirectShare);
+  if (withMethod.length) {
+    const wr = wb.addWorksheet(sheetName("Revenue and indirect"), { properties: { tabColor: { argb: "FFC08A2E" } } });
+    wr.getCell(1, 1).value = "Nation's Finest";
+    wr.getCell(1, 1).font = { bold: true, size: 14, color: { argb: INK } };
+    wr.getCell(2, 1).value = `Revenue methods and indirect spread · FY${FY} budget`;
+    wr.getCell(2, 1).font = { bold: true, size: 12, color: { argb: INK } };
+    const ind = rollup.indirect;
+    wr.getCell(3, 1).value = ind ? `Corporate costs of ${ind.poolTotal.toLocaleString("en-US", { maximumFractionDigits: 0 })} spread to ${ind.recipients.filter((x) => x.fte > 0).length} units by ${ind.totalFte} FTE${ind.warnings.length ? " · " + ind.warnings.join(" ") : ""}` : "Indirect spread is not used.";
+    wr.getCell(3, 1).font = { italic: true, size: 9, color: { argb: GRAY } };
+    header(wr, 5, ["Unit", "Group", "Revenue method", `FY${FY} program revenue`, "Indirect billing", "FTE", "Share of the pool", "Indirect cost charged"], [1, 2, 3]);
+    let rr = 6;
+    withMethod.forEach((u) => {
+      const p = ((model.revenue || {}).units || {})[u.unit.id];
+      const sh = u.indirectShare;
+      const row = wr.getRow(rr);
+      row.values = [u.unit.name, u.unit.group, u.revenue ? toolRevenueDescription(p) : "From last year", u.revenue ? toolRound2(u.revenue.total4100) : null, u.revenue ? toolRound2(u.revenue.total4101) : null, sh ? sh.fte : null, sh ? sh.share : null, sh ? toolRound2(sh.amount) : null];
+      for (let c = 1; c <= 8; c++) {
+        const cell = row.getCell(c);
+        cell.font = { size: 10, color: { argb: INK } };
+        if (c === 4 || c === 5 || c === 8) cell.numFmt = NUM;
+        if (c === 7) cell.numFmt = "0.0%";
+        if (c === 6) cell.numFmt = "0.00";
+      }
+      rr += 1;
+    });
+    wr.columns = [{ width: 32 }, { width: 28 }, { width: 70 }, { width: 18 }, { width: 16 }, { width: 8 }, { width: 14 }, { width: 18 }];
+    wr.views = [{ state: "frozen", ySplit: 5, showGridLines: false }];
+    wr.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+  }
+
   // ---- Whole organization, then each group's total followed by its units ----
   writeAccountSheet("TOTAL organization", `All ${rollup.units.length} units that roll forward`, toolAggregateAccounts(rollup.units.map((u) => u.lines)), HEAD);
   rollup.groups.forEach((g, gi) => {
@@ -6526,6 +6726,12 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit
   const rollup = useMemo(() => toolRollup(model, budgets, staff), [model, budgets, staff]);
   const pcfg = toolPersonnelConfig(model);
   const setPersonnel = (fn) => onChange((m) => ({ ...m, personnel: fn(m.personnel || {}) }));
+  const icfg = toolIndirectConfig(model);
+  const seeded = (model.units || []).filter((x) => x.revenueSeed);
+  const usingMethods = rollup.units.filter((x) => x.revenue).length;
+  const setIndirect = (fn) => onChange((m) => ({ ...m, indirect: fn(m.indirect || {}) }));
+  const useWorkbookMethods = () => onChange((m) => { const units = { ...((m.revenue || {}).units || {}) }; (m.units || []).forEach((x) => { if (x.revenueSeed) units[x.id] = { ...x.revenueSeed }; }); return { ...m, revenue: { ...(m.revenue || {}), units } }; });
+  const clearMethods = () => onChange((m) => ({ ...m, revenue: { ...(m.revenue || {}), units: {} } }));
   const [pickerOpen, setPickerOpen] = useState(!model.setupDone);
   const [detailId, setDetailId] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
@@ -6686,6 +6892,38 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit
         </div>
       )}
 
+      <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+        <div className="font-medium mb-1" style={{ color: "#1C2624" }}>Revenue and indirect</div>
+        <p className="text-xs mb-3" style={{ color: "#5B6B66" }}>
+          By default a unit's revenue is last year's plus the percentages above, so it doesn't move when its expenses do. A revenue method follows how the program is paid: cost reimbursement (revenue equals expenses, plus indirect billing), per diem (beds, occupancy and a daily rate), or a monthly schedule. Choose one per unit by opening it.
+        </p>
+        <div className="flex flex-wrap items-center gap-2 mb-3 text-sm">
+          {canEdit && seeded.length > 0 && <button onClick={useWorkbookMethods} className="px-3 py-1.5 rounded-md border" style={{ borderColor: "#1F5C6B", color: "#1F5C6B" }}>Use my workbooks' revenue methods ({seeded.length} units)</button>}
+          {canEdit && usingMethods > 0 && <button onClick={clearMethods} className="px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Back to last year's revenue everywhere</button>}
+          <span className="text-xs" style={{ color: "#5B6B66" }}>{usingMethods} of {rollup.units.length} units use a revenue method.</span>
+        </div>
+        <label className="flex items-start gap-2 text-sm mb-2" style={{ color: "#1C2624" }}>
+          <input type="checkbox" aria-label="Spread corporate costs to programs" className="mt-1" disabled={!canEdit} checked={icfg.enabled} onChange={(e) => setIndirect((i) => ({ ...i, enabled: e.target.checked }))} />
+          <span>Spread the corporate costs to programs by FTE. Each program's 6990 Indirect expense becomes its share of the corporate unit's costs, as in your Indirect Cost SPREAD sheet. FTE comes from the people allocated to each unit in Personnel, or a figure you type in the unit.</span>
+        </label>
+        {icfg.enabled && (
+          <div className="text-sm ml-6" style={{ color: "#1C2624" }}>
+            <label className="flex items-center gap-2 mb-1">Corporate costs are in
+              <select aria-label="Unit that holds the corporate costs" disabled={!canEdit} className="rounded-md border px-2 py-1 text-sm" style={inputStyle} value={icfg.poolUnitId} onChange={(e) => setIndirect((i) => ({ ...i, poolUnitId: e.target.value }))}>
+                <option value="">Choose a unit</option>
+                {(model.units || []).filter((x) => x.include).map((x) => <option key={x.id} value={x.id}>{x.name}</option>)}
+              </select>
+            </label>
+            {rollup.indirect && (
+              <div className="text-xs" style={{ color: "#5B6B66" }}>
+                {fmt(rollup.indirect.poolTotal)} is spread across {rollup.indirect.recipients.filter((x) => x.fte > 0).length} units by {rollup.indirect.totalFte} FTE.
+                {rollup.indirect.warnings.map((w, i) => <div key={i} style={{ color: "#8A5A00" }}>{w}</div>)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
         <table className="w-full text-sm">
           <thead>
@@ -6717,7 +6955,7 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit
                 {g.units.map((u) => (
                   <tr key={u.unit.id} className="border-t" style={{ borderColor: "#EEF0EC" }}>
                     <td className="px-3 py-2 pl-6">
-                      <div style={{ color: "#1C2624" }}>{u.unit.name}{u.personnelOn && <span className="ml-2"><ToolChip text={`Personnel · ${u.personnel.count} people`} tone="teal" /></span>}</div>
+                      <div style={{ color: "#1C2624" }}>{u.unit.name}{u.personnelOn && <span className="ml-2"><ToolChip text={`Personnel · ${u.personnel.count} people`} tone="teal" /></span>}{u.revenue && <span className="ml-2"><ToolChip text={TOOL_REV_METHODS[u.revenue.method]} tone="gray" /></span>}</div>
                       <div className="text-xs" style={{ color: u.needsData ? "#8A5A00" : "#8A8F87" }}>{u.baseline.basisLabel}</div>
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums" style={{ color: "#5B6B66" }}>{fmt(u.totals.baseRev)}</td>
@@ -6995,6 +7233,8 @@ function BudgetUnitModal({ model, row, canEdit, onChange, hasStaff, onClose }) {
 
         {hasStaff && row.personnel && <BudgetPersonnelSection model={model} row={row} canEdit={canEdit} onChange={onChange} />}
 
+        <BudgetRevenueSection model={model} row={row} canEdit={canEdit} onChange={onChange} />
+
         {canEdit && (
           <div className="border rounded-lg p-3" style={{ borderColor: "#E1E5DE" }}>
             <div className="text-sm font-medium mb-2" style={{ color: "#1C2624" }}>Add a line</div>
@@ -7038,6 +7278,117 @@ function BudgetUnitModal({ model, row, canEdit, onChange, hasStaff, onClose }) {
         </div>
       </div>
     </Modal>
+  );
+}
+
+// How one unit's revenue is worked out, and its share of the corporate indirect.
+function BudgetRevenueSection({ model, row, canEdit, onChange }) {
+  const unit = row.unit;
+  const cur = ((model.revenue || {}).units || {})[unit.id] || { method: "runrate" };
+  const method = cur.method || "runrate";
+  const seed = unit.revenueSeed;
+  const icfg = toolIndirectConfig(model);
+  const share = row.indirectShare;
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+  const lineSum = (sub, field) => row.lines.filter((l) => l.subcategory.startsWith(sub)).reduce((t, l) => t + sum(l[field]), 0);
+  const month = (v, i) => <option key={v} value={i}>{v}</option>;
+
+  const setP = (fn) => onChange((m) => {
+    const r = m.revenue || {};
+    const units = { ...(r.units || {}) };
+    units[unit.id] = fn({ ...(units[unit.id] || { method: "runrate" }) });
+    return { ...m, revenue: { ...r, units } };
+  });
+  const setMethod = (v) => setP((p) => {
+    if (v === "runrate") return { method: "runrate" };
+    if (seed && seed.method === v) return { ...seed };
+    const ind = p.indirectRate || 0;
+    if (v === "cost") return { method: "cost", indirectRate: ind, markupPct: 0, excludeDepreciation: false };
+    if (v === "perdiem") return { method: "perdiem", indirectRate: ind, beds: 0, rate: 0, occupancy: Array(12).fill(75) };
+    return { method: "schedule", indirectRate: ind, amounts: Array(12).fill(0) };
+  });
+  const num = (key) => (v) => setP((p) => { const n = { ...p }; if (v === null) delete n[key]; else n[key] = v; return n; });
+  const setAt = (key, i, v) => setP((p) => { const a = [...(Array.isArray(p[key]) ? p[key] : Array(12).fill(0))]; a[i] = v === null ? 0 : v; return { ...p, [key]: a }; });
+  const fillAll = (key, v) => setP((p) => ({ ...p, [key]: Array(12).fill(v === null ? 0 : v) }));
+  const setIndUnit = (patch) => onChange((m) => { const ind = m.indirect || {}; const units = { ...(ind.units || {}) }; const next = { ...(units[unit.id] || {}), ...patch }; Object.keys(next).forEach((k) => { if (next[k] === null || next[k] === undefined) delete next[k]; }); if (Object.keys(next).length === 0) delete units[unit.id]; else units[unit.id] = next; return { ...m, indirect: { ...ind, units } }; });
+  const differsFromSeed = seed && JSON.stringify(seed) !== JSON.stringify(cur);
+
+  return (
+    <div className="border rounded-lg p-3" style={{ borderColor: "#E1E5DE" }}>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div className="text-sm font-medium" style={{ color: "#1C2624" }}>Revenue</div>
+        <div className="flex items-center gap-2 text-sm">
+          <select aria-label="Revenue method" disabled={!canEdit} className="rounded-md border px-2 py-1 text-sm" style={inputStyle} value={method} onChange={(e) => setMethod(e.target.value)}>
+            {Object.keys(TOOL_REV_METHODS).map((k) => <option key={k} value={k}>{TOOL_REV_METHODS[k]}</option>)}
+          </select>
+          {canEdit && differsFromSeed && <button onClick={() => setP(() => ({ ...seed }))} className="px-2 py-1 rounded-md border text-xs" style={{ borderColor: "#1F5C6B", color: "#1F5C6B" }}>Use my workbook's: {toolRevenueDescription(seed)}</button>}
+        </div>
+      </div>
+      <div className="text-xs mb-2" style={{ color: "#5B6B66" }}>
+        {method === "runrate" ? "Revenue is last year's with the percentages above." : toolRevenueDescription(cur)}. Program revenue FY{model.fy}: {fmt(lineSum("4100", "model"))} (FY{model.fy - 1} baseline {fmt(lineSum("4100", "base"))}){lineSum("4101", "model") ? `, indirect billing ${fmt(lineSum("4101", "model"))}` : ""}.
+      </div>
+
+      {method === "cost" && (
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm" style={{ color: "#1C2624" }}>
+          <label className="flex items-center gap-2">Markup <ToolNumberInput label="Markup percent" width="w-16" disabled={!canEdit} value={typeof cur.markupPct === "number" ? cur.markupPct : 0} onCommit={num("markupPct")} /> %</label>
+          <label className="flex items-center gap-2">Indirect billing <ToolNumberInput label="Indirect billing percent" width="w-16" disabled={!canEdit} value={typeof cur.indirectRate === "number" ? cur.indirectRate : 0} onCommit={num("indirectRate")} /> %</label>
+          <label className="flex items-center gap-2"><input type="checkbox" aria-label="Leave out depreciation" disabled={!canEdit} checked={cur.excludeDepreciation === true} onChange={(e) => setP((p) => ({ ...p, excludeDepreciation: e.target.checked }))} /> Leave out depreciation</label>
+          <label className="flex items-center gap-2">From <select aria-label="Revenue from month" disabled={!canEdit} className="rounded border px-1 py-0.5" style={inputStyle} value={typeof cur.fromMonth === "number" ? cur.fromMonth : 0} onChange={(e) => setP((p) => ({ ...p, fromMonth: Number(e.target.value) }))}>{MONTHS.map(month)}</select>
+            through <select aria-label="Revenue through month" disabled={!canEdit} className="rounded border px-1 py-0.5" style={inputStyle} value={typeof cur.throughMonth === "number" ? cur.throughMonth : 11} onChange={(e) => setP((p) => ({ ...p, throughMonth: Number(e.target.value) }))}>{MONTHS.map(month)}</select></label>
+        </div>
+      )}
+
+      {method === "perdiem" && (
+        <div className="space-y-2 text-sm" style={{ color: "#1C2624" }}>
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <label className="flex items-center gap-2">Beds <ToolNumberInput label="Beds" width="w-16" step="1" disabled={!canEdit} value={typeof cur.beds === "number" ? cur.beds : 0} onCommit={num("beds")} /></label>
+            <label className="flex items-center gap-2">Daily rate $ <ToolNumberInput label="Daily rate" width="w-24" step="0.01" disabled={!canEdit} value={typeof cur.rate === "number" ? cur.rate : 0} onCommit={num("rate")} /></label>
+            <label className="flex items-center gap-2">New rate $ <ToolNumberInput label="New daily rate" width="w-24" step="0.01" disabled={!canEdit} value={typeof cur.rate2 === "number" ? cur.rate2 : null} placeholder="none" onCommit={num("rate2")} /> from
+              <select aria-label="New rate from month" disabled={!canEdit} className="rounded border px-1 py-0.5" style={inputStyle} value={typeof cur.rate2Month === "number" ? cur.rate2Month : 0} onChange={(e) => setP((p) => ({ ...p, rate2Month: Number(e.target.value) }))}>{MONTHS.map(month)}</select></label>
+            <label className="flex items-center gap-2">Indirect billing <ToolNumberInput label="Indirect billing percent" width="w-16" disabled={!canEdit} value={typeof cur.indirectRate === "number" ? cur.indirectRate : 0} onCommit={num("indirectRate")} /> %</label>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs" style={{ color: "#5B6B66" }}>Occupancy %</span>
+            <label className="flex items-center gap-1 text-xs">all months <ToolNumberInput label="Occupancy for all months" width="w-14" step="1" disabled={!canEdit} value={null} placeholder="set" onCommit={(v) => { if (v !== null) fillAll("occupancy", v); }} /></label>
+            {MONTHS.map((mn, i) => (
+              <label key={mn} className="flex flex-col items-center text-[10px]" style={{ color: "#8A8F87" }}>{mn}
+                <ToolNumberInput label={`Occupancy for ${mn}`} width="w-14" step="1" disabled={!canEdit} value={Array.isArray(cur.occupancy) ? cur.occupancy[i] : 0} onCommit={(v) => setAt("occupancy", i, v)} />
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {method === "schedule" && (
+        <div className="space-y-2 text-sm" style={{ color: "#1C2624" }}>
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <label className="flex items-center gap-2">Same amount every month $ <ToolNumberInput label="Same amount every month" width="w-28" step="1" disabled={!canEdit} value={null} placeholder="set" onCommit={(v) => { if (v !== null) fillAll("amounts", v); }} /></label>
+            <label className="flex items-center gap-2">Indirect billing <ToolNumberInput label="Indirect billing percent" width="w-16" disabled={!canEdit} value={typeof cur.indirectRate === "number" ? cur.indirectRate : 0} onCommit={num("indirectRate")} /> %</label>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {MONTHS.map((mn, i) => (
+              <label key={mn} className="flex flex-col items-center text-[10px]" style={{ color: "#8A8F87" }}>{mn}
+                <ToolNumberInput label={`Amount for ${mn}`} width="w-24" step="1" disabled={!canEdit} value={Array.isArray(cur.amounts) ? cur.amounts[i] : 0} onCommit={(v) => setAt("amounts", i, v)} />
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {icfg.enabled && (
+        <div className="mt-3 pt-3 border-t text-sm" style={{ borderColor: "#EEF0EC", color: "#1C2624" }}>
+          {unit.id === icfg.poolUnitId ? (
+            <span className="text-xs" style={{ color: "#5B6B66" }}>This unit holds the corporate costs that are spread to the programs.</span>
+          ) : (
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+              <label className="flex items-center gap-2"><input type="checkbox" aria-label="Receives the corporate indirect" disabled={!canEdit} checked={toolIndirectReceives(unit, icfg)} onChange={(e) => setIndUnit({ receives: e.target.checked })} /> Receives corporate indirect</label>
+              <label className="flex items-center gap-2">FTE for the spread <ToolNumberInput label="FTE for the spread" width="w-20" step="0.01" disabled={!canEdit} value={typeof (icfg.units[unit.id] || {}).fte === "number" ? icfg.units[unit.id].fte : null} placeholder={share ? String(share.fte) : "from Personnel"} onCommit={(v) => setIndUnit({ fte: v })} /></label>
+              <span className="text-xs" style={{ color: "#5B6B66" }}>{share && share.amount > 0 ? `${(share.share * 100).toFixed(1)}% of the pool → ${fmt(share.amount)} as 6990 Indirect` : toolIndirectReceives(unit, icfg) ? "No share yet: it has no FTE." : "Not part of the spread."}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
