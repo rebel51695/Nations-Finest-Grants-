@@ -524,7 +524,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.9.0";
+const APP_VERSION = "2.0.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -5701,6 +5701,161 @@ function toolRevenueDescription(p) {
 }
 
 // ===========================================================================
+// Publishing a Budget tool model: one Draft Template per unit for next year.
+// Plain calculation (no screens) so every rule can be tested on real data.
+// ===========================================================================
+
+// Does Org Budget count this budget? Active Templates always; Draft Templates made by
+// the Budget tool only when the "include next-year drafts" switch is on.
+function isOrgBudgetIncluded(b, includeDrafts) {
+  if (b.budgetType !== "Template") return false;
+  return isActiveBudget(b.status) || (!!includeDrafts && b.status === "Draft" && !!b.toolModelId);
+}
+
+function toolHash(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+  return String(h >>> 0);
+}
+// A fingerprint of a Template's plan, so a later publish can tell if someone edited it by hand.
+function toolLinesHash(lines) {
+  return toolHash(JSON.stringify((lines || []).map((l) => [l.category, l.subcategory || "", String(l.description || "").trim(), l.type, (l.amounts || []).map((a) => toolRound2(a))])));
+}
+
+// The Template lines for one unit. Account lines carry the model's figures; where
+// Personnel built the wages, each position is its own 5000 line (by title, never by
+// person) and the payroll taxes and benefits are one 5900 line. Lines with no money
+// are left out.
+function toolPublishLines(row) {
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+  const out = [];
+  const mk = (category, subcategory, type, description, arr) => ({ ...newLine(12), category, subcategory, type, description: description || "", amounts: arr.map(toolRound2), actuals: Array(12).fill(0) });
+  (row.lines || []).forEach((l) => {
+    if (l.type !== "revenue" && l.type !== "expense") return;
+    if (Math.abs(sum(l.model)) < 0.005) return;
+    if (l.fromPersonnel && row.personnel && /^5000\b/.test(l.subcategory)) {
+      const byTitle = {};
+      row.personnel.rows.filter((r) => !r.excluded).forEach((r) => {
+        const title = String(r.position || "").trim() || "Position";
+        const arr = byTitle[title] || (byTitle[title] = Array(12).fill(0));
+        r.wages.forEach((v, i) => { arr[i] += v; });
+      });
+      Object.keys(byTitle).forEach((title) => { if (Math.abs(sum(byTitle[title])) >= 0.005) out.push(mk(l.category, l.subcategory, "expense", title, byTitle[title])); });
+    } else if (l.fromPersonnel && /^5900\b/.test(l.subcategory)) {
+      out.push(mk(l.category, l.subcategory, "expense", "Payroll taxes and benefits", l.model));
+    } else {
+      out.push(mk(l.category, l.subcategory || "", l.type, l.manual ? l.description : "", l.model));
+    }
+  });
+  return out;
+}
+
+// What publishing would do for every unit that rolls forward.
+//   opts.createCostCenters   give units that have no grant or cost center one, so the
+//                            draft isn't ownerless
+//   opts.overwriteEdited     replace drafts that were edited by hand since the last publish
+//   opts.publishAnyway       publish where the owner already has a Template for that year
+function planToolPublish({ model, rollup, budgets, grants, costCenters, budgetGroups, opts }) {
+  const o = opts || {};
+  const fy = model.fy;
+  const norm = toolNorm;
+  const newCCs = [];
+  const items = [];
+  const grantOf = (id) => grants.find((g) => g.id === id);
+  const ccOf = (id) => costCenters.find((c) => c.id === id);
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+
+  rollup.units.forEach((row) => {
+    const unit = row.unit;
+    const lines = toolPublishLines(row);
+    const item = {
+      unitId: unit.id, name: unit.name, group: unit.group, lines, action: "create", reason: "", existingId: "", warnings: [], edited: false,
+      revenue: toolRound2(sum(lines.filter((l) => l.type === "revenue").map((l) => sum(l.amounts)))),
+      expense: toolRound2(sum(lines.filter((l) => l.type === "expense").map((l) => sum(l.amounts)))),
+      grantId: unit.grantId && grantOf(unit.grantId) ? unit.grantId : "", costCenterId: unit.costCenterId && ccOf(unit.costCenterId) ? unit.costCenterId : "", newCostCenter: null,
+    };
+    items.push(item);
+    if (lines.length === 0) { item.action = "skip"; item.reason = "Nothing to publish yet: no figures"; return; }
+
+    // The draft this model made for the unit before, if any.
+    const mine = budgets.find((b) => b.toolModelId === model.id && b.toolUnitId === unit.id);
+    if (mine) {
+      item.existingId = mine.id;
+      if (mine.status !== "Draft") { item.action = "skip"; item.reason = `Already ${mine.status}: the tool never changes an activated Template`; return; }
+      item.grantId = mine.grantId || ""; item.costCenterId = mine.costCenterId || "";
+      const edited = !!mine.toolPublishedHash && toolLinesHash(mine.lines) !== mine.toolPublishedHash;
+      item.edited = edited;
+      if (toolLinesHash(mine.lines) === toolLinesHash(lines)) { item.action = "unchanged"; item.reason = "Already up to date"; return; }
+      if (edited && !o.overwriteEdited) { item.action = "skip"; item.reason = "Edited by hand since the last publish"; return; }
+      item.action = "update";
+      if (edited) item.warnings.push("Overwrites changes made by hand");
+      return;
+    }
+
+    // An owner for a new draft.
+    if (!item.grantId && !item.costCenterId) {
+      if (o.createCostCenters) {
+        const bare = unit.name.replace(/^\d{3,4}\s*[-–]?\s*/, "").trim() || unit.name;
+        const ccName = unit.code && /^\d{3,4}$/.test(unit.code) ? `${unit.code} - ${bare}` : unit.name;
+        const found = costCenters.find((c) => norm(c.name) === norm(ccName)) || newCCs.find((c) => norm(c.name) === norm(ccName));
+        if (found) item.costCenterId = found.id;
+        else {
+          const bg = (budgetGroups || []).find((g) => norm(g.name) === norm(unit.group));
+          const cc = { id: uid(), name: ccName, description: "Created by the Budget tool", budgetGroupId: bg ? bg.id : "" };
+          newCCs.push(cc);
+          item.costCenterId = cc.id;
+          item.newCostCenter = cc;
+        }
+      } else item.warnings.push("No grant or cost center: the draft will show as Unknown owner");
+    }
+    // Already a Template for that owner and year that this tool did not make?
+    const ownerKey = item.grantId ? "g" : item.costCenterId && !item.newCostCenter ? "c" : "";
+    if (ownerKey && !o.publishAnyway) {
+      const dupe = budgets.find((b) => b.budgetType === "Template" && !b.toolModelId && String(b.periodStart || "").slice(0, 4) === String(fy) && b.status !== "Closed" && (ownerKey === "g" ? b.grantId === item.grantId : b.costCenterId === item.costCenterId)
+        && (!unit.templateIds || !unit.templateIds.includes(b.id)));
+      if (dupe) { item.action = "skip"; item.reason = `Already has a ${fy} Template: "${String(dupe.title).trim()}"`; item.dupeId = dupe.id; }
+    }
+  });
+  const counts = { create: 0, update: 0, unchanged: 0, skip: 0 };
+  items.forEach((i) => { counts[i.action] += 1; });
+  const used = new Set(items.filter((i) => i.action === "create" && i.newCostCenter).map((i) => i.newCostCenter.id));
+  return { items, newCostCenters: newCCs.filter((c) => used.has(c.id)), counts };
+}
+
+// Writes a plan into the budget and cost center lists (returns new lists).
+function applyToolPublish(plan, model, budgets, costCenters, ctx) {
+  const now = (ctx && ctx.now) || new Date();
+  const by = (ctx && ctx.by) || "Unknown";
+  const stamp = now.toISOString();
+  const day = stamp.slice(0, 10);
+  const note = `Created by the Budget tool from "${model.title}" on ${day} by ${by}. Plan only: actuals start empty.`;
+  let nextBudgets = budgets;
+  const ids = {};
+  plan.items.forEach((i) => {
+    if (i.action === "update") {
+      nextBudgets = nextBudgets.map((b) => (b.id === i.existingId ? { ...b, lines: i.lines, notes: note, toolPublishedAt: stamp, toolPublishedHash: toolLinesHash(i.lines) } : b));
+      ids[i.unitId] = i.existingId;
+    } else if (i.action === "create") {
+      const id = uid();
+      ids[i.unitId] = id;
+      nextBudgets = [...nextBudgets, {
+        id, grantId: i.grantId, costCenterId: i.costCenterId, title: `${i.name} - FY${model.fy} Template`, fy: String(model.fy),
+        periodStart: `${model.fy}-01-01`, periodEnd: `${model.fy}-12-31`, status: "Draft", budgetType: "Template", linkedBudgetIds: [],
+        notes: note, approvedBy: "", approvedAt: "", rejectionReason: "", actualsThrough: "", lines: i.lines,
+        toolModelId: model.id, toolUnitId: i.unitId, toolPublishedAt: stamp, toolPublishedHash: toolLinesHash(i.lines),
+      }];
+    }
+  });
+  const nextCCs = plan.newCostCenters.length ? [...costCenters, ...plan.newCostCenters] : costCenters;
+  return { budgets: nextBudgets, costCenters: nextCCs, ids };
+}
+
+// Drafts this model made that are still Drafts (the ones that can be taken back).
+function toolPublishedDrafts(model, budgets) {
+  return budgets.filter((b) => b.toolModelId === model.id && b.status === "Draft");
+}
+
+// ===========================================================================
 // Budget tool: next year's budget, built from this year's. Replaces Scenarios.
 // Everything in this block is plain calculation (no screens), so it can be
 // tested on its own against real data.
@@ -6612,7 +6767,7 @@ function ToolNumberInput({ value, onCommit, placeholder, disabled, label, width,
   );
 }
 
-function BudgetToolView({ models, setModels, grants, budgets, costCenters, staff, whoami, setTrash, canEdit, logActivity }) {
+function BudgetToolView({ models, setModels, grants, budgets, setBudgets, costCenters, setCostCenters, budgetGroups, staff, whoami, setTrash, canEdit, isAdmin, logActivity }) {
   const [openId, setOpenId] = useState(null);
   const [creating, setCreating] = useState(false);
   const [confirm, setConfirm] = useState(null);
@@ -6645,6 +6800,13 @@ function BudgetToolView({ models, setModels, grants, budgets, costCenters, staff
           budgets={budgets}
           costCenters={costCenters}
           staff={staff}
+          budgetGroups={budgetGroups}
+          setBudgets={setBudgets}
+          setCostCenters={setCostCenters}
+          setTrash={setTrash}
+          whoami={whoami}
+          isAdmin={isAdmin}
+          logActivity={logActivity}
           canEdit={canEdit}
           onChange={(fn) => update(open.id, fn)}
           onBack={() => setOpenId(null)}
@@ -6722,7 +6884,7 @@ function NewBudgetModelModal({ fy, onCreate, onClose }) {
   );
 }
 
-function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit, onChange, onBack, onDelete }) {
+function BudgetModelEditor({ model, grants, budgets, costCenters, staff, budgetGroups, setBudgets, setCostCenters, setTrash, whoami, isAdmin, logActivity, canEdit, onChange, onBack, onDelete }) {
   const rollup = useMemo(() => toolRollup(model, budgets, staff), [model, budgets, staff]);
   const pcfg = toolPersonnelConfig(model);
   const setPersonnel = (fn) => onChange((m) => ({ ...m, personnel: fn(m.personnel || {}) }));
@@ -6737,6 +6899,8 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit
   const [importOpen, setImportOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const liveDrafts = toolPublishedDrafts(model, budgets);
   const t = rollup.org.totals;
   const adj = model.adjustments || { global: {}, categories: {}, units: {}, lines: {} };
   const detail = rollup.units.find((u) => u.unit.id === detailId);
@@ -6785,11 +6949,13 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit
             style={{ color: "#1C2624", borderColor: "#1F5C6B" }}
           />
           <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>FY{model.fy} (calendar year) · built from FY{model.fy - 1} actuals</p>
+          {model.publishedAt && <p className="text-xs mt-1" style={{ color: "#2F6F53" }}>Published to Draft Templates on {String(model.publishedAt).slice(0, 10)}{model.publishedBy ? ` by ${model.publishedBy}` : ""} · {liveDrafts.length} draft{liveDrafts.length === 1 ? "" : "s"} still in Draft</p>}
         </div>
         <div className="flex flex-wrap gap-2">
           {canEdit && <button onClick={() => setPickerOpen(true)} className={btn} style={btnStyle}>Choose units</button>}
           {canEdit && <button onClick={() => setImportOpen(true)} className={btn} style={btnStyle}><Upload size={15} /> Import Sage export</button>}
           {canEdit && <button onClick={() => setAddOpen(true)} className={btn} style={btnStyle}><Plus size={15} /> Add unit</button>}
+          <button onClick={() => setPublishOpen(true)} disabled={!(isAdmin && canEdit)} title={isAdmin && canEdit ? "Create next year's Draft Templates from this model" : "Only admins can publish"} className={btn} style={{ ...btnStyle, borderColor: "#2F6F53", color: "#2F6F53", opacity: isAdmin && canEdit ? 1 : 0.5 }}>Publish drafts…</button>
           <button onClick={exportExcel} disabled={exporting} className={btn + " text-white"} style={{ background: "#1F5C6B", borderColor: "#1F5C6B", opacity: exporting ? 0.6 : 1 }}>
             <Download size={15} /> {exporting ? "Building…" : "Download Excel"}
           </button>
@@ -6999,6 +7165,24 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit
         />
       )}
       {detail && <BudgetUnitModal model={model} row={detail} canEdit={canEdit} onChange={onChange} hasStaff={!!(staff && staff.length)} onClose={() => setDetailId(null)} />}
+      {publishOpen && (
+        <BudgetPublishModal
+          model={model}
+          rollup={rollup}
+          grants={grants}
+          costCenters={costCenters}
+          budgets={budgets}
+          budgetGroups={budgetGroups}
+          isAdmin={isAdmin && canEdit}
+          whoami={whoami}
+          setBudgets={setBudgets}
+          setCostCenters={setCostCenters}
+          setTrash={setTrash}
+          logActivity={logActivity}
+          onChange={onChange}
+          onClose={() => setPublishOpen(false)}
+        />
+      )}
       {importOpen && (
         <BudgetSageImportModal
           model={model}
@@ -7389,6 +7573,106 @@ function BudgetRevenueSection({ model, row, canEdit, onChange }) {
         </div>
       )}
     </div>
+  );
+}
+
+// Turns the model into next year's Draft Templates, one per unit, after showing exactly what will happen.
+function BudgetPublishModal({ model, rollup, grants, costCenters, budgets, budgetGroups, isAdmin, whoami, setBudgets, setCostCenters, setTrash, logActivity, onChange, onClose }) {
+  const [createCC, setCreateCC] = useState(true);
+  const [overwrite, setOverwrite] = useState(false);
+  const [anyway, setAnyway] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const plan = useMemo(() => planToolPublish({ model, rollup, budgets, grants, costCenters, budgetGroups, opts: { createCostCenters: createCC, overwriteEdited: overwrite, publishAnyway: anyway } }), [model, rollup, budgets, grants, costCenters, budgetGroups, createCC, overwrite, anyway]);
+  const drafts = toolPublishedDrafts(model, budgets);
+  const doing = plan.counts.create + plan.counts.update;
+  const ownerText = (i) => {
+    if (i.newCostCenter) return `new cost center: ${i.newCostCenter.name}`;
+    const g = i.grantId ? grants.find((x) => x.id === i.grantId) : null;
+    if (g) return `${g.programCode ? g.programCode + " " : ""}${g.title}`.trim();
+    const c = i.costCenterId ? costCenters.find((x) => x.id === i.costCenterId) : null;
+    return c ? c.name : "Unknown owner";
+  };
+  const chip = (i) => (i.action === "create" ? <ToolChip text="New draft" tone="teal" /> : i.action === "update" ? <ToolChip text="Update draft" tone="amber" /> : i.action === "unchanged" ? <ToolChip text="Up to date" tone="gray" /> : <ToolChip text="Skipped" tone="gray" />);
+  const hasDupes = plan.items.some((i) => i.dupeId);
+  const hasEdited = plan.items.some((i) => i.edited);
+
+  const publish = () => {
+    if (!isAdmin) { notify("Only admins can publish."); return; }
+    const stamp = new Date().toISOString();
+    if (plan.newCostCenters.length) setCostCenters((prev) => [...prev, ...plan.newCostCenters.filter((c) => !prev.some((x) => x.id === c.id))]);
+    setBudgets((prev) => applyToolPublish(plan, model, prev, [], { by: whoami, now: new Date(stamp) }).budgets);
+    onChange((m) => ({ ...m, publishedAt: stamp, publishedBy: whoami || "" }));
+    logActivity?.("Budget tool", "Published", `${model.title}: ${plan.counts.create} new, ${plan.counts.update} updated draft Templates`);
+    notify(`Published ${plan.counts.create} new and updated ${plan.counts.update} draft Template${doing === 1 ? "" : "s"}${plan.newCostCenters.length ? `, and created ${plan.newCostCenters.length} cost center${plan.newCostCenters.length === 1 ? "" : "s"}` : ""}.`, "info");
+    onClose();
+  };
+  const removeDrafts = () => {
+    if (!isAdmin) return;
+    drafts.forEach((b) => pushTrash(setTrash, "budget", b, whoami));
+    setBudgets((prev) => prev.filter((b) => !(b.toolModelId === model.id && b.status === "Draft")));
+    onChange((m) => { const n = { ...m }; delete n.publishedAt; delete n.publishedBy; return n; });
+    logActivity?.("Budget tool", "Removed drafts", `${model.title}: ${drafts.length} draft Templates`);
+    notify(`Removed ${drafts.length} draft Template${drafts.length === 1 ? "" : "s"}. They can be restored from Trash.`, "info");
+    onClose();
+  };
+
+  return (
+    <Modal title="Publish draft Templates" onClose={onClose} size="xl">
+      <div className="space-y-4">
+        <p className="text-sm" style={{ color: "#5B6B66" }}>
+          Creates one Draft Template for calendar {model.fy} from each unit's figures, with plan only and no actuals. Nothing is linked to a Grant Budget and nothing counts in Org Budget until you choose (Org Budget has a switch for drafts from the Budget tool). Drafts you've activated, or edited by hand, are never overwritten unless you say so.
+        </p>
+        {!isAdmin && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBF3E4", borderColor: "#E9D5A8", color: "#6B4700" }}>Only admins can publish. You can look at what would happen.</div>}
+
+        <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm" style={{ color: "#1C2624" }}>
+          <label className="flex items-center gap-2"><input type="checkbox" aria-label="Create cost centers for units with no owner" checked={createCC} onChange={(e) => setCreateCC(e.target.checked)} /> Create a cost center for units GrantFlow doesn't have, so their drafts aren't "Unknown owner"</label>
+          {hasDupes && <label className="flex items-center gap-2"><input type="checkbox" aria-label="Publish where a Template for that year already exists" checked={anyway} onChange={(e) => setAnyway(e.target.checked)} /> Also publish where the owner already has a {model.fy} Template (adds a second one)</label>}
+          {hasEdited && <label className="flex items-center gap-2"><input type="checkbox" aria-label="Overwrite drafts edited by hand" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} /> Overwrite drafts that were edited by hand</label>}
+        </div>
+
+        <div className="text-sm" style={{ color: "#1C2624" }}>
+          <b>{plan.counts.create}</b> new draft{plan.counts.create === 1 ? "" : "s"}, <b>{plan.counts.update}</b> to update, {plan.counts.unchanged} already up to date, {plan.counts.skip} skipped{plan.newCostCenters.length ? `, ${plan.newCostCenters.length} new cost center${plan.newCostCenters.length === 1 ? "" : "s"}` : ""}.
+        </div>
+
+        <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "45vh" }}>
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 z-10">
+              <tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+                <th className="px-3 py-2 font-normal">Unit</th><th className="px-3 py-2 font-normal">What happens</th><th className="px-3 py-2 font-normal">Owner</th>
+                <th className="px-3 py-2 font-normal text-right">Revenue</th><th className="px-3 py-2 font-normal text-right">Expense</th>
+              </tr>
+            </thead>
+            <tbody>
+              {plan.items.map((i) => (
+                <tr key={i.unitId} className="border-t align-top" style={{ borderColor: "#EEF0EC", opacity: i.action === "skip" || i.action === "unchanged" ? 0.7 : 1 }}>
+                  <td className="px-3 py-2" style={{ color: "#1C2624" }}>{i.name}<div className="text-xs" style={{ color: "#8A8F87" }}>{i.group}</div></td>
+                  <td className="px-3 py-2">{chip(i)}{i.reason && <div className="text-xs mt-1" style={{ color: "#5B6B66" }}>{i.reason}</div>}{i.warnings.map((w, k) => <div key={k} className="text-xs mt-1" style={{ color: "#8A5A00" }}>{w}</div>)}</td>
+                  <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>{ownerText(i)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{i.lines.length ? fmt(i.revenue) : "—"}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{i.lines.length ? fmt(i.expense) : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            {drafts.length > 0 && !confirmRemove && <button onClick={() => setConfirmRemove(true)} disabled={!isAdmin} className="text-sm px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#B5443A", opacity: isAdmin ? 1 : 0.5 }}>Remove the {drafts.length} published draft{drafts.length === 1 ? "" : "s"}…</button>}
+            {confirmRemove && (
+              <span className="text-sm" style={{ color: "#B5443A" }}>Remove {drafts.length} draft Template{drafts.length === 1 ? "" : "s"} (still in Draft)? They go to Trash.{" "}
+                <button onClick={removeDrafts} className="px-2 py-1 rounded-md border mx-1" style={{ borderColor: "#B5443A" }}>Remove them</button>
+                <button onClick={() => setConfirmRemove(false)} className="px-2 py-1 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Keep</button>
+              </span>
+            )}
+          </div>
+          <div className="flex gap-2">
+            <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+            <button onClick={publish} disabled={!isAdmin || doing === 0} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#2F6F53", opacity: !isAdmin || doing === 0 ? 0.5 : 1 }}>{doing === 0 ? "Nothing to publish" : `Publish ${doing} draft${doing === 1 ? "" : "s"}`}</button>
+          </div>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -8366,6 +8650,8 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const [scope, setScope] = useState("all"); // all | a budget group id
   const [viewMode, setViewMode] = useState("monthly");
   const [dataMode, setDataMode] = useState("plan");
+  const [includeDrafts, setIncludeDrafts] = useState(false); // next-year drafts from the Budget tool
+  const toolDraftCount = budgets.filter((b) => b.budgetType === "Template" && b.status === "Draft" && b.toolModelId).length;
 
   const deferredRevenueGroupId = useMemo(
     () => (budgetGroups || []).find((bg) => bg.name?.trim().toLowerCase() === "deferred revenue")?.id || null,
@@ -8396,7 +8682,7 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const scopedBudgets = (scope === "all"
     ? budgets.filter((b) => !(b.grantId && excludedGrantIds?.has(b.grantId)) && !(b.costCenterId && excludedCcIds?.has(b.costCenterId)))
     : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCostCenterIds.has(b.costCenterId)))
-  ).filter((b) => isActiveBudget(b.status) && b.budgetType === "Template");
+  ).filter((b) => isOrgBudgetIncluded(b, includeDrafts));
 
   // Real calendar years actually touched by any in-scope budget's period, so the
   // year picker reflects reality even when grants run off the calendar year.
@@ -8641,7 +8927,16 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
             </select>
           </Field>
         )}
+        {toolDraftCount > 0 && (
+          <label className="flex items-end gap-2 text-sm pb-2" style={{ color: "#1C2624" }}>
+            <input type="checkbox" aria-label="Include next-year drafts" checked={includeDrafts} onChange={(e) => setIncludeDrafts(e.target.checked)} />
+            Include next-year drafts from the Budget tool ({toolDraftCount})
+          </label>
+        )}
       </div>
+      {includeDrafts && toolDraftCount > 0 && (
+        <p className="text-xs" style={{ color: "#8A8F87" }}>Drafts from the Budget tool are included as plan only. In Actual view their months still show the run-rate projection, as for any later budget.</p>
+      )}
       <p className="text-xs" style={{ color: "#8A8F87" }}>
         Only budgets marked as budget type "Template" are included here — the "Grant Budget" version sent to a grantor doesn't affect this rollup.
       </p>
@@ -13678,8 +13973,8 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
         ) : tab === "budgettool" ? (
           <BudgetToolView
             models={budgetModels} setModels={setBudgetModels}
-            grants={grants} budgets={budgets} costCenters={costCenters} staff={staff}
-            whoami={currentUserEmail || whoami} setTrash={setTrash} canEdit={canEdit} logActivity={logActivity}
+            grants={grants} budgets={budgets} setBudgets={setBudgets} costCenters={costCenters} setCostCenters={setCostCenters} budgetGroups={budgetGroups} staff={staff}
+            whoami={currentUserEmail || whoami} setTrash={setTrash} canEdit={canEdit} isAdmin={isAdmin} logActivity={logActivity}
           />
         ) : tab === "burn-rate" ? (
           <BurnRateView grants={grants} budgets={budgets} />
