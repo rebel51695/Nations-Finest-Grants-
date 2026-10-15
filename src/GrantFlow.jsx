@@ -162,7 +162,8 @@ function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
   const results = [];
   linkedIds.forEach((targetId) => {
     const target = allBudgets.find((b) => b.id === targetId);
-    if (!target || !target.periodStart || !target.periodEnd) return;
+    // A Template is where actuals come from; it is never written to by another Template's sync.
+    if (!target || target.budgetType === "Template" || !target.periodStart || !target.periodEnd) return;
 
     const targetCols = monthColumnsForBudget(target.periodStart, target.periodEnd);
     const targetColIndexByYM = {};
@@ -523,7 +524,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.7.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -2535,12 +2536,13 @@ function BudgetModal({ budget, grantId, costCenterId, canEdit = true, onSave, on
                 if (!(b.grantId === form.grantId || b.costCenterId === form.costCenterId)) return false;
                 const isLinkable = b.status === "Draft" || b.status === "Active" || b.status === "Closed";
                 const alreadyLinked = (form.linkedBudgetIds || []).includes(b.id);
+                if (b.budgetType === "Template") return alreadyLinked; // a Template is a source, never a destination; shown only so an old link can be removed
                 return isLinkable || alreadyLinked; // keep a since-changed link visible so it can still be unlinked
               })}
               selectedIds={form.linkedBudgetIds || []}
               onChange={(ids) => setForm({ ...form, linkedBudgetIds: ids })}
               placeholder="Select budgets to link…"
-              renderLabel={(b) => `${b.title || "Untitled budget"} (${b.fy}${b.budgetType ? `, ${budgetTypeLabel(b.budgetType)}` : ""})`}
+              renderLabel={(b) => `${b.title || "Untitled budget"} (${b.fy}${b.budgetType ? `, ${budgetTypeLabel(b.budgetType)}` : ""})${b.budgetType === "Template" ? " - a Template: unlink this" : ""}`}
             />
           </Field>
           <p className="text-xs mt-1" style={{ color: "#8A8F87" }}>
@@ -3668,6 +3670,7 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
   const [overviewStatusFilter, setOverviewStatusFilter] = useState("Active");
   const [exportingBudgetsOverview, setExportingBudgetsOverview] = useState(false);
   const [showExcelImport, setShowExcelImport] = useState(false);
+  const [showActuals, setShowActuals] = useState(false);
 
   const grant = grants.find((g) => g.id === selectedGrantId);
   const costCenter = costCenters.find((c) => c.id === selectedCostCenterId);
@@ -3925,6 +3928,11 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
       <div className="flex items-center justify-between">
         <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Budgets</h1>
         <div className="flex items-center gap-2">
+          {canEdit && (
+            <button onClick={() => setShowActuals(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+              <Upload size={16} /> Upload monthly actuals
+            </button>
+          )}
           {canEdit && (
             <button onClick={() => setShowExcelImport(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
               <Upload size={16} /> Import Excel Template
@@ -4224,6 +4232,16 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
           setBudgets={setBudgets}
           logActivity={logActivity}
           onClose={() => setShowExcelImport(false)}
+        />
+      )}
+      {showActuals && (
+        <MonthlyActualsModal
+          grants={grants}
+          costCenters={costCenters}
+          budgets={budgets}
+          setBudgets={setBudgets}
+          logActivity={logActivity}
+          onClose={() => setShowActuals(false)}
         />
       )}
     </div>
@@ -5752,6 +5770,7 @@ function parseSageByColumnExport(aoa) {
   }
 
   const rows = [];
+  const totals = {}; // the file's own "Total Revenue" / "Total Expenditures" per column
   let section = "";
   let inKind = false;
   for (let i = h + 3; i < aoa.length; i++) {
@@ -5764,11 +5783,15 @@ function parseSageByColumnExport(aoa) {
     let any = false;
     columns.forEach((col) => { const v = cell(i, col.index); if (typeof v === "number") { values[col.index] = v; any = true; } });
     if (!any) { if (!/^created on/i.test(label)) section = label; continue; } // a heading row
+    if (/^total (revenue|expenditures)$/i.test(label)) {
+      const kind = /revenue/i.test(label) ? "revenue" : "expense";
+      columns.forEach((col) => { if (typeof values[col.index] === "number") (totals[col.index] = totals[col.index] || {})[kind] = values[col.index]; });
+    }
     if (/^total\b/i.test(label) || /^changes in net income/i.test(label) || /^net income/i.test(label)) continue;
     const code = (label.match(/^(\d{3,4}[A-Za-z]*)\s*-/) || [])[1] || "";
     rows.push({ label, code, section, values });
   }
-  return { columns, month, project, projectCode, asOf, rows };
+  return { columns, month, project, projectCode, asOf, rows, totals };
 }
 
 let _toolAccountByName = null;
@@ -5870,6 +5893,19 @@ function toolApplySageImport(model, assignments, parsed, monthKey, budgets) {
     imports[unitId] = { ...(imports[unitId] || {}), [monthKey]: lines };
   });
   return { ...model, imports };
+}
+
+// Several monthly exports at once (up to a full year). Columns are matched to
+// units by their heading, not their position, so files can differ in column order.
+//   files: [{ parsed, monthKey }]   assignByLabel: normalized heading -> unit id
+function toolApplySageFiles(model, files, assignByLabel, budgets) {
+  let next = model;
+  files.forEach((f) => {
+    const assignments = {};
+    f.parsed.columns.forEach((c) => { const u = assignByLabel[toolNorm(c.label)]; if (u) assignments[c.index] = u; });
+    next = toolApplySageImport(next, assignments, f.parsed, f.monthKey, budgets);
+  });
+  return next;
 }
 
 // ---------------------------------------------------------------------------
@@ -6766,119 +6802,129 @@ function BudgetAddUnitModal({ model, grants, costCenters, budgets, onChange, onC
   );
 }
 
-// Import one month of a Sage profit and loss export that has a column per project
-// or location, and say which unit each column is.
+// Import monthly Sage exports (one file per month, up to a full year) that have a
+// column per project or location, and say which unit each column is. Columns are
+// matched by heading, so the same choice applies to every file.
 function BudgetSageImportModal({ model, budgets, onImport, onClose }) {
-  const [parsed, setParsed] = useState(null);
+  const [files, setFiles] = useState([]); // [{ id, name, parsed, monthIndex, year, error }]
+  const [assign, setAssign] = useState({}); // normalized column heading -> unit id
   const [error, setError] = useState("");
-  const [fileName, setFileName] = useState("");
-  const [assign, setAssign] = useState({});
-  const [year, setYear] = useState("");
-  const [monthIndex, setMonthIndex] = useState(0);
 
-  const readFile = async (file) => {
+  const readFiles = async (list) => {
     setError("");
-    setParsed(null);
-    try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: "array", cellDates: true });
-      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: null });
-      const p = parseSageByColumnExport(aoa);
-      if (p.error) { setError(p.error); return; }
-      if (p.rows.length === 0) { setError("No account rows were found in this file."); return; }
-      const a = {};
-      p.columns.forEach((c) => { a[c.index] = toolGuessUnitForColumn(c.label, model.units, p.projectCode) || ""; });
-      setAssign(a);
-      setYear(p.month && p.month.year ? String(p.month.year) : String(model.fy - 1));
-      setMonthIndex(p.month ? p.month.monthIndex : 0);
-      setFileName(file.name);
-      setParsed(p);
-    } catch (e) {
-      setError("Couldn't read that file: " + (e.message || e));
+    const out = [];
+    for (const file of list) {
+      try {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: "array", cellDates: true });
+        const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: null });
+        const p = parseSageByColumnExport(aoa);
+        if (p.error) { out.push({ id: uid(), name: file.name, error: p.error }); continue; }
+        if (p.rows.length === 0) { out.push({ id: uid(), name: file.name, error: "No account rows were found in this file." }); continue; }
+        out.push({ id: uid(), name: file.name, parsed: p, monthIndex: p.month ? p.month.monthIndex : 0, year: p.month && p.month.year ? String(p.month.year) : String(model.fy - 1), yearKnown: !!(p.month && p.month.year) });
+      } catch (e) {
+        out.push({ id: uid(), name: file.name, error: "Couldn't read that file: " + (e.message || e) });
+      }
     }
+    const good = out.filter((f) => f.parsed);
+    if (good.length === 0 && out.length > 0) setError(out[0].error);
+    const a = {};
+    good.forEach((f) => f.parsed.columns.forEach((c) => {
+      const k = toolNorm(c.label);
+      if (!(k in a)) a[k] = toolGuessUnitForColumn(c.label, model.units, f.parsed.projectCode) || "";
+    }));
+    setAssign(a);
+    setFiles(out);
   };
 
+  const good = files.filter((f) => f.parsed);
+  const bad = files.filter((f) => f.error);
+  // One row per distinct column heading across all the files.
+  const labels = [];
+  good.forEach((f) => f.parsed.columns.forEach((c) => { const k = toolNorm(c.label); if (!labels.find((l) => l.key === k)) labels.push({ key: k, label: c.label }); }));
+  const monthKeyOf = (f) => `${f.year}-${String(f.monthIndex + 1).padStart(2, "0")}`;
+  const setFile = (id, patch) => setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+
   const info = useMemo(() => {
-    if (!parsed) return {};
     const out = {};
-    parsed.columns.forEach((c) => {
-      const u = (model.units || []).find((x) => x.id === assign[c.index]);
-      out[c.index] = toolSageColumnLines(parsed, c.index, u ? toolDescriptionIndex(u, budgets) : {});
+    good.forEach((f) => {
+      out[f.id] = {};
+      f.parsed.columns.forEach((c) => {
+        const u = (model.units || []).find((x) => x.id === assign[toolNorm(c.label)]);
+        out[f.id][c.index] = toolSageColumnLines(f.parsed, c.index, u ? toolDescriptionIndex(u, budgets) : {});
+      });
     });
     return out;
-  }, [parsed, assign, model.units, budgets]);
+  }, [files, assign, model.units, budgets]);
 
-  const chosen = parsed ? parsed.columns.filter((c) => assign[c.index]) : [];
-  const yearNum = Number(year);
-  const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
-  const duplicates = chosen.filter((c) => ((model.imports || {})[assign[c.index]] || {})[monthKey]);
-  const lost = chosen.reduce((s, c) => s + info[c.index].unmapped.length, 0);
-  const sameUnit = chosen.some((c, i) => chosen.findIndex((d) => assign[d.index] === assign[c.index]) !== i);
-  const canImport = chosen.length > 0 && Number.isInteger(yearNum) && yearNum > 2000 && !sameUnit;
+  const chosenLabels = labels.filter((l) => assign[l.key]);
+  const unitsChosen = chosenLabels.map((l) => assign[l.key]);
+  const sameUnit = unitsChosen.some((u, i) => unitsChosen.indexOf(u) !== i);
+  const monthKeys = good.map(monthKeyOf);
+  const dupMonths = monthKeys.filter((k, i) => monthKeys.indexOf(k) !== i);
+  const badYear = good.some((f) => !(Number.isInteger(Number(f.year)) && Number(f.year) > 2000));
+  const lost = good.reduce((n, f) => n + f.parsed.columns.filter((c) => assign[toolNorm(c.label)]).reduce((m, c) => m + info[f.id][c.index].unmapped.length, 0), 0);
+  const replaced = [];
+  good.forEach((f) => f.parsed.columns.forEach((c) => { const u = assign[toolNorm(c.label)]; if (u && ((model.imports || {})[u] || {})[monthKeyOf(f)]) replaced.push(`${c.label} ${MONTHS[f.monthIndex]} ${f.year}`); }));
+  const canImport = good.length > 0 && chosenLabels.length > 0 && !sameUnit && dupMonths.length === 0 && !badYear;
 
   const run = () => {
-    const clean = {};
-    chosen.forEach((c) => { clean[c.index] = assign[c.index]; });
-    const next = toolApplySageImport(model, clean, parsed, monthKey, budgets);
-    onImport(next, `Imported ${MONTHS[monthIndex]} ${year} for ${chosen.length} unit${chosen.length === 1 ? "" : "s"}.`);
+    const next = toolApplySageFiles(model, good.map((f) => ({ parsed: f.parsed, monthKey: monthKeyOf(f) })), assign, budgets);
+    const summary = good.length === 1
+      ? `Imported ${MONTHS[good[0].monthIndex]} ${good[0].year} for ${chosenLabels.length} unit${chosenLabels.length === 1 ? "" : "s"}.`
+      : `Imported ${good.length} months for ${chosenLabels.length} unit${chosenLabels.length === 1 ? "" : "s"}.`;
+    onImport(next, summary);
   };
 
   return (
-    <Modal title="Import a Sage export" onClose={onClose} size="xl">
+    <Modal title="Import Sage exports" onClose={onClose} size="xl">
       <div className="space-y-4">
         <p className="text-sm" style={{ color: "#5B6B66" }}>
-          Use a Sage profit and loss report with one column per project or location, for one month. Each import fills that month for the units you choose; import more months to build the year. Months you don't import are filled with each account's average.
+          Use the Sage profit and loss report with one column per project or location, run for one month. Choose one file or up to twelve at once, one per month. Months you don't import are filled with each account's average.
         </p>
         <div>
           <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-            <Upload size={15} /> {parsed ? "Choose a different file" : "Choose an Excel file"}
-            <input aria-label="Sage export file" type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) readFile(f); e.target.value = ""; }} />
+            <Upload size={15} /> {files.length ? "Choose different files" : "Choose Excel files"}
+            <input aria-label="Sage export file" type="file" multiple accept=".xlsx,.xls" className="hidden" onChange={(e) => { const f = e.target.files ? Array.from(e.target.files) : []; if (f.length) readFiles(f); e.target.value = ""; }} />
           </label>
-          {fileName && <span className="ml-3 text-sm" style={{ color: "#5B6B66" }}>{fileName}</span>}
+          {files.length > 0 && <span className="ml-3 text-sm" style={{ color: "#5B6B66" }}>{files.length} file{files.length === 1 ? "" : "s"}</span>}
         </div>
         {error && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{error}</div>}
+        {bad.length > 0 && !error && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{bad.map((f) => `${f.name}: ${f.error}`).join(" ")}</div>}
 
-        {parsed && (
+        {good.length > 0 && (
           <>
-            <div className="flex flex-wrap items-center gap-3 text-sm" style={{ color: "#1C2624" }}>
-              <span>This file is for</span>
-              <select aria-label="Month" className="rounded-md border px-2 py-1.5 text-sm" style={inputStyle} value={monthIndex} onChange={(e) => setMonthIndex(Number(e.target.value))}>
-                {MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}
-              </select>
-              <input aria-label="Year" type="number" className="rounded-md border px-2 py-1.5 text-sm w-24" style={inputStyle} value={year} onChange={(e) => setYear(e.target.value)} />
-              {!(parsed.month && parsed.month.year) && <ToolChip text="Year not in the file; check it" tone="amber" />}
-            </div>
-
-            <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "40vh" }}>
+            <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "28vh" }}>
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
-                    <th className="px-3 py-2 font-normal">Column in the file</th>
-                    <th className="px-3 py-2 font-normal">Unit</th>
-                    <th className="px-3 py-2 font-normal text-right">Expense</th>
-                    <th className="px-3 py-2 font-normal text-right">Revenue</th>
+                    <th className="px-3 py-2 font-normal">File</th>
+                    <th className="px-3 py-2 font-normal">Month</th>
+                    <th className="px-3 py-2 font-normal text-right">Expense (chosen columns)</th>
                     <th className="px-3 py-2 font-normal">Rows</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {parsed.columns.map((c) => {
-                    const r = info[c.index];
-                    const rev = Object.values(r.lines).filter((l) => l.type === "revenue").reduce((s, l) => s + l.amount, 0);
+                  {good.map((f) => {
+                    const cols = f.parsed.columns.filter((c) => assign[toolNorm(c.label)]);
+                    const exp = cols.reduce((s, c) => s + info[f.id][c.index].expenseTotal, 0);
+                    const guessed = cols.reduce((s, c) => s + info[f.id][c.index].guessed, 0);
+                    const notPlaced = cols.reduce((s, c) => s + info[f.id][c.index].unmapped.length, 0);
                     return (
-                      <tr key={c.index} className="border-t" style={{ borderColor: "#EEF0EC" }}>
-                        <td className="px-3 py-2" style={{ color: "#1C2624" }}>{c.label}</td>
+                      <tr key={f.id} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                        <td className="px-3 py-2" style={{ color: "#1C2624" }}>{f.name}</td>
                         <td className="px-3 py-2">
-                          <select aria-label={`Unit for ${c.label}`} className="rounded-md border px-2 py-1 text-sm w-full" style={inputStyle} value={assign[c.index] || ""} onChange={(e) => setAssign({ ...assign, [c.index]: e.target.value })}>
-                            <option value="">Skip this column</option>
-                            {(model.units || []).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-                          </select>
+                          <div className="flex items-center gap-2">
+                            <select aria-label={`Month for ${f.name}`} className="rounded-md border px-2 py-1 text-sm" style={inputStyle} value={f.monthIndex} onChange={(e) => setFile(f.id, { monthIndex: Number(e.target.value) })}>
+                              {MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}
+                            </select>
+                            <input aria-label={`Year for ${f.name}`} type="number" className="rounded-md border px-2 py-1 text-sm w-20" style={inputStyle} value={f.year} onChange={(e) => setFile(f.id, { year: e.target.value })} />
+                            {!f.yearKnown && <ToolChip text="Year not in the file; check it" tone="amber" />}
+                          </div>
                         </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{assign[c.index] ? fmt(r.expenseTotal) : "—"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{assign[c.index] ? fmt(rev) : "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{cols.length ? fmt(exp) : "—"}</td>
                         <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>
-                          {assign[c.index] ? (
-                            <>{r.matched + r.guessed} placed{r.guessed > 0 && <> · <span style={{ color: "#8A5A00" }}>{r.guessed} guessed</span></>}{r.unmapped.length > 0 && <> · <span style={{ color: "#B5443A" }}>{r.unmapped.length} not placed</span></>}</>
-                          ) : ""}
+                          {cols.length ? <>{guessed > 0 && <span style={{ color: "#8A5A00" }}>{guessed} guessed</span>}{guessed > 0 && notPlaced > 0 && " · "}{notPlaced > 0 && <span style={{ color: "#B5443A" }}>{notPlaced} not placed</span>}{guessed === 0 && notPlaced === 0 && "all placed"}</> : ""}
                         </td>
                       </tr>
                     );
@@ -6887,18 +6933,652 @@ function BudgetSageImportModal({ model, budgets, onImport, onClose }) {
               </table>
             </div>
 
-            {parsed.columns.some((c) => !assign[c.index] && /all|total/i.test(c.label)) && (
+            <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "30vh" }}>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+                    <th className="px-3 py-2 font-normal">Column in the files</th>
+                    <th className="px-3 py-2 font-normal">Unit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {labels.map((l) => (
+                    <tr key={l.key} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                      <td className="px-3 py-2" style={{ color: "#1C2624" }}>{l.label}</td>
+                      <td className="px-3 py-2">
+                        <select aria-label={`Unit for ${l.label}`} className="rounded-md border px-2 py-1 text-sm w-full" style={inputStyle} value={assign[l.key] || ""} onChange={(e) => setAssign({ ...assign, [l.key]: e.target.value })}>
+                          <option value="">Skip this column</option>
+                          {(model.units || []).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {labels.some((l) => !assign[l.key] && /all|total/i.test(l.label)) && (
               <p className="text-xs" style={{ color: "#8A8F87" }}>Columns that add other columns together (marked "All") are skipped automatically so nothing counts twice.</p>
             )}
             {sameUnit && <div className="text-sm" style={{ color: "#B5443A" }}>Two columns are set to the same unit. Pick a different unit for one of them, or skip it.</div>}
+            {dupMonths.length > 0 && <div className="text-sm" style={{ color: "#B5443A" }}>Two files are set to the same month ({[...new Set(dupMonths)].map((k) => `${MONTHS[Number(k.slice(5, 7)) - 1]} ${k.slice(0, 4)}`).join(", ")}). Change the month on one of them.</div>}
             {lost > 0 && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBF3E4", borderColor: "#E9D5A8", color: "#6B4700" }}>{lost} row{lost === 1 ? "" : "s"} with money couldn't be matched to an account and will be left out.</div>}
-            {duplicates.length > 0 && <div className="text-sm" style={{ color: "#8A5A00" }}>{MONTHS[monthIndex]} {year} was already imported for {duplicates.map((c) => c.label).join(", ")}. Importing again replaces it.</div>}
+            {replaced.length > 0 && <div className="text-sm" style={{ color: "#8A5A00" }}>Already imported, so importing again replaces it: {replaced.slice(0, 4).join(", ")}{replaced.length > 4 ? `, and ${replaced.length - 4} more` : ""}.</div>}
           </>
         )}
 
         <div className="flex justify-end gap-2">
           <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-          <button onClick={run} disabled={!canImport} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B", opacity: canImport ? 1 : 0.5 }}>Import {chosen.length > 0 ? `${chosen.length} column${chosen.length === 1 ? "" : "s"}` : ""}</button>
+          <button onClick={run} disabled={!canImport} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B", opacity: canImport ? 1 : 0.5 }}>
+            {good.length > 1 ? `Import ${good.length} files` : `Import ${chosenLabels.length > 0 ? `${chosenLabels.length} column${chosenLabels.length === 1 ? "" : "s"}` : ""}`}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ===========================================================================
+// Monthly actuals upload: put one month of a Sage profit and loss export (one
+// column per project or location) onto the Templates, line by line.
+// Plain calculation, no screens, so it can be tested against real data.
+// ===========================================================================
+
+// The part of a Sage row label that names the line:
+// "5211--Asst. Site Director" -> "Asst. Site Director".
+function actualsRowName(row) {
+  return String(row.label || "").replace(/^\d{3,4}[A-Za-z]*\s*-+\s*/, "").trim();
+}
+
+// Words that mean the same thing in a position name, so "Supervising CM" can be
+// recognised as "Supervising Case Manager" when suggesting a line.
+const ACTUALS_ABBREV = { dir: "director", mgr: "manager", asst: "assistant", acct: "accounting", cm: "case manager", admin: "administrator", coord: "coordinator", spec: "specialist", sr: "senior", hc: "health care", healthcare: "health care", ehr: "electronic health record" };
+function actualsNameTokens(s) {
+  return toolNorm(s).split(" ").filter(Boolean).flatMap((t) => (ACTUALS_ABBREV[t] || t).split(" "));
+}
+// 0 to 1: how alike two names are.
+function actualsNameScore(a, b) {
+  const x = new Set(actualsNameTokens(a));
+  const y = new Set(actualsNameTokens(b));
+  if (x.size === 0 || y.size === 0) return 0;
+  let both = 0;
+  x.forEach((t) => { if (y.has(t)) both += 1; });
+  return both / (x.size + y.size - both);
+}
+// What identifies a Sage row from month to month: its account number when it has one.
+function actualsRowKey(row) {
+  return row.code ? row.code : `n:${toolNorm(row.label)}`;
+}
+
+// Where each row of one export column goes on a Template. Existing lines are
+// always used before new ones are made. For each row, in order:
+//   1. the line you chose for it, or the line that remembers it (by Sage's account
+//      number, learned from an earlier upload)
+//   2. a line with the same name
+//   3. a line of the same account that already holds exactly this month's figure
+//      (how your own position names get linked to Sage's the first time)
+//   4. what is left: a single unclaimed line of that account takes all of it (a
+//      "Fringe" line for all benefits); else the account's blank line; else a custom
+//      "in totality" line; else a new line, so no dollar is ever dropped
+// overrides: { [rowKey]: lineId | "new" } choices made on the preview screen.
+function planActualsForTemplate(parsed, colIndex, template, monthCol, overrides) {
+  const lines = (template.lines || []).filter((l) => l.type === "revenue" || l.type === "expense");
+  const known = toolKnownAccounts();
+  const isStandard = (l) => !!known[`${l.category}|||${l.subcategory || ""}`];
+  const acctKey = (c, s) => `${c}|||${s || ""}`;
+  const cur = (l) => (monthCol >= 0 ? Number((l.actuals || [])[monthCol]) || 0 : 0);
+  const ov = overrides || {};
+
+  const byAccount = {};
+  const customByCategory = {};
+  const customByName = {};
+  lines.forEach((l) => {
+    (byAccount[acctKey(l.category, l.subcategory)] = byAccount[acctKey(l.category, l.subcategory)] || []).push(l);
+    if (!isStandard(l)) {
+      (customByCategory[l.category] = customByCategory[l.category] || []).push(l);
+      const n = toolNorm(l.subcategory);
+      if (n && !customByName[n]) customByName[n] = l;
+    }
+  });
+  const descIndex = {};
+  lines.forEach((l) => { const n = toolNorm(l.description); if (n && isStandard(l) && !descIndex[n]) descIndex[n] = { category: l.category, subcategory: l.subcategory || "", type: l.type }; });
+
+  // Every row with money, and the account it belongs to.
+  const items = [];
+  const unplaced = [];
+  parsed.rows.forEach((row) => {
+    const v = row.values[colIndex];
+    if (typeof v !== "number") return;
+    let target = toolMapSageRow(row, descIndex);
+    if (!target) {
+      const c = customByName[toolNorm(actualsRowName(row))];
+      if (c) target = { category: c.category, subcategory: c.subcategory || "", type: c.type };
+    }
+    if (!target || (target.type !== "revenue" && target.type !== "expense")) {
+      if (Math.abs(v) > 0.005) unplaced.push({ label: row.label, amount: v });
+      return;
+    }
+    const name = actualsRowName(row);
+    items.push({ row, v, target, name, n: toolNorm(name), key: actualsRowKey(row), isPosition: /^(5000|5900)\b/.test(target.subcategory), line: null, kind: "" });
+  });
+  const sameAccount = (l, t) => l.category === t.category && (l.subcategory || "") === t.subcategory;
+
+  // Pass 1: chosen, remembered, same name.
+  const claimed = {};
+  const claim = (it, line, kind) => { it.line = line; it.kind = kind; claimed[line.id] = true; };
+  items.forEach((it) => {
+    const chosen = ov[it.key];
+    if (chosen && chosen !== "new") { const l = lines.find((x) => x.id === chosen); if (l) { claim(it, l, "chosen"); return; } }
+    if (chosen === "new") { it.forceNew = true; return; }
+    if (it.row.code) { const l = lines.find((x) => x.sageAccount === it.key && x.category === it.target.category); if (l) { claim(it, l, "remembered"); return; } }
+    else { const l = lines.find((x) => x.sageAccount === it.key); if (l) { claim(it, l, "remembered"); return; } }
+    if (it.n) {
+      const byName = lines.find((l) => toolNorm(l.description) === it.n && sameAccount(l, it.target))
+        || lines.find((l) => !isStandard(l) && toolNorm(l.subcategory) === it.n && l.category === it.target.category);
+      if (byName) claim(it, byName, "name");
+    }
+  });
+  // Pass 2: a line of the same account that already holds this month's figure
+  // (exactly, then to within a dollar of rounding), as long as only one line and
+  // one row could be meant.
+  const amountPass = (rel) => items.forEach((it) => {
+    if (it.line || it.forceNew || Math.abs(it.v) < 0.005) return;
+    // a rounding difference is a small fraction of the figure, never a few dollars on a small one
+    const tol = rel ? Math.min(1.01, Math.max(0.005, Math.abs(it.v) * 0.001)) : 0.005;
+    const same = items.filter((o) => !o.line && !o.forceNew && o.target.subcategory === it.target.subcategory && o.target.category === it.target.category && Math.abs(o.v - it.v) < tol);
+    if (same.length !== 1) return;
+    const cands = lines.filter((l) => sameAccount(l, it.target) && !claimed[l.id] && Math.abs(cur(l) - it.v) < tol && Math.abs(cur(l)) > 0.005);
+    if (cands.length === 1) claim(it, cands[0], "amount");
+  });
+  amountPass(false);
+  amountPass(true);
+  // Pass 2b: a name that is clearly the same position written differently
+  // ("Supervising CM" and "Supervising Case Manager"), with no close second.
+  items.forEach((it) => {
+    if (it.line || it.forceNew || !it.isPosition || !it.n) return;
+    const scored = lines.filter((l) => sameAccount(l, it.target) && !claimed[l.id] && toolNorm(l.description)).map((l) => ({ l, sc: actualsNameScore(it.name, l.description) })).sort((x, y) => y.sc - x.sc);
+    if (scored.length && scored[0].sc >= 0.8 && (scored.length === 1 || scored[0].sc - scored[1].sc >= 0.2)) claim(it, scored[0].l, "name");
+  });
+  // Pass 3: what is left.
+  const leftByAccount = {};
+  items.forEach((it) => { if (!it.line && !it.forceNew) (leftByAccount[acctKey(it.target.category, it.target.subcategory)] = leftByAccount[acctKey(it.target.category, it.target.subcategory)] || []).push(it); });
+  Object.keys(leftByAccount).forEach((k) => {
+    const group = leftByAccount[k];
+    const acct = byAccount[k] || [];
+    const free = acct.filter((l) => !claimed[l.id]);
+    const blank = acct.find((l) => !toolNorm(l.description));
+    // A single free line takes everything only when nothing else in the account was matched
+    // (one "Fringe" line for all benefits); otherwise it could belong to someone else.
+    const anyMatched = acct.some((l) => claimed[l.id]);
+    group.forEach((it) => {
+      if (free.length === 1 && !anyMatched) claim(it, free[0], "account");
+      else if (blank) claim(it, blank, "account");
+      else if (acct.length > 0 && !it.isPosition) claim(it, acct[0], "account");
+      else if (acct.length === 0 && (customByCategory[it.target.category] || []).length === 1 && !it.isPosition) claim(it, customByCategory[it.target.category][0], "category");
+    });
+  });
+
+  // Totals per line and per new line.
+  const toLine = {};
+  const toNew = {};
+  const how = { chosen: 0, remembered: 0, name: 0, amount: 0, account: 0, category: 0, created: 0 };
+  let expenseTotal = 0, revenueTotal = 0, placedExpense = 0, placedRevenue = 0;
+  items.forEach((it) => {
+    if (it.target.type === "expense") expenseTotal += it.v; else revenueTotal += it.v;
+    if (it.line) {
+      const e = toLine[it.line.id] || (toLine[it.line.id] = { amount: 0, kinds: {}, keys: {}, label: it.line.description || it.line.subcategory });
+      e.amount += it.v; e.kinds[it.kind] = true; e.keys[it.key] = true;
+      how[it.kind] += 1;
+    } else {
+      const k = `${it.target.category}|||${it.target.subcategory}|||${it.isPosition ? it.n : ""}`;
+      const e = toNew[k] || (toNew[k] = { category: it.target.category, subcategory: it.target.subcategory, type: it.target.type, description: it.isPosition ? it.name : "", amount: 0, key: it.key, label: it.row.label });
+      e.amount += it.v;
+      how.created += 1;
+    }
+    if (it.target.type === "expense") placedExpense += it.v; else placedRevenue += it.v;
+  });
+
+  // The file is authoritative for every account it reports: lines of those
+  // accounts that no row reached are set to $0 for this month.
+  const touched = {};
+  items.forEach((it) => { touched[acctKey(it.target.category, it.target.subcategory)] = true; if (it.line) touched[acctKey(it.line.category, it.line.subcategory)] = true; });
+  const zeroed = lines.filter((l) => touched[acctKey(l.category, l.subcategory)] && !toLine[l.id] && Math.abs(cur(l)) > 0.005).map((l) => ({ lineId: l.id, label: l.description || l.subcategory, was: cur(l) }));
+
+  // What gets remembered: a line reached by exactly one Sage row, by a firm match.
+  const learned = [];
+  Object.keys(toLine).forEach((id) => {
+    const e = toLine[id];
+    const keys = Object.keys(e.keys);
+    const firm = Object.keys(e.kinds).every((k) => k === "name" || k === "amount" || k === "chosen" || k === "remembered");
+    if (keys.length === 1 && firm) learned.push({ lineId: id, key: keys[0] });
+  });
+
+  // Rows that would become new lines, with the lines they might really be.
+  const pending = Object.keys(toNew).map((k) => {
+    const e = toNew[k];
+    const cands = lines.filter((l) => l.category === e.category && (l.subcategory || "") === e.subcategory && !toLine[l.id])
+      .map((l) => ({ lineId: l.id, description: l.description || l.subcategory, current: cur(l), score: actualsNameScore(e.description || e.label, l.description) + (Math.abs(cur(l) - e.amount) < Math.max(1, Math.abs(e.amount) * 0.05) && cur(l) ? 0.5 : 0) }))
+      .sort((x, y) => y.score - x.score);
+    return { key: e.key, label: e.label, amount: e.amount, candidates: cands };
+  });
+
+  return {
+    toLine, toNew, unplaced, how, zeroed, learned, pending,
+    expenseTotal: toolRound2(expenseTotal), revenueTotal: toolRound2(revenueTotal),
+    placedExpense: toolRound2(placedExpense), placedRevenue: toolRound2(placedRevenue),
+  };
+}
+
+// Puts a plan's figures on the Template for one month column. Lines the export
+// reaches get its figures; lines of reported accounts that it doesn't reach go
+// to $0; new lines are added for rows with no home; matched lines remember the
+// Sage account they came from.
+function applyActualsPlan(template, plan, monthCol) {
+  const size = monthColumnsForBudget(template.periodStart, template.periodEnd).length;
+  const zero = {};
+  plan.zeroed.forEach((z) => { zero[z.lineId] = true; });
+  const learn = {};
+  plan.learned.forEach((x) => { learn[x.lineId] = x.key; });
+  const lines = (template.lines || []).map((l) => {
+    const hit = plan.toLine[l.id];
+    if (!hit && !zero[l.id]) return l;
+    const actuals = [...(l.actuals || Array(size).fill(0))];
+    while (actuals.length < size) actuals.push(0);
+    actuals[monthCol] = hit ? toolRound2(hit.amount) : 0;
+    return { ...l, actuals, ...(learn[l.id] ? { sageAccount: learn[l.id] } : {}) };
+  });
+  Object.values(plan.toNew).forEach((e) => {
+    const actuals = Array(size).fill(0);
+    actuals[monthCol] = toolRound2(e.amount);
+    lines.push({ ...newLine(size), category: e.category, type: e.type, subcategory: e.subcategory, description: e.description, amounts: Array(size).fill(0), actuals, ...(e.description ? { sageAccount: e.key } : {}) });
+  });
+  return { ...template, lines };
+}
+
+// Moves "actuals complete through" forward only when no month is left out: the
+// marker means every month up to it is real, so a gap must not be skipped over.
+function nextActualsThrough(template, year, monthIndex) {
+  const cols = monthColumnsForBudget(template.periodStart, template.periodEnd);
+  const idx = (y, m) => y * 12 + m;
+  const cur = parseActualsThrough(template.actualsThrough);
+  const here = idx(year, monthIndex);
+  const key = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+  if (cur && here <= idx(cur.year, cur.monthIndex)) return { value: template.actualsThrough, advanced: false, gap: [] };
+  const start = cur ? idx(cur.year, cur.monthIndex) + 1 : cols.length ? idx(cols[0].year, cols[0].monthIndex) : here;
+  if (here === start) return { value: key, advanced: true, gap: [] };
+  const gap = [];
+  for (let k = start; k < here; k++) gap.push(`${MONTHS[k % 12]} ${Math.floor(k / 12)}`);
+  return { value: template.actualsThrough || "", advanced: false, gap };
+}
+
+// Does what was placed add up to the file's own totals, with nothing left out?
+function tiesToFile(plan, totals) {
+  if (plan.unplaced.length > 0) return false;
+  if (!totals) return true;
+  const okExp = totals.expense === undefined || Math.abs(plan.placedExpense - totals.expense) < 0.5;
+  const okRev = totals.revenue === undefined || Math.abs(plan.placedRevenue - totals.revenue) < 0.5;
+  return okExp && okRev;
+}
+
+// The whole upload, as a dry run or for real: files in, updated budgets out.
+//   files:  [{ name, parsed, year, monthIndex }]
+//   assign: normalized column heading -> { templateId } | { create: { grantId, name } } | null
+//   replace: { [grantId]: [templateId, ...] }  Templates the new ones stand in for
+// Returns the new budgets list and a report line for every column of every file.
+function planMonthlyActualsUpload({ files, assign, budgets, replace, overrides }) {
+  const sorted = [...files].sort((a, b) => (a.year * 12 + a.monthIndex) - (b.year * 12 + b.monthIndex));
+  let working = budgets.map((b) => b);
+  const report = [];
+  const touched = {};
+  const created = {};
+  const createdIds = [];
+  const swap = replace || {};
+  const replacing = (grantId) => (swap[grantId] || []).length > 0;
+
+  // New Templates first (one per column heading), created empty for the year.
+  const firstYear = sorted.length ? sorted[0].year : new Date().getFullYear();
+  Object.keys(assign || {}).forEach((key) => {
+    const a = assign[key];
+    if (!a || !a.create) return;
+    const swapIds = swap[a.create.grantId] || [];
+    const linked = [...new Set(swapIds.flatMap((id) => { const t = working.find((b) => b.id === id); return t ? linkedIdsOf(t) : []; }))];
+    const t = {
+      id: uid(), grantId: a.create.grantId, costCenterId: "", title: `${a.create.name} — FY${firstYear} Template`,
+      fy: `FY${String(firstYear).slice(2)}`, periodStart: `${firstYear}-01-01`, periodEnd: `${firstYear}-12-31`,
+      status: replacing(a.create.grantId) ? "Active" : "Draft", budgetType: "Template",
+      linkedBudgetIds: replacing(a.create.grantId) ? linked : [], notes: "Created from a Sage monthly upload.",
+      approvedBy: "", approvedAt: "", rejectionReason: "", actualsThrough: "", sageColumn: key, lines: [],
+    };
+    created[key] = t.id;
+    createdIds.push(t.id);
+    working = [...working, t];
+  });
+
+  sorted.forEach((file) => {
+    file.parsed.columns.forEach((col) => {
+      const key = toolNorm(col.label);
+      const a = (assign || {})[key];
+      if (!a) return;
+      const templateId = a.create ? created[key] : a.templateId;
+      const template = working.find((b) => b.id === templateId);
+      if (!template) return;
+      const entry = { file: file.name, label: col.label, month: `${MONTHS[file.monthIndex]} ${file.year}`, templateId, title: template.title, created: !!a.create };
+      const cols = monthColumnsForBudget(template.periodStart, template.periodEnd);
+      const monthCol = cols.findIndex((c) => c.year === file.year && c.monthIndex === file.monthIndex);
+      if (monthCol < 0) { report.push({ ...entry, error: `${template.title} doesn't cover ${entry.month}.` }); return; }
+      const plan = planActualsForTemplate(file.parsed, col.index, template, monthCol, ((overrides || {})[templateId] || {}));
+      let next = applyActualsPlan(template, plan, monthCol);
+      const marker = nextActualsThrough(next, file.year, file.monthIndex);
+      // A Template is a source, never a destination: drop any link that points at another Template.
+      const linkIds = linkedIdsOf(next);
+      const goodLinks = linkIds.filter((id) => { const b = working.find((x) => x.id === id); return b && b.budgetType !== "Template"; });
+      const droppedLinks = linkIds.length - goodLinks.length;
+      next = { ...next, actualsThrough: marker.value, sageColumn: next.sageColumn || key, ...(droppedLinks ? { linkedBudgetIds: goodLinks, ...(next.linkedBudgetId ? { linkedBudgetId: "" } : {}) } : {}) };
+      working = working.map((b) => (b.id === next.id ? next : b));
+      touched[next.id] = true;
+      report.push({
+        ...entry, plan, marker, markerBefore: template.actualsThrough || "", droppedLinks,
+        newLines: Object.values(plan.toNew), unplaced: plan.unplaced, zeroed: plan.zeroed, pending: plan.pending,
+        fileTotals: (file.parsed.totals || {})[col.index] || null,
+        ties: tiesToFile(plan, (file.parsed.totals || {})[col.index]),
+      });
+    });
+  });
+
+  // Templates being stood in for are closed and stop feeding the Grant Budgets.
+  const closedIds = [];
+  Object.keys(swap).forEach((grantId) => {
+    if (!createdIds.some((id) => (working.find((b) => b.id === id) || {}).grantId === grantId)) return;
+    (swap[grantId] || []).forEach((id) => {
+      working = working.map((b) => (b.id === id ? { ...b, status: "Closed", linkedBudgetIds: [], ...(b.linkedBudgetId ? { linkedBudgetId: "" } : {}) } : b));
+      closedIds.push(id);
+    });
+  });
+
+  // Carry the new figures to the Grant Budgets each touched Template feeds.
+  const synced = [];
+  Object.keys(touched).forEach((id) => {
+    const t = working.find((b) => b.id === id);
+    if (!t) return;
+    const targets = syncActualsToLinkedBudgets(t, working);
+    targets.forEach((s) => { working = working.map((b) => (b.id === s.id ? s : b)); synced.push(s.id); });
+  });
+
+  return { budgets: working, report, changedIds: Object.keys(touched), createdIds, closedIds, syncedIds: [...new Set(synced)] };
+}
+
+// ---------------------------------------------------------------------------
+// Monthly actuals upload screen
+// ---------------------------------------------------------------------------
+
+// Upload the month's Sage profit and loss exports (one column per project or
+// location), say which Template each column feeds, check the totals, then update
+// every Template's actuals line by line.
+function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActivity, onClose }) {
+  const [files, setFiles] = useState([]); // [{ id, name, parsed, monthIndex, year, yearKnown, error }]
+  const [choice, setChoice] = useState({}); // normalized heading -> "" | "t:<templateId>" | "c:<unitId>"
+  const [standIn, setStandIn] = useState({}); // grantId -> true
+  const [overrides, setOverrides] = useState({}); // templateId -> rowKey -> lineId | "new"
+  const [allowLost, setAllowLost] = useState(false);
+  const [error, setError] = useState("");
+
+  const templates = useMemo(() => budgets.filter((b) => b.budgetType === "Template" && b.status !== "Closed"), [budgets]);
+  const units = useMemo(() => resolveToolUnits(grants, costCenters, budgets), [grants, costCenters, budgets]);
+  const grantName = (id) => { const g = grants.find((x) => x.id === id); return g ? `${g.programCode ? g.programCode + " " : ""}${g.title}`.trim() : "grant"; };
+
+  // The best first guess for a column: the Template that remembers it, then the unit it looks like.
+  const guessFor = (label, projectCode) => {
+    const key = toolNorm(label);
+    const remembered = templates.find((t) => t.sageColumn === key);
+    if (remembered) return { value: `t:${remembered.id}`, why: "remembered" };
+    const unitId = toolGuessUnitForColumn(label, units, projectCode);
+    const unit = unitId ? units.find((u) => u.id === unitId) : null;
+    if (unit) {
+      if (unit.templateIds.length === 1 && templates.some((t) => t.id === unit.templateIds[0])) return { value: `t:${unit.templateIds[0]}`, why: "matched" };
+      if (unit.baseline === "import" && unit.grantId) return { value: `c:${unit.id}`, why: "new" };
+    }
+    return { value: "", why: "" };
+  };
+
+  const readFiles = async (list) => {
+    setError("");
+    const out = [];
+    for (const file of list) {
+      try {
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: "array", cellDates: true });
+        const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: null });
+        const p = parseSageByColumnExport(aoa);
+        if (p.error) { out.push({ id: uid(), name: file.name, error: p.error }); continue; }
+        if (p.rows.length === 0) { out.push({ id: uid(), name: file.name, error: "No account rows were found in this file." }); continue; }
+        out.push({ id: uid(), name: file.name, parsed: p, monthIndex: p.month ? p.month.monthIndex : 0, year: p.month && p.month.year ? String(p.month.year) : String(new Date().getFullYear()), yearKnown: !!(p.month && p.month.year) });
+      } catch (e) {
+        out.push({ id: uid(), name: file.name, error: "Couldn't read that file: " + (e.message || e) });
+      }
+    }
+    const good = out.filter((f) => f.parsed);
+    if (good.length === 0 && out.length > 0) setError(out[0].error);
+    const c = {};
+    const why = {};
+    good.forEach((f) => f.parsed.columns.forEach((col) => {
+      const k = toolNorm(col.label);
+      if (!(k in c)) { const g = guessFor(col.label, f.parsed.projectCode); c[k] = g.value; why[k] = g.why; }
+    }));
+    setChoice(c);
+    setReasons(why);
+    setStandIn({});
+    setOverrides({});
+    setAllowLost(false);
+    setFiles(out);
+  };
+  const [reasons, setReasons] = useState({});
+
+  const good = files.filter((f) => f.parsed);
+  const bad = files.filter((f) => f.error);
+  const labels = [];
+  good.forEach((f) => f.parsed.columns.forEach((c) => { const k = toolNorm(c.label); if (!labels.find((l) => l.key === k)) labels.push({ key: k, label: c.label }); }));
+  const setFile = (id, patch) => setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+
+  const assign = useMemo(() => {
+    const a = {};
+    Object.keys(choice).forEach((k) => {
+      const v = choice[k];
+      if (v.startsWith("t:")) a[k] = { templateId: v.slice(2) };
+      else if (v.startsWith("c:")) { const u = units.find((x) => x.id === v.slice(2)); if (u) a[k] = { create: { grantId: u.grantId, name: u.name } }; }
+    });
+    return a;
+  }, [choice, units]);
+
+  // Templates a new one could stand in for: the grant's other Templates that no column here feeds.
+  const standInCandidates = useMemo(() => {
+    const out = {};
+    Object.values(assign).forEach((a) => {
+      if (!a.create) return;
+      const used = new Set(Object.values(assign).map((x) => x.templateId).filter(Boolean));
+      out[a.create.grantId] = templates.filter((t) => t.grantId === a.create.grantId && isActiveBudget(t.status) && !used.has(t.id));
+    });
+    return out;
+  }, [assign, templates]);
+  const replace = useMemo(() => { const r = {}; Object.keys(standIn).forEach((g) => { if (standIn[g] && (standInCandidates[g] || []).length) r[g] = standInCandidates[g].map((t) => t.id); }); return r; }, [standIn, standInCandidates]);
+
+  const planFiles = good.map((f) => ({ name: f.name, parsed: f.parsed, year: Number(f.year), monthIndex: f.monthIndex }));
+  const badYear = good.some((f) => !(Number.isInteger(Number(f.year)) && Number(f.year) > 2000));
+  const result = useMemo(() => (good.length && Object.keys(assign).length && !badYear ? planMonthlyActualsUpload({ files: planFiles, assign, budgets, replace, overrides }) : null), [files, assign, budgets, replace, overrides]);
+
+  const entries = result ? result.report : [];
+  const errors = entries.filter((e) => e.error);
+  const ok = entries.filter((e) => !e.error);
+  const lostRows = ok.reduce((n, e) => n + (e.unplaced || []).length, 0);
+  const cellKey = (f, t) => `${t}|${f}`;
+  const dupes = (() => { const seen = {}; const out = []; ok.forEach((e) => { const k = `${e.templateId}|${e.month}`; if (seen[k]) out.push(`${e.title} ${e.month}`); seen[k] = true; }); return out; })();
+  const canApply = !!result && ok.length > 0 && errors.length === 0 && dupes.length === 0 && (lostRows === 0 || allowLost);
+
+  const choose = (key, value) => { setChoice({ ...choice, [key]: value }); setStandIn({}); setOverrides({}); };
+  const decide = (templateId, rowKey, lineId) => setOverrides((prev) => ({ ...prev, [templateId]: { ...(prev[templateId] || {}), [rowKey]: lineId } }));
+
+  const apply = () => {
+    let summary = "";
+    setBudgets((prev) => {
+      const r = planMonthlyActualsUpload({ files: planFiles, assign, budgets: prev, replace, overrides });
+      const months = new Set(r.report.filter((x) => !x.error).map((x) => x.month));
+      r.changedIds.forEach((id) => { const t = r.budgets.find((b) => b.id === id); logActivity?.("Budget", "Updated", `${t?.title || "Template"} (Sage monthly actuals upload)`); });
+      summary = `Updated actuals on ${r.changedIds.length} Template${r.changedIds.length === 1 ? "" : "s"} for ${months.size} month${months.size === 1 ? "" : "s"}${r.syncedIds.length ? `, and ${r.syncedIds.length} Grant Budget${r.syncedIds.length === 1 ? "" : "s"}` : ""}.`;
+      return r.budgets;
+    });
+    notify(summary || "Actuals updated.", "info");
+    onClose();
+  };
+
+  const markerText = (e) => {
+    const m = e.marker;
+    const label = (v) => { if (!v) return "not set"; const p = parseActualsThrough(v); return p ? `${MONTHS[p.monthIndex]} ${p.year}` : v; };
+    if (m.advanced) return <span style={{ color: "#2F6F53" }}>{label(e.markerBefore)} → {label(m.value)}</span>;
+    if (m.gap.length) return <span style={{ color: "#8A5A00" }}>stays {label(m.value)}; {m.gap.slice(0, 3).join(", ")}{m.gap.length > 3 ? ` and ${m.gap.length - 3} more` : ""} not loaded yet</span>;
+    return <span style={{ color: "#8A8F87" }}>stays {label(m.value)}</span>;
+  };
+  const howText = (h) => [h.remembered && `${h.remembered} remembered`, h.name && `${h.name} by name`, h.chosen && `${h.chosen} you chose`, h.amount && `${h.amount} by matching figure`, h.account && `${h.account} to an account line`, h.category && `${h.category} to a category line`, h.created && `${h.created} new`].filter(Boolean).join(" · ");
+
+  return (
+    <Modal title="Upload monthly actuals" onClose={onClose} size="xl">
+      <div className="space-y-4">
+        <p className="text-sm" style={{ color: "#5B6B66" }}>
+          Upload the Sage profit and loss report with one column per project or location, one file per month. Each column's figures go onto the Template you choose, line by line. Plan amounts are never touched, and uploading a month again replaces it.
+        </p>
+        <div>
+          <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> {files.length ? "Choose different files" : "Choose Excel files"}
+            <input aria-label="Sage actuals file" type="file" multiple accept=".xlsx,.xls" className="hidden" onChange={(e) => { const f = e.target.files ? Array.from(e.target.files) : []; if (f.length) readFiles(f); e.target.value = ""; }} />
+          </label>
+          {files.length > 0 && <span className="ml-3 text-sm" style={{ color: "#5B6B66" }}>{files.length} file{files.length === 1 ? "" : "s"}</span>}
+        </div>
+        {error && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{error}</div>}
+        {bad.length > 0 && !error && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{bad.map((f) => `${f.name}: ${f.error}`).join(" ")}</div>}
+
+        {good.length > 0 && (
+          <>
+            <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "22vh" }}>
+              <table className="w-full text-sm">
+                <thead><tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}><th className="px-3 py-2 font-normal">File</th><th className="px-3 py-2 font-normal">Month</th></tr></thead>
+                <tbody>
+                  {good.map((f) => (
+                    <tr key={f.id} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                      <td className="px-3 py-2" style={{ color: "#1C2624" }}>{f.name}</td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <select aria-label={`Month for ${f.name}`} className="rounded-md border px-2 py-1 text-sm" style={inputStyle} value={f.monthIndex} onChange={(e) => setFile(f.id, { monthIndex: Number(e.target.value) })}>{MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}</select>
+                          <input aria-label={`Year for ${f.name}`} type="number" className="rounded-md border px-2 py-1 text-sm w-20" style={inputStyle} value={f.year} onChange={(e) => setFile(f.id, { year: e.target.value })} />
+                          {!f.yearKnown && <ToolChip text="Year not in the file; check it" tone="amber" />}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "26vh" }}>
+              <table className="w-full text-sm">
+                <thead><tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}><th className="px-3 py-2 font-normal">Column in the files</th><th className="px-3 py-2 font-normal">Feeds this Template</th></tr></thead>
+                <tbody>
+                  {labels.map((l) => {
+                    const cu = units.find((u) => `c:${u.id}` === choice[l.key]);
+                    const guessedCreate = (() => { const f = good.find((x) => x.parsed.columns.some((c) => toolNorm(c.label) === l.key)); const id = f ? toolGuessUnitForColumn(l.label, units, f.parsed.projectCode) : null; const u = id ? units.find((x) => x.id === id) : null; return u && u.baseline === "import" && u.grantId ? u : null; })();
+                    return (
+                      <tr key={l.key} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                        <td className="px-3 py-2" style={{ color: "#1C2624" }}>{l.label}</td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-2">
+                            <select aria-label={`Template for ${l.label}`} className="rounded-md border px-2 py-1 text-sm w-full" style={inputStyle} value={choice[l.key] || ""} onChange={(e) => choose(l.key, e.target.value)}>
+                              <option value="">Skip this column</option>
+                              {guessedCreate && <option value={`c:${guessedCreate.id}`}>Create a new Template: {guessedCreate.name}</option>}
+                              {templates.map((t) => <option key={t.id} value={`t:${t.id}`}>{String(t.title || "Template").trim().slice(0, 70)}{t.status !== "Active" && t.status !== "Awarded" ? ` (${t.status})` : ""}</option>)}
+                            </select>
+                            {reasons[l.key] === "remembered" && choice[l.key] && <ToolChip text="remembered" tone="teal" />}
+                            {reasons[l.key] === "matched" && choice[l.key] && <ToolChip text="matched" tone="gray" />}
+                            {cu && <ToolChip text="new Template" tone="amber" />}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {Object.keys(standInCandidates).map((gid) => (standInCandidates[gid].length > 0 && (
+              <label key={gid} className="flex items-start gap-2 rounded-lg border p-3 text-sm" style={{ borderColor: "#E9D5A8", background: "#FBF3E4", color: "#6B4700" }}>
+                <input type="checkbox" aria-label={`Stand in for ${grantName(gid)}`} className="mt-1" checked={!!standIn[gid]} onChange={(e) => setStandIn({ ...standIn, [gid]: e.target.checked })} />
+                <span>
+                  <b>{grantName(gid)}</b> already has {standInCandidates[gid].map((t) => `"${String(t.title).trim()}"`).join(", ")}, which covers these columns together. Tick this to close it and let the new Templates feed the Grant Budget instead. Leave it unticked to create them as Drafts that don't count anywhere yet; do this only once every month of the year is loaded, or earlier months will drop out of Org Budget.
+                </span>
+              </label>
+            )))}
+
+            {errors.length > 0 && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{errors.map((e) => e.error).join(" ")}</div>}
+            {dupes.length > 0 && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>Two files are set to the same month for {dupes.join(", ")}. Change the month on one of them.</div>}
+
+            {ok.length > 0 && (
+              <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "34vh" }}>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+                      <th className="px-3 py-2 font-normal">Month</th><th className="px-3 py-2 font-normal">Template</th><th className="px-3 py-2 font-normal">Where the rows went</th>
+                      <th className="px-3 py-2 font-normal text-right">Expense in file</th><th className="px-3 py-2 font-normal">Check</th><th className="px-3 py-2 font-normal">Actuals through</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ok.map((e, i) => (
+                      <tr key={i} className="border-t align-top" style={{ borderColor: "#EEF0EC" }}>
+                        <td className="px-3 py-2 whitespace-nowrap" style={{ color: "#1C2624" }}>{e.month}</td>
+                        <td className="px-3 py-2" style={{ color: "#1C2624" }}>{String(e.title).trim()}{e.created && <> <ToolChip text="new" tone="amber" /></>}<div className="text-xs" style={{ color: "#8A8F87" }}>{e.label}</div></td>
+                        <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>{howText(e.plan.how)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{fmt(e.plan.expenseTotal)}</td>
+                        <td className="px-3 py-2 text-xs" style={{ color: e.ties ? "#2F6F53" : "#B5443A" }}>{e.ties ? (e.fileTotals ? "Ties to the file's total" : "All rows placed") : "Doesn't tie"}</td>
+                        <td className="px-3 py-2 text-xs">{markerText(e)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {ok.filter((e) => (e.pending || []).length > 0).map((e, i) => (
+              <div key={i} className="rounded-lg border p-3" style={{ borderColor: "#E9D5A8", background: "#FFFDF7" }}>
+                <div className="text-sm font-medium" style={{ color: "#6B4700" }}>{e.pending.length} row{e.pending.length === 1 ? "" : "s"} in {e.month} for {String(e.title).trim()} {e.pending.length === 1 ? "doesn't" : "don't"} match a line yet</div>
+                <div className="text-xs mb-2" style={{ color: "#8A5A00" }}>Pick the line each one belongs to and it will be remembered for every later month, or leave it to add a new line.</div>
+                <div className="space-y-1.5 overflow-auto" style={{ maxHeight: "22vh" }}>
+                  {e.pending.slice(0, 40).map((p) => (
+                    <div key={p.key} className="flex items-center gap-2 text-sm">
+                      <div className="w-1/3" style={{ color: "#1C2624" }}>{p.label} <span className="text-xs" style={{ color: "#8A8F87" }}>{fmt(p.amount)}</span></div>
+                      <select aria-label={`Line for ${p.label}`} className="rounded-md border px-2 py-1 text-sm flex-1" style={inputStyle} value={((overrides[e.templateId] || {})[p.key]) || "new"} onChange={(ev) => decide(e.templateId, p.key, ev.target.value)}>
+                        <option value="new">Add as a new line</option>
+                        {p.candidates.map((c) => <option key={c.lineId} value={c.lineId}>{String(c.description).trim()} (this month: {fmt(c.current)})</option>)}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+
+            {ok.some((e) => (e.zeroed || []).length > 0) && (
+              <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBF3E4", borderColor: "#E9D5A8", color: "#6B4700" }}>
+                These lines hold money for the month but aren't in the file, so they'll be set to $0:{" "}
+                {ok.flatMap((e) => (e.zeroed || []).map((z) => `${String(z.label).trim()} (${fmt(z.was)}, ${e.month})`)).slice(0, 6).join("; ")}
+                {ok.reduce((n, e) => n + (e.zeroed || []).length, 0) > 6 ? "; and more" : ""}. If one of them is really a row listed under another name, choose it above.
+              </div>
+            )}
+            {lostRows > 0 && (
+              <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>
+                {lostRows} row{lostRows === 1 ? "" : "s"} with money couldn't be matched to any account and will be left out: {ok.flatMap((e) => e.unplaced).slice(0, 4).map((u) => `${u.label} (${fmt(u.amount)})`).join("; ")}.
+                <label className="flex items-center gap-2 mt-2"><input type="checkbox" aria-label="Continue without those rows" checked={allowLost} onChange={(e) => setAllowLost(e.target.checked)} /> Update anyway, without those rows</label>
+              </div>
+            )}
+          </>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button onClick={apply} disabled={!canApply} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B", opacity: canApply ? 1 : 0.5 }}>Update actuals</button>
         </div>
       </div>
     </Modal>
