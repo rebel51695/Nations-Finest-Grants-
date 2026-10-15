@@ -523,7 +523,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.5.5";
+const APP_VERSION = "1.6.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -1101,53 +1101,6 @@ function pushTrash(setTrash, entityType, data, deletedBy, extra) {
     { id: uid(), entityType, data, extra: extra || null, deletedAt: new Date().toISOString(), deletedBy: deletedBy || "Unknown" },
     ...prev,
   ].slice(0, 500));
-}
-
-function newScenario(basedOn) {
-  return {
-    id: uid(), title: "", notes: "", createdBy: "", createdAt: new Date().toISOString(),
-    basedOn: basedOn || { type: "blank" },
-    fy: "", periodStart: "", periodEnd: "",
-    lines: [newLine()],
-  };
-}
-
-// Computes the CURRENT real numbers a scenario should be compared against,
-// based on what it was snapshotted from. Always re-derived live — never a
-// frozen copy — so the comparison reflects reality as of right now.
-function liveComparisonForScenario(scenario, grants, budgets, costCenters) {
-  const basedOn = scenario.basedOn || { type: "blank" };
-  if (basedOn.type === "grant" || basedOn.type === "costCenter") {
-    const b = budgets.find((x) => x.id === basedOn.budgetId);
-    if (!b) return { available: false, reason: "The original budget this was based on no longer exists." };
-    const map = {};
-    b.lines.forEach((l) => {
-      if (!map[l.category]) map[l.category] = Array(12).fill(0);
-      (l.amounts || Array(12).fill(0)).forEach((a, i) => { map[l.category][i] += Number(a) || 0; });
-    });
-    return { available: true, byCategory: map, periodStart: b.periodStart };
-  }
-  if (basedOn.type === "org") {
-    const scope = basedOn.scope || "all";
-    const calYear = basedOn.calYear ?? "All";
-    const scopedGrantIds = scope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === scope).map((g) => g.id));
-    const scopedCcIds = scope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === scope).map((c) => c.id));
-    const scopedBudgets = (scope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
-    const map = {};
-    scopedBudgets.forEach((b) => {
-      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-      b.lines.forEach((l) => {
-        if (!map[l.category]) map[l.category] = Array(12).fill(0);
-        (l.amounts || Array(12).fill(0)).forEach((a, i) => {
-          const col = cols[i];
-          if (calYear !== "All" && col.year !== calYear) return;
-          map[l.category][col.monthIndex] += Number(a) || 0;
-        });
-      });
-    });
-    return { available: true, byCategory: map, periodStart: "" };
-  }
-  return { available: false, reason: "This scenario started blank, with nothing to compare against." };
 }
 
 function daysOutstanding(inv) {
@@ -5252,442 +5205,7 @@ function OrgBudgetRow({ label, values, projected, bold, indent, color, isHeader 
   );
 }
 
-function NewScenarioModal({ grants, costCenters, budgets, budgetGroups, onCreate, onClose }) {
-  const [title, setTitle] = useState("");
-  const [startMode, setStartMode] = useState("blank"); // blank | existing | org
-  const [pickMode, setPickMode] = useState("grant"); // grant | costCenter (for "existing")
-  const [pickedGrantId, setPickedGrantId] = useState("");
-  const [pickedCcId, setPickedCcId] = useState("");
-  const [pickedBudgetId, setPickedBudgetId] = useState("");
-  const [orgScope, setOrgScope] = useState("all");
-  const [orgYear, setOrgYear] = useState("All");
-
-  const candidateBudgets = pickMode === "grant"
-    ? budgets.filter((b) => b.grantId === pickedGrantId)
-    : budgets.filter((b) => b.costCenterId === pickedCcId);
-
-  const orgCalendarYears = useMemo(() => {
-    const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
-    const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
-    const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
-    const years = new Set();
-    scoped.forEach((b) => monthColumnsForBudget(b.periodStart, b.periodEnd).forEach((col) => years.add(col.year)));
-    return [...years].sort();
-  }, [orgScope, grants, costCenters, budgets]);
-
-  const canCreate = title.trim() && (
-    startMode === "blank" ||
-    (startMode === "existing" && pickedBudgetId) ||
-    startMode === "org"
-  );
-
-  const handleCreate = () => {
-    let scen;
-    if (startMode === "blank") {
-      scen = newScenario({ type: "blank" });
-    } else if (startMode === "existing") {
-      const b = budgets.find((x) => x.id === pickedBudgetId);
-      const g = pickMode === "grant" ? grants.find((x) => x.id === pickedGrantId) : null;
-      const cc = pickMode === "costCenter" ? costCenters.find((x) => x.id === pickedCcId) : null;
-      scen = newScenario({
-        type: pickMode, grantId: pickedGrantId || "", costCenterId: pickedCcId || "", budgetId: pickedBudgetId,
-        label: g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : cc ? cc.name : "",
-      });
-      scen.fy = b.fy;
-      scen.periodStart = b.periodStart;
-      scen.periodEnd = b.periodEnd;
-      scen.lines = b.lines.map((l) => ({ ...l, id: uid(), amounts: [...l.amounts] }));
-    } else {
-      const bg = budgetGroups.find((x) => x.id === orgScope);
-      scen = newScenario({ type: "org", scope: orgScope, calYear: orgYear, label: orgScope === "all" ? "Whole Organization" : (bg?.name || "Budget Group") });
-      scen.periodStart = orgYear !== "All" ? `${orgYear}-01-01` : "";
-      const scopedGrantIds = orgScope === "all" ? null : new Set(grants.filter((g) => g.budgetGroupId === orgScope).map((g) => g.id));
-      const scopedCcIds = orgScope === "all" ? null : new Set((costCenters || []).filter((c) => c.budgetGroupId === orgScope).map((c) => c.id));
-      const scoped = (orgScope === "all" ? budgets : budgets.filter((b) => (b.grantId && scopedGrantIds.has(b.grantId)) || (b.costCenterId && scopedCcIds.has(b.costCenterId)))).filter((b) => isActiveBudget(b.status));
-      const map = {};
-      scoped.forEach((b) => {
-        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-        b.lines.forEach((l) => {
-          const key = l.category;
-          if (!map[key]) {
-            const catDef = CATEGORIES.find((c) => c.name === l.category);
-            map[key] = { category: l.category, type: catDef ? catDef.type : l.type, subcategory: "", amounts: Array(12).fill(0) };
-          }
-          (l.amounts || Array(12).fill(0)).forEach((a, i) => {
-            const col = cols[i];
-            if (!col) return;
-            if (orgYear !== "All" && col.year !== orgYear) return;
-            map[key].amounts[col.monthIndex] += Number(a) || 0;
-          });
-        });
-      });
-      scen.lines = Object.values(map).map((l) => ({ id: uid(), category: l.category, type: l.type, categoryCustom: false, subcategory: "", subcategoryCustom: false, amounts: l.amounts }));
-      if (scen.lines.length === 0) scen.lines = [newLine()];
-    }
-    scen.title = title.trim();
-    onCreate(scen);
-  };
-
-  return (
-    <Modal title="New scenario" onClose={onClose} wide>
-      <div className="space-y-4">
-        <Field label="Scenario name">
-          <input className={inputCls} style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. FY27 Conservative Case" autoFocus />
-        </Field>
-
-        <Field label="Starting point">
-          <div className="grid grid-cols-3 gap-2">
-            {[
-              { key: "blank", label: "Start blank" },
-              { key: "existing", label: "Snapshot a grant/cost center budget" },
-              { key: "org", label: "Snapshot the Org Budget rollup" },
-            ].map((opt) => (
-              <button
-                key={opt.key}
-                onClick={() => setStartMode(opt.key)}
-                className="text-sm px-3 py-2.5 rounded-md border text-left"
-                style={{
-                  borderColor: startMode === opt.key ? "#1F5C6B" : "#E1E5DE",
-                  background: startMode === opt.key ? "rgba(31,92,107,0.06)" : "#FFFFFF",
-                  color: "#1C2624",
-                }}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </Field>
-
-        {startMode === "existing" && (
-          <div className="space-y-3 rounded-md border p-4" style={{ borderColor: "#E1E5DE" }}>
-            <div className="inline-flex rounded-md border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
-              <button onClick={() => { setPickMode("grant"); setPickedBudgetId(""); }} className="px-3 py-1.5 text-sm font-medium" style={{ background: pickMode === "grant" ? "#1F5C6B" : "#FFFFFF", color: pickMode === "grant" ? "#FFFFFF" : "#5B6B66" }}>Grant</button>
-              <button onClick={() => { setPickMode("costCenter"); setPickedBudgetId(""); }} className="px-3 py-1.5 text-sm font-medium" style={{ background: pickMode === "costCenter" ? "#1F5C6B" : "#FFFFFF", color: pickMode === "costCenter" ? "#FFFFFF" : "#5B6B66" }}>Cost Center</button>
-            </div>
-            {pickMode === "grant" ? (
-              <GrantPicker grants={grants} value={pickedGrantId} onChange={(v) => { setPickedGrantId(v); setPickedBudgetId(""); }} noneLabel="Select a grant" />
-            ) : (
-              <select value={pickedCcId} onChange={(e) => { setPickedCcId(e.target.value); setPickedBudgetId(""); }} className={inputCls} style={inputStyle}>
-                <option value="">Select a cost center</option>
-                {(costCenters || []).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-            )}
-            {(pickedGrantId || pickedCcId) && (
-              <select value={pickedBudgetId} onChange={(e) => setPickedBudgetId(e.target.value)} className={inputCls} style={inputStyle}>
-                <option value="">Select a budget to snapshot</option>
-                {candidateBudgets.map((b) => <option key={b.id} value={b.id}>{b.title}{b.fy ? ` (${b.fy})` : ""}</option>)}
-              </select>
-            )}
-          </div>
-        )}
-
-        {startMode === "org" && (
-          <div className="grid grid-cols-2 gap-3 rounded-md border p-4" style={{ borderColor: "#E1E5DE" }}>
-            <Field label="Scope">
-              <select value={orgScope} onChange={(e) => { setOrgScope(e.target.value); setOrgYear("All"); }} className={inputCls} style={inputStyle}>
-                <option value="all">Whole Organization</option>
-                {(budgetGroups || []).map((bg) => <option key={bg.id} value={bg.id}>{bg.name}</option>)}
-              </select>
-            </Field>
-            <Field label="Calendar year">
-              <select value={orgYear} onChange={(e) => setOrgYear(e.target.value === "All" ? "All" : Number(e.target.value))} className={inputCls} style={inputStyle}>
-                <option value="All">All years combined</option>
-                {orgCalendarYears.map((y) => <option key={y} value={y}>{y}</option>)}
-              </select>
-            </Field>
-          </div>
-        )}
-      </div>
-      <div className="flex justify-end gap-2 mt-6">
-        <button onClick={onClose} className="px-4 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
-        <button
-          disabled={!canCreate}
-          onClick={handleCreate}
-          className="px-4 py-2 rounded-md text-sm text-white"
-          style={{ background: canCreate ? "#1F5C6B" : "#8A8F87" }}
-        >
-          Create scenario
-        </button>
-      </div>
-    </Modal>
-  );
-}
-
-function ScenarioEditor({ scenario, grants, costCenters, budgets, canEdit = true, onSave, onDelete, onBack }) {
-  const [form, setForm, undoForm, canUndoForm] = useUndoableState(scenario);
-  const [showCompare, setShowCompare] = useState(true);
-  const cols = monthColumnsForBudget(form.periodStart, form.periodEnd);
-
-  useEffect(() => {
-    const needsResize = form.lines.some((l) => (l.amounts?.length || 0) !== cols.length);
-    if (!needsResize) return;
-    setForm((f) => ({
-      ...f,
-      lines: f.lines.map((l) => ({
-        ...l,
-        amounts: resizeMonthlyArray(l.amounts, cols.length),
-      })),
-    }));
-  }, [cols.length]);
-
-  const updateLine = (id, patch) => setForm((f) => ({ ...f, lines: f.lines.map((l) => (l.id === id ? { ...l, ...patch } : l)) }));
-  const addLine = () => setForm((f) => ({ ...f, lines: [...f.lines, newLine(cols.length)] }));
-  const removeLine = (id) => setForm((f) => ({ ...f, lines: f.lines.filter((l) => l.id !== id) }));
-  const setAnnual = (id, val) => {
-    const per = Math.round((Number(val) || 0) / cols.length * 100) / 100;
-    updateLine(id, { amounts: Array(cols.length).fill(per) });
-  };
-
-  const totals = useMemo(() => {
-    const revenue = form.lines.filter((l) => l.type === "revenue").reduce((a, l) => a + lineTotal(l), 0);
-    const expense = form.lines.filter((l) => l.type === "expense").reduce((a, l) => a + lineTotal(l), 0);
-    return { revenue, expense, net: revenue - expense };
-  }, [form.lines]);
-
-  const comparison = useMemo(() => liveComparisonForScenario(form, grants, budgets, costCenters), [form, grants, budgets, costCenters]);
-
-  const exportXlsx = () => {
-    const labels = cols.map((c) => c.label);
-    const rows = [
-      [form.title],
-      [`Scenario${form.basedOn?.label ? ` — based on ${form.basedOn.label}` : " — started blank"}`],
-      [],
-      ["Category", "Subcategory", "Description", "Type", ...labels, "Total"],
-      ...form.lines.map((l) => [l.category, l.subcategory || "", l.description || "", l.type, ...l.amounts, lineTotal(l)]),
-      [],
-      ["Total Revenue", "", "", "", ...Array(cols.length).fill(""), totals.revenue],
-      ["Total Expense", "", "", "", ...Array(cols.length).fill(""), totals.expense],
-      ["Net", "", "", "", ...Array(cols.length).fill(""), totals.net],
-    ];
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws["!cols"] = [{ wch: 30 }, { wch: 18 }, { wch: 24 }, { wch: 10 }, ...cols.map(() => ({ wch: 12 })), { wch: 14 }];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Scenario");
-    const safe = (s) => (s || "scenario").replace(/[^a-z0-9]+/gi, "_").slice(0, 40);
-    const arrayBuffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-    downloadFile(`${safe(form.title)}.xlsx`, arrayBuffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  };
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <button onClick={onBack} className="text-sm inline-flex items-center gap-1" style={{ color: "#1F5C6B" }}>
-          <ArrowRight size={14} style={{ transform: "rotate(180deg)" }} /> Back to scenarios
-        </button>
-        <div className="flex items-center gap-2">
-          {canEdit && canUndoForm && (
-            <button onClick={undoForm} className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-              <Undo2 size={14} /> Undo
-            </button>
-          )}
-          <button onClick={exportXlsx} className="inline-flex items-center gap-1.5 text-xs px-3 py-2 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
-            <Download size={14} /> Export Excel
-          </button>
-          {canEdit && (
-            <>
-              <button onClick={() => onSave(form)} className="px-4 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Save scenario</button>
-              <button onClick={onDelete} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#B5443A", color: "#B5443A" }}>Delete</button>
-            </>
-          )}
-        </div>
-      </div>
-
-      <div className="bg-white rounded-lg border p-5 space-y-4" style={{ borderColor: "#E1E5DE" }}>
-        <fieldset disabled={!canEdit} style={{ border: "none", margin: 0, padding: 0, minWidth: 0 }}>
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Field label="Scenario name">
-            <input className={inputCls} style={inputStyle} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
-          </Field>
-          <Field label="Fiscal year label (optional)">
-            <input className={inputCls} style={inputStyle} value={form.fy} onChange={(e) => setForm({ ...form, fy: e.target.value })} placeholder="e.g. FY27" />
-          </Field>
-          <Field label="Period start (for month labels)">
-            <input type="date" className={inputCls} style={inputStyle} value={form.periodStart} onChange={(e) => setForm({ ...form, periodStart: e.target.value })} />
-          </Field>
-          <Field label="Period end">
-            <input type="date" className={inputCls} style={inputStyle} value={form.periodEnd} onChange={(e) => setForm({ ...form, periodEnd: e.target.value })} />
-          </Field>
-        </div>
-        <p className="text-xs" style={{ color: "#8A8F87" }}>
-          {form.basedOn?.type === "blank" ? "Started blank — not tied to any real grant or budget." : `Based on: ${form.basedOn?.label || "unknown"}`}
-        </p>
-
-        <div className="overflow-x-auto border rounded-lg" style={{ borderColor: "#E1E5DE" }}>
-          <table className="text-xs" style={{ fontFamily: "var(--mono-font)", width: "max-content" }}>
-            <thead>
-              <tr style={{ background: "#F6F7F3" }}>
-                <th className="text-left px-2 py-2 sticky left-0" style={{ background: "#F6F7F3", minWidth: 190 }}>Category</th>
-                <th className="text-left px-2 py-2" style={{ minWidth: 190 }}>Subcategory</th>
-                <th className="text-left px-2 py-2" style={{ minWidth: 140 }}>Description</th>
-                <th className="text-right px-2 py-2" style={{ minWidth: 95 }}>Annual total</th>
-                {cols.map((c, i) => <th key={i} className="text-right px-2 py-2" style={{ minWidth: 88 }}>{c.label}</th>)}
-                <th className="text-right px-2 py-2" style={{ minWidth: 80 }}>Total</th>
-                <th className="px-2 py-2" style={{ minWidth: 36 }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {form.lines.map((line) => {
-                const cat = CATEGORIES.find((c) => c.name === line.category);
-                return (
-                  <tr key={line.id} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                    <td className="px-2 py-1.5 sticky left-0 bg-white">
-                      {line.categoryCustom ? (
-                        <div className="flex gap-1">
-                          <input value={line.category} onChange={(e) => updateLine(line.id, { category: e.target.value })} placeholder="Custom category" className="w-full rounded border px-1.5 py-1 text-xs" style={inputStyle} />
-                          <select value={line.type} onChange={(e) => updateLine(line.id, { type: e.target.value })} className="shrink-0 rounded border px-1 py-1 text-xs" style={inputStyle}>
-                            <option value="expense">Exp</option>
-                            <option value="revenue">Rev</option>
-                          </select>
-                          <button onClick={() => updateLine(line.id, { categoryCustom: false, category: CATEGORIES[0].name, type: CATEGORIES[0].type, subcategory: "", subcategoryCustom: false })} className="shrink-0 px-1 rounded hover:bg-red-50">
-                            <X size={12} style={{ color: "#B5443A" }} />
-                          </button>
-                        </div>
-                      ) : (
-                        <select
-                          value={line.category}
-                          onChange={(e) => {
-                            if (e.target.value === CUSTOM_CATEGORY) { updateLine(line.id, { categoryCustom: true, category: "", subcategory: "", subcategoryCustom: false }); return; }
-                            const nc = CATEGORIES.find((c) => c.name === e.target.value);
-                            updateLine(line.id, { category: nc.name, type: nc.type, subcategory: "", subcategoryCustom: false });
-                          }}
-                          className="w-full rounded border px-1.5 py-1 text-xs"
-                          style={inputStyle}
-                        >
-                          {CATEGORIES.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
-                          <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
-                        </select>
-                      )}
-                    </td>
-                    <td className="px-2 py-1.5">
-                      {line.categoryCustom || line.subcategoryCustom ? (
-                        <div className="flex gap-1">
-                          <input value={line.subcategory} onChange={(e) => updateLine(line.id, { subcategory: e.target.value })} placeholder="Custom subcategory" className="w-full rounded border px-1.5 py-1 text-xs" style={inputStyle} />
-                          {!line.categoryCustom && (
-                            <button onClick={() => updateLine(line.id, { subcategoryCustom: false, subcategory: "" })} className="shrink-0 px-1 rounded hover:bg-red-50">
-                              <X size={12} style={{ color: "#B5443A" }} />
-                            </button>
-                          )}
-                        </div>
-                      ) : (
-                        <select
-                          value={line.subcategory}
-                          onChange={(e) => {
-                            if (e.target.value === CUSTOM_CATEGORY) { updateLine(line.id, { subcategoryCustom: true, subcategory: "" }); return; }
-                            updateLine(line.id, { subcategory: e.target.value });
-                          }}
-                          className="w-full rounded border px-1.5 py-1 text-xs"
-                          style={inputStyle}
-                        >
-                          <option value="">Select subcategory</option>
-                          {cat?.subs.map((s) => <option key={s} value={s}>{s}</option>)}
-                          <option value={CUSTOM_CATEGORY}>Other (write in)…</option>
-                        </select>
-                      )}
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <input
-                        value={line.description || ""}
-                        onChange={(e) => updateLine(line.id, { description: e.target.value })}
-                        placeholder="Optional note"
-                        className="w-full rounded border px-1.5 py-1 text-xs"
-                        style={inputStyle}
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <input
-                        type="number"
-                        className="w-full rounded border px-1.5 py-1 text-xs text-right"
-                        style={inputStyle}
-                        placeholder="0"
-                        onChange={(e) => setAnnual(line.id, e.target.value)}
-                      />
-                    </td>
-                    {line.amounts.map((a, i) => (
-                      <td key={i} className="px-1 py-1.5">
-                        <input
-                          type="number"
-                          value={a}
-                          onChange={(e) => {
-                            const vals = [...line.amounts];
-                            vals[i] = Number(e.target.value) || 0;
-                            updateLine(line.id, { amounts: vals });
-                          }}
-                          className="w-full rounded border px-1.5 py-1 text-xs text-right"
-                          style={inputStyle}
-                        />
-                      </td>
-                    ))}
-                    <td className="px-2 py-1.5 text-right font-medium" style={{ color: "#1C2624" }}>{fmt(lineTotal(line))}</td>
-                    <td className="px-2 py-1.5">
-                      <button onClick={() => removeLine(line.id)} className="p-1 rounded hover:bg-red-50">
-                        <Trash2 size={13} style={{ color: "#B5443A" }} />
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-        <button onClick={addLine} className="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>
-          <Plus size={13} /> Add row
-        </button>
-
-        <div className="grid grid-cols-3 gap-4 text-sm pt-2 border-t" style={{ borderColor: "#E1E5DE" }}>
-          <div>Revenue: <span style={{ color: "#2F6F53", fontWeight: 600 }}>{fmt(totals.revenue)}</span></div>
-          <div>Expense: <span style={{ color: "#B5443A", fontWeight: 600 }}>{fmt(totals.expense)}</span></div>
-          <div>Net: <span style={{ fontWeight: 600 }}>{fmt(totals.net)}</span></div>
-        </div>
-        </fieldset>
-      </div>
-
-      <div className="bg-white rounded-lg border p-5" style={{ borderColor: "#E1E5DE" }}>
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="font-display text-base" style={{ color: "#1C2624" }}>Compare to real numbers</h2>
-          <button onClick={() => setShowCompare((v) => !v)} className="text-xs" style={{ color: "#1F5C6B" }}>{showCompare ? "Hide" : "Show"}</button>
-        </div>
-        {showCompare && (
-          comparison.available ? (
-            <div className="overflow-x-auto">
-              <table className="text-sm w-full">
-                <thead>
-                  <tr style={{ color: "#8A8F87" }}>
-                    <th className="text-left py-1.5 font-medium">Category</th>
-                    <th className="text-right py-1.5 font-medium">Scenario</th>
-                    <th className="text-right py-1.5 font-medium">Real (current)</th>
-                    <th className="text-right py-1.5 font-medium">Variance</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {form.lines.reduce((acc, l) => { if (!acc.includes(l.category)) acc.push(l.category); return acc; }, []).map((catName) => {
-                    const scenarioTotal = form.lines.filter((l) => l.category === catName).reduce((a, l) => a + lineTotal(l), 0);
-                    const realVals = comparison.byCategory[catName] || Array(12).fill(0);
-                    const realTotal = realVals.reduce((a, b) => a + b, 0);
-                    const variance = scenarioTotal - realTotal;
-                    return (
-                      <tr key={catName} className="border-t" style={{ borderColor: "#E1E5DE" }}>
-                        <td className="py-1.5" style={{ color: "#1C2624" }}>{catName}</td>
-                        <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{fmt(scenarioTotal)}</td>
-                        <td className="py-1.5 text-right" style={{ fontVariantNumeric: "tabular-nums", color: "#8A8F87" }}>{fmt(realTotal)}</td>
-                        <td className="py-1.5 text-right font-medium" style={{ fontVariantNumeric: "tabular-nums", color: variance >= 0 ? "#2F6F53" : "#B5443A" }}>
-                          {variance >= 0 ? "+" : ""}{fmt(variance)}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <p className="text-sm" style={{ color: "#8A8F87" }}>{comparison.reason}</p>
-          )
-        )}
-      </div>
-    </div>
-  );
-}
-
-function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, setRestrictedFunds, isAdmin, canEdit, logActivity }) {
+function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTasks, setInvoices, setStaff, setCostCenters, setScenarios, setBudgetModels, setRestrictedFunds, isAdmin, canEdit, logActivity }) {
   const [confirm, setConfirm] = useState(null);
 
   const labelFor = (t) => {
@@ -5700,12 +5218,13 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
       case "invoice": return t.data?.invoiceNumber || "Untitled invoice";
       case "staff": return t.data?.name || "Untitled staff member";
       case "scenario": return t.data?.title || "Untitled scenario";
+      case "budgetmodel": return t.data?.title || "Untitled budget model";
       default: return "Item";
     }
   };
   const typeLabel = {
     grant: "Grant", budget: "Budget", costCenter: "Cost Center", report: "Grant Report",
-    task: "Task", invoice: "Invoice", staff: "Staff", scenario: "Scenario",
+    task: "Task", invoice: "Invoice", staff: "Staff", scenario: "Scenario", budgetmodel: "Budget model",
   };
 
   const restore = (t) => {
@@ -5736,6 +5255,7 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
       case "invoice": setInvoices?.((prev) => [...prev, t.data]); break;
       case "staff": setStaff?.((prev) => [...prev, t.data]); break;
       case "scenario": setScenarios?.((prev) => [...prev, t.data]); break;
+      case "budgetmodel": setBudgetModels?.((prev) => [...prev, t.data]); break;
       default: break;
     }
     setTrash((prev) => prev.filter((x) => x.id !== t.id));
@@ -5799,45 +5319,842 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
   );
 }
 
-function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, budgetGroups, whoami, setTrash, canEdit, logActivity }) {
+// ===========================================================================
+// Budget tool: next year's budget, built from this year's. Replaces Scenarios.
+// Everything in this block is plain calculation (no screens), so it can be
+// tested on its own against real data.
+// ===========================================================================
+
+// Every budget unit on the FY2026 workbooks, grouped the way the workbooks'
+// TOTAL sheets group them.
+//   grantCode / costCenterCode  match a grant's program code or a cost center's
+//                               leading number in GrantFlow
+//   templateRe                  narrows which of that grant's Templates the unit is
+//   searchAllTemplates          look for the Template under any grant (1640's is
+//                               filed under 1620)
+//   baseline: "import"          GrantFlow only holds the combined figures (SSVF's
+//                               states), so the baseline comes from Sage exports
+const BUDGET_TOOL_SEED = [
+  { group: "1840 SSFG", name: "1840 SSFG", code: "1840", grantCode: "1840" },
+
+  { group: "SSVF", name: "1700 SSVF CA", code: "1700", grantCode: "1790", baseline: "import" },
+  { group: "SSVF", name: "1760 SSVF NV", code: "1760", grantCode: "1790", baseline: "import" },
+  { group: "SSVF", name: "1790 SSVF AZ", code: "1790", grantCode: "1790", baseline: "import" },
+  { group: "SSVF", name: "1710 SSVF CA LT", code: "1710", grantCode: "1710" },
+  { group: "SSVF", name: "1715 SSVF NV LT", code: "1715", grantCode: "1715" },
+
+  { group: "SSVF support", name: "Site donations - CA" },
+  { group: "SSVF support", name: "Site donations - AZ" },
+  { group: "SSVF support", name: "Site donations - NV" },
+  { group: "SSVF support", name: "Site donations - Santa Rosa" },
+  { group: "SSVF support", name: "Site donations - Sacramento" },
+  { group: "SSVF support", name: "Site donations - Eureka" },
+  { group: "SSVF support", name: "Site donations - Redding" },
+
+  { group: "GPD", name: "GPD NorCal - Mather", code: "1540", grantCode: "1540", templateRe: "mather" },
+  { group: "GPD", name: "GPD NorCal - Sacramento", code: "1540", grantCode: "1540", templateRe: "sac" },
+  { group: "GPD", name: "GPD SF - Eureka", code: "1530", grantCode: "1530" },
+
+  { group: "HCHV", name: "HCHV Hearn House", code: "1521", grantCode: "1521" },
+  { group: "HCHV", name: "HCHV Eureka", code: "1532", grantCode: "1532" },
+  { group: "HCHV", name: "HCHV Sacramento", code: "1543", grantCode: "1543" },
+  { group: "HCHV", name: "HCHV Reno", code: "1560", grantCode: "1560" },
+  { group: "HCHV", name: "MP Geriatric", code: "1675", grantCode: "1675" },
+
+  { group: "Residential", name: "3022 Windsor Veterans Village", code: "3022", costCenterCode: "3022" },
+  { group: "Residential", name: "3030 Bayview Heights", code: "3030", costCenterCode: "3030" },
+  { group: "Residential", name: "3041 Mather VV Phase I", code: "3041", costCenterCode: "3041" },
+  { group: "Residential", name: "3043 Mather VV Phase III", code: "3043", costCenterCode: "3043" },
+
+  { group: "Housing support", name: "SLE - Santa Rosa", templateRe: "SLE.*Santa Rosa", searchAllTemplates: true },
+  { group: "Housing support", name: "SLE - Park Marina", templateRe: "Park Marina", searchAllTemplates: true },
+  { group: "Housing support", name: "Waldon St PH" },
+  { group: "Housing support", name: "1620 VSSR Sonoma", code: "1620", grantCode: "1620", templateRe: "sonoma" },
+  { group: "Housing support", name: "1640 VSSR Sacramento", code: "1640", grantCode: "1640", templateRe: "1640", searchAllTemplates: true },
+
+  { group: "Outreach", name: "1613 CAVSA", code: "1613", grantCode: "1613" },
+  { group: "Outreach", name: "1642 TLI", code: "1642", grantCode: "1642" },
+  { group: "Outreach", name: "1655 CVHI", code: "1655", grantCode: "1655" },
+  { group: "Outreach", name: "1626 Marin Outreach", code: "1626", grantCode: "1626" },
+  { group: "Outreach", name: "1661 LIHTF", code: "1661", grantCode: "1661" },
+
+  { group: "Other programs", name: "1630 CalFresh", code: "1630", grantCode: "1630" },
+  { group: "Other programs", name: "1624 SRJC", code: "1624", grantCode: "1624" },
+  { group: "Other programs", name: "1691 Pathways", code: "1691", grantCode: "1691" },
+  { group: "Other programs", name: "1830 CalAim", code: "1830", grantCode: "1830" },
+
+  { group: "General admin and fundraising", name: "Corp - indirect allowable", code: "1100", costCenterCode: "1100" },
+  { group: "General admin and fundraising", name: "Corp - indirect unallowable", code: "1110", costCenterCode: "1110" },
+  { group: "General admin and fundraising", name: "General - fundraising", code: "1112", costCenterCode: "1112" },
+  { group: "General admin and fundraising", name: "Game of Throws" },
+  { group: "General admin and fundraising", name: "Corp. sales" },
+  { group: "General admin and fundraising", name: "Corp. donations - restricted" },
+  { group: "General admin and fundraising", name: "1300 Sisterhood", code: "1300", grantCode: "1300" },
+  { group: "General admin and fundraising", name: "Corporate improvements" },
+  { group: "General admin and fundraising", name: "MSU contributions" },
+  { group: "General admin and fundraising", name: "1549 GPD Daughters", code: "1549", grantCode: "1549" },
+];
+
+function toolNorm(s) {
+  return String(s || "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
+}
+function toolRound2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+function toolUnitId(seed) {
+  return "u-" + toolNorm(`${seed.group} ${seed.name}`).replace(/ /g, "-");
+}
+
+// Turns the seed list into this organization's units, matched to GrantFlow's
+// grants, cost centers and Templates. Matching is only a starting point: every
+// choice can be changed in the roll-forward window.
+function resolveToolUnits(grants, costCenters, budgets) {
+  const activeTemplates = budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status));
+  const ccCode = (c) => { const m = String(c.name || "").match(/^\s*(\d{4})/); return m ? m[1] : ""; };
+  return BUDGET_TOOL_SEED.map((seed) => {
+    const unit = { id: toolUnitId(seed), code: seed.code || "", name: seed.name, group: seed.group, kind: "new", grantId: "", costCenterId: "", templateIds: [], baseline: "none", include: true };
+
+    let grant = null;
+    if (seed.grantCode) {
+      const matches = grants.filter((g) => String(g.programCode || "").trim().toLowerCase() === seed.grantCode.toLowerCase());
+      grant = matches.find((g) => g.stage === "Active") || matches[0] || null;
+    }
+    let cc = null;
+    if (!grant && seed.costCenterCode) {
+      const ccs = costCenters.filter((c) => ccCode(c) === seed.costCenterCode);
+      cc = ccs.find((c) => activeTemplates.some((t) => t.costCenterId === c.id)) || ccs[0] || null;
+    }
+    if (grant) { unit.kind = "grant"; unit.grantId = grant.id; }
+    else if (cc) { unit.kind = "costCenter"; unit.costCenterId = cc.id; }
+
+    if (seed.baseline === "import") {
+      unit.baseline = "import";
+    } else {
+      let t = [];
+      if (grant) t = activeTemplates.filter((b) => b.grantId === grant.id);
+      else if (cc) t = activeTemplates.filter((b) => b.costCenterId === cc.id);
+      if (seed.templateRe) {
+        const re = new RegExp(seed.templateRe, "i");
+        const narrowed = t.filter((b) => re.test(b.title || ""));
+        t = narrowed.length ? narrowed : (seed.searchAllTemplates ? activeTemplates.filter((b) => re.test(b.title || "")) : []);
+      }
+      unit.templateIds = t.map((b) => b.id);
+      unit.baseline = unit.templateIds.length ? "template" : "none";
+      // a Template that belongs to no grant or cost center (the SLE sites)
+      if (unit.kind === "new" && unit.templateIds.length) unit.kind = "template";
+    }
+
+    // A grant that is anything but Active (Closing, Closed...) starts unchecked.
+    unit.include = !(grant && grant.stage !== "Active");
+    return unit;
+  });
+}
+
+// What to flag next to a unit in the roll-forward window.
+function toolUnitFlags(unit, grants, todayIso) {
+  const today = todayIso || new Date().toISOString().slice(0, 10);
+  const flags = [];
+  const g = unit.grantId ? grants.find((x) => x.id === unit.grantId) : null;
+  if (g && g.stage && g.stage !== "Active") flags.push({ text: g.stage, tone: "gray" });
+  if (g && g.stage === "Active" && g.end && String(g.end).slice(0, 10) < today) flags.push({ text: "End date passed", tone: "amber" });
+  if (unit.kind === "new") flags.push({ text: "Will be created", tone: "teal" });
+  else if (unit.kind === "template") flags.push({ text: "Template only", tone: "gray" });
+  if (unit.kind !== "new" && unit.baseline === "none") flags.push({ text: "No Template yet", tone: "teal" });
+  if (unit.baseline === "import") flags.push({ text: "Needs Sage import", tone: "teal" });
+  return flags;
+}
+
+// Where a unit's dates come from, for the roll-forward window.
+function toolUnitDates(unit, grants) {
+  const g = unit.grantId ? grants.find((x) => x.id === unit.grantId) : null;
+  if (g) return `${g.start ? fmtDate(g.start) : "?"} to ${g.end ? fmtDate(g.end) : "?"}`;
+  if (unit.kind === "costCenter") return "Cost center (ongoing)";
+  if (unit.kind === "template") return "Template only";
+  return "Not in GrantFlow yet";
+}
+
+// Active Templates that no unit uses. SSVF's combined Template is left out: its
+// three state units cover it.
+function toolUncoveredTemplates(model, budgets) {
+  const used = new Set();
+  const importGrants = new Set();
+  (model.units || []).forEach((u) => {
+    (u.templateIds || []).forEach((id) => used.add(id));
+    if (u.baseline === "import" && u.grantId) importGrants.add(u.grantId);
+  });
+  return budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status) && !used.has(b.id) && !(b.grantId && importGrants.has(b.grantId)));
+}
+
+// A unit for a Template that has none, named after its grant or cost center.
+function toolUnitForTemplate(t, grants, costCenters, group) {
+  const g = t.grantId ? grants.find((x) => x.id === t.grantId) : null;
+  const cc = !g && t.costCenterId ? costCenters.find((x) => x.id === t.costCenterId) : null;
+  const name = g ? `${g.programCode ? g.programCode + " " : ""}${g.title}`.trim() : cc ? cc.name : String(t.title || "Template").trim();
+  return { id: "u-" + uid(), code: g ? String(g.programCode || "") : "", name, group, kind: g ? "grant" : cc ? "costCenter" : "template", grantId: g ? g.id : "", costCenterId: cc ? cc.id : "", templateIds: [t.id], baseline: "template", include: true };
+}
+
+function newBudgetModel({ title, whoami, grants, costCenters, budgets, now }) {
+  const when = now || new Date();
+  return {
+    id: uid(), title, fy: when.getFullYear() + 1, createdBy: whoami || "Unknown",
+    createdAt: when.toISOString(), updatedAt: when.toISOString(), notes: "", setupDone: false,
+    units: resolveToolUnits(grants, costCenters, budgets),
+    imports: {}, // unitId -> "YYYY-MM" -> account key -> { category, subcategory, type, amount }
+    adjustments: { global: { revenue: 0, expense: 0 }, categories: {}, units: {}, lines: {} },
+    addedLines: {}, // unitId -> [{ id, category, subcategory, description, type, annual }]
+  };
+}
+
+let _toolKnownAccounts = null;
+function toolKnownAccounts() {
+  if (_toolKnownAccounts) return _toolKnownAccounts;
+  const m = {};
+  CATEGORIES.forEach((c) => c.subs.forEach((sub) => { m[`${c.name}|||${sub}`] = true; }));
+  _toolKnownAccounts = m;
+  return m;
+}
+// A wage-section name that is a benefit or tax rather than a position.
+function toolIsBenefitName(label) {
+  return /tax|benefit|401|hsa|ltd|dental|vision|medical|workers|insurance|pension|retire/i.test(String(label || ""));
+}
+// Some Templates type position or benefit names in as account names ("Awake Night
+// Staff", "Medical Benefits"). The budget tool keeps one row per standard
+// account, so those fold into 5000 or 5900 and a blank name under a one-account
+// category is filed under that account. Dollar totals are unchanged.
+function toolCanonicalAccount(category, subcategory) {
+  const sub = subcategory || "";
+  if (toolKnownAccounts()[`${category}|||${sub}`]) return { category, subcategory: sub };
+  if (category === "Wages and Benefits") return { category, subcategory: toolIsBenefitName(sub) ? "5900 - Payroll taxes and benefits" : "5000 - Salary and Wages" };
+  if (!sub) {
+    const cat = CATEGORIES.find((c) => c.name === category);
+    if (cat && cat.subs.length === 1) return { category, subcategory: cat.subs[0] };
+  }
+  return { category, subcategory: sub };
+}
+
+// The unit's starting figures: what FY(next-1) looks like by account and month.
+// Real months are the Template's actuals up to its "actuals complete through"
+// month, plus any Sage import for a month. Every other month is that account's
+// average over the real months, the same run-rate rule Org Budget uses. A
+// Template with no marker contributes its plan instead.
+function toolUnitBaseline(unit, model, budgets) {
+  const baseYear = (model.fy || 0) - 1;
+  const lines = {};
+  const ensure = (rawCategory, rawSubcategory, type) => {
+    const { category, subcategory } = toolCanonicalAccount(rawCategory, rawSubcategory);
+    const key = `${category}|||${subcategory}`;
+    return lines[key] || (lines[key] = { key, category, subcategory, type, base: Array(12).fill(0), real: Array(12).fill(false) });
+  };
+
+  const templates = (unit.templateIds || []).map((id) => budgets.find((b) => b.id === id)).filter(Boolean);
+  const cutoffs = [];
+  let anyPlan = false;
+  templates.forEach((t) => {
+    const proj = projectBudgetActuals(t);
+    const hasMarker = !!proj.cutoff;
+    if (hasMarker) cutoffs.push(proj.cutoff); else anyPlan = true;
+    (t.lines || []).forEach((l) => {
+      if (l.type !== "revenue" && l.type !== "expense") return; // balance-sheet lines are not part of a budget
+      const lp = proj.lines[l.id];
+      proj.cols.forEach((col, i) => {
+        if (col.year !== baseYear) return;
+        const m = col.monthIndex;
+        const line = ensure(l.category, l.subcategory, l.type);
+        if (hasMarker) {
+          line.base[m] += lp.values[i];
+          if (!lp.projected[i]) line.real[m] = true;
+        } else {
+          line.base[m] += Number((l.amounts || [])[i]) || 0;
+        }
+      });
+    });
+  });
+
+  // Sage imports: in an imported month every account is real, $0 unless the export has it.
+  const imp = (model.imports && model.imports[unit.id]) || {};
+  const importKeys = Object.keys(imp).filter((k) => Number(k.slice(0, 4)) === baseYear);
+  importKeys.forEach((mk) => Object.keys(imp[mk]).forEach((key) => { const r = imp[mk][key]; ensure(r.category, r.subcategory, r.type); }));
+  importKeys.forEach((mk) => {
+    const m = Number(mk.slice(5, 7)) - 1;
+    const inMonth = {};
+    Object.values(imp[mk]).forEach((r) => { const k = ensure(r.category, r.subcategory, r.type).key; inMonth[k] = (inMonth[k] || 0) + (Number(r.amount) || 0); });
+    Object.values(lines).forEach((line) => {
+      line.base[m] = inMonth[line.key] || 0;
+      line.real[m] = true;
+    });
+  });
+
+  // No Template behind the unit: fill the months we don't have with each account's average.
+  if (templates.length === 0) {
+    Object.values(lines).forEach((line) => {
+      const realIdx = line.real.map((r, i) => (r ? i : -1)).filter((i) => i >= 0);
+      if (realIdx.length === 0) return;
+      const avg = realIdx.reduce((s, i) => s + line.base[i], 0) / realIdx.length;
+      line.base = line.base.map((v, i) => (line.real[i] ? v : avg));
+    });
+  }
+
+  let basis = "none";
+  let basisLabel = "No baseline yet";
+  if (templates.length > 0) {
+    if (cutoffs.length > 0 && !anyPlan) {
+      const earliest = cutoffs.reduce((a, b) => ((a.year * 12 + a.monthIndex) <= (b.year * 12 + b.monthIndex) ? a : b));
+      basis = "actuals";
+      basisLabel = `Actuals through ${MONTHS[earliest.monthIndex]} ${earliest.year}, then run-rate`;
+    } else {
+      basis = "plan";
+      basisLabel = anyPlan && cutoffs.length ? "Mix of actuals and plan" : "FY plan (no actuals marker set)";
+    }
+    if (importKeys.length) basisLabel += ` · ${importKeys.length} imported month${importKeys.length === 1 ? "" : "s"}`;
+  } else if (importKeys.length > 0) {
+    basis = "import";
+    basisLabel = `Sage import: ${importKeys.length} month${importKeys.length === 1 ? "" : "s"}, then run-rate`;
+  }
+  return { lines: Object.values(lines), basis, basisLabel, importedMonths: importKeys.length };
+}
+
+// Which percentage applies to one line: the most specific one set wins.
+function toolAdjPct(adjustments, unit, line) {
+  const adj = adjustments || {};
+  const own = (adj.lines || {})[`${unit.id}|${line.key}`];
+  if (own && typeof own.pct === "number") return own.pct;
+  const u = (adj.units || {})[unit.id];
+  if (u && typeof u[line.type] === "number") return u[line.type];
+  const c = (adj.categories || {})[line.category];
+  if (typeof c === "number") return c;
+  const g = adj.global && adj.global[line.type];
+  return typeof g === "number" ? g : 0;
+}
+
+// The unit's next-year figures: baseline with the percentages applied, or an
+// exact yearly figure where one was typed in, plus any lines added by hand.
+function toolUnitModel(unit, baseline, model) {
+  const adj = model.adjustments || {};
+  const out = [];
+  baseline.lines.forEach((line) => {
+    const own = (adj.lines || {})[`${unit.id}|${line.key}`] || {};
+    const pct = toolAdjPct(adj, unit, line);
+    const baseTotal = line.base.reduce((a, b) => a + b, 0);
+    const hasOverride = typeof own.annual === "number" && !isNaN(own.annual);
+    let values;
+    if (hasOverride) values = Math.abs(baseTotal) > 0.005 ? line.base.map((v) => (v * own.annual) / baseTotal) : Array(12).fill(own.annual / 12);
+    else values = line.base.map((v) => v * (1 + pct / 100));
+    out.push({ ...line, pct, override: hasOverride ? own.annual : null, model: values.map(toolRound2), manual: false });
+  });
+  ((model.addedLines || {})[unit.id] || []).forEach((a) => {
+    out.push({
+      key: `added|||${a.id}`, category: a.category, subcategory: a.subcategory || "", description: a.description || "", type: a.type,
+      base: Array(12).fill(0), real: Array(12).fill(false), pct: 0, override: null,
+      model: Array(12).fill(toolRound2((Number(a.annual) || 0) / 12)), manual: true, addedId: a.id,
+    });
+  });
+  return out;
+}
+
+// All the totals the screens and the Excel file need: by unit, by group, for the
+// whole organization, and by category. Only units that roll forward count.
+function toolRollup(model, budgets) {
+  const zeros = () => Array(12).fill(0);
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+  const emptyTotals = () => ({ baseRev: zeros(), baseExp: zeros(), modRev: zeros(), modExp: zeros() });
+  const addInto = (t, line) => {
+    const isRev = line.type === "revenue";
+    const isExp = line.type === "expense";
+    if (!isRev && !isExp) return;
+    line.base.forEach((v, i) => { (isRev ? t.baseRev : t.baseExp)[i] += v; });
+    line.model.forEach((v, i) => { (isRev ? t.modRev : t.modExp)[i] += v; });
+  };
+  const summarize = (t) => ({
+    baseRev: sum(t.baseRev), baseExp: sum(t.baseExp), modRev: sum(t.modRev), modExp: sum(t.modExp),
+    baseNet: sum(t.baseRev) - sum(t.baseExp), modNet: sum(t.modRev) - sum(t.modExp),
+  });
+
+  const org = emptyTotals();
+  const categories = {};
+  const groupMap = {};
+  const groupOrder = [];
+  const units = [];
+  const issues = [];
+
+  (model.units || []).forEach((unit) => {
+    if (!unit.include) return;
+    const baseline = toolUnitBaseline(unit, model, budgets);
+    const lines = toolUnitModel(unit, baseline, model);
+    const monthly = emptyTotals();
+    lines.forEach((l) => {
+      addInto(monthly, l);
+      addInto(org, l);
+      if (l.type === "revenue" || l.type === "expense") {
+        const c = categories[l.category] || (categories[l.category] = { type: l.type, base: 0, model: 0 });
+        c.base += sum(l.base);
+        c.model += sum(l.model);
+      }
+    });
+    const needsData = baseline.basis === "none";
+    if (needsData) issues.push({ unitId: unit.id, name: unit.name, kind: unit.baseline === "import" ? "import" : "none" });
+    const row = { unit, baseline, lines, monthly, totals: summarize(monthly), needsData };
+    units.push(row);
+    if (!groupMap[unit.group]) { groupMap[unit.group] = { name: unit.group, units: [], monthly: emptyTotals() }; groupOrder.push(unit.group); }
+    const g = groupMap[unit.group];
+    g.units.push(row);
+    ["baseRev", "baseExp", "modRev", "modExp"].forEach((k) => monthly[k].forEach((v, i) => { g.monthly[k][i] += v; }));
+  });
+
+  const groups = groupOrder.map((name) => ({ ...groupMap[name], totals: summarize(groupMap[name].monthly) }));
+  return { units, groups, org: { monthly: org, totals: summarize(org) }, categories, issues };
+}
+
+// ---------------------------------------------------------------------------
+// Sage "one column per project or location" exports
+// ---------------------------------------------------------------------------
+
+const TOOL_MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+
+function toolParseDateCell(v) {
+  if (v instanceof Date && !isNaN(v)) return { year: v.getUTCFullYear(), monthIndex: v.getUTCMonth() };
+  const m = String(v || "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  return m ? { year: Number(m[3]), monthIndex: Number(m[1]) - 1 } : null;
+}
+
+// Reads a Sage profit and loss export that has one column per project or
+// location (for a single month). Returns the columns it found, the month, and
+// every account row with its figure in each column.
+function parseSageByColumnExport(aoa) {
+  const cell = (r, c) => (aoa[r] ? aoa[r][c] : null);
+  const text = (v) => (v === null || v === undefined ? "" : String(v).trim());
+
+  let h = -1;
+  for (let r = 0; r < Math.min(aoa.length - 1, 30); r++) {
+    if (text(cell(r, 1)) && /^month/i.test(text(cell(r + 1, 1)))) { h = r; break; }
+  }
+  if (h < 0) return { error: "Couldn't find the column headings. This should be a Sage profit and loss report with one column per project or location." };
+
+  const columns = [];
+  for (let c = 1; c < (aoa[h] || []).length; c++) {
+    const label = text(cell(h, c));
+    if (label) columns.push({ index: c, label });
+  }
+
+  let asOf = null;
+  let project = "";
+  for (let r = 0; r < h; r++) {
+    const k = text(cell(r, 0));
+    if (/^as of date/i.test(k)) asOf = toolParseDateCell(cell(r, 1));
+    if (/^project/i.test(k)) project = text(cell(r, 1));
+  }
+  const projectCode = (project.match(/^\s*(\d{4})/) || [])[1] || "";
+
+  const rawMonth = cell(h + 2, 1);
+  let month = toolParseDateCell(rawMonth);
+  if (!month) {
+    const idx = TOOL_MONTH_NAMES.indexOf(text(rawMonth).toLowerCase());
+    if (idx >= 0) month = { year: asOf ? (idx > asOf.monthIndex ? asOf.year - 1 : asOf.year) : null, monthIndex: idx };
+  }
+
+  const rows = [];
+  let section = "";
+  let inKind = false;
+  for (let i = h + 3; i < aoa.length; i++) {
+    const label = text(cell(i, 0));
+    if (!label) continue;
+    if (/^in\s*kind\s*activity$/i.test(label)) { inKind = true; continue; }
+    if (/^total\s+in\s*kind\s*activity/i.test(label)) { inKind = false; continue; }
+    if (inKind) continue;
+    const values = {};
+    let any = false;
+    columns.forEach((col) => { const v = cell(i, col.index); if (typeof v === "number") { values[col.index] = v; any = true; } });
+    if (!any) { if (!/^created on/i.test(label)) section = label; continue; } // a heading row
+    if (/^total\b/i.test(label) || /^changes in net income/i.test(label) || /^net income/i.test(label)) continue;
+    const code = (label.match(/^(\d{3,4}[A-Za-z]*)\s*-/) || [])[1] || "";
+    rows.push({ label, code, section, values });
+  }
+  return { columns, month, project, projectCode, asOf, rows };
+}
+
+let _toolAccountByName = null;
+function toolAccountByName() {
+  if (_toolAccountByName) return _toolAccountByName;
+  const map = {};
+  CATEGORIES.forEach((cat) => cat.subs.forEach((sub) => {
+    const name = toolNorm(sub.replace(/^\d{3,4}[A-Za-z]*\s*-\s*/, ""));
+    if (name && !map[name]) map[name] = { category: cat.name, subcategory: sub, type: cat.type };
+  }));
+  _toolAccountByName = map;
+  return map;
+}
+
+// The position names a unit's Templates already use, so a named row such as
+// "Awake Night Staff" finds the account it belongs to.
+function toolDescriptionIndex(unit, budgets) {
+  const idx = {};
+  (unit.templateIds || []).map((id) => budgets.find((b) => b.id === id)).filter(Boolean).forEach((t) => {
+    (t.lines || []).forEach((l) => {
+      const n = toolNorm(l.description);
+      if (n && (l.type === "revenue" || l.type === "expense") && !idx[n]) idx[n] = { category: l.category, subcategory: l.subcategory || "", type: l.type };
+    });
+  });
+  return idx;
+}
+
+// Which account a Sage row belongs to, and how sure we are.
+function toolMapSageRow(row, descIndex) {
+  if (row.code) {
+    const exact = CODE_TO_CATEGORY[row.code];
+    if (exact) return { ...exact, status: "code" };
+    // Sage gives every position, benefit and TFA type its own account number;
+    // GrantFlow keeps them under one account each.
+    const num = parseInt(row.code, 10);
+    const parent = num >= 5000 && num < 5900 ? "5000" : num >= 5900 && num < 6000 ? "5900" : num >= 7100 && num < 7200 ? "7100" : num >= 7200 && num < 7300 ? "7200" : null;
+    const t = parent && CODE_TO_CATEGORY[parent];
+    return t ? { ...t, status: "code" } : null;
+  }
+  const n = toolNorm(row.label);
+  const byName = toolAccountByName()[n];
+  if (byName) return { ...byName, status: "name" };
+  if (/^indirect( expense)?$/.test(n) && CODE_TO_CATEGORY["6990"]) return { ...CODE_TO_CATEGORY["6990"], status: "name" };
+  if (descIndex && descIndex[n]) return { ...descIndex[n], status: "position" };
+  if (/wage|benefit/i.test(row.section || "")) {
+    const t = CODE_TO_CATEGORY[toolIsBenefitName(row.label) ? "5900" : "5000"];
+    return t ? { ...t, status: "guessed" } : null;
+  }
+  return null;
+}
+
+// One column of the export, turned into account totals for a unit.
+function toolSageColumnLines(parsed, colIndex, descIndex) {
+  const lines = {};
+  const unmapped = [];
+  let matched = 0;
+  let guessed = 0;
+  let sourceTotal = 0;
+  parsed.rows.forEach((r) => {
+    const v = r.values[colIndex];
+    if (typeof v !== "number") return;
+    const t = toolMapSageRow(r, descIndex);
+    if (!t || (t.type !== "revenue" && t.type !== "expense")) {
+      if (Math.abs(v) > 0.005) unmapped.push({ label: r.label, amount: v });
+      return;
+    }
+    const key = `${t.category}|||${t.subcategory}`;
+    const e = lines[key] || (lines[key] = { category: t.category, subcategory: t.subcategory, type: t.type, amount: 0 });
+    e.amount += v;
+    if (t.type === "expense") sourceTotal += v;
+    if (t.status === "guessed") guessed += 1; else matched += 1;
+  });
+  Object.values(lines).forEach((e) => { e.amount = toolRound2(e.amount); });
+  return { lines, unmapped, matched, guessed, expenseTotal: toolRound2(sourceTotal) };
+}
+
+// Suggests which unit a column belongs to (null for the total columns).
+function toolGuessUnitForColumn(label, units, projectCode) {
+  const l = toolNorm(label);
+  if (/\(all\)/i.test(label) || /\ball programs\b/.test(l) || /\btotal\b/.test(l)) return null;
+  const code = (String(label).match(/^\s*(\d{4})/) || [])[1];
+  const pool = code ? units.filter((u) => u.code === code) : (projectCode ? units.filter((u) => u.code === projectCode) : units);
+  if (pool.length === 1) return pool[0].id;
+  const tokens = l.split(" ").filter((t) => t.length > 2);
+  const scored = pool.map((u) => ({ u, score: tokens.filter((t) => toolNorm(u.name).includes(t)).length })).filter((x) => x.score > 0).sort((a, b) => b.score - a.score);
+  if (scored.length === 1 || (scored.length > 1 && scored[0].score > scored[1].score)) return scored[0].u.id;
+  return null;
+}
+
+// Stores one month of a Sage export against the units chosen for its columns.
+function toolApplySageImport(model, assignments, parsed, monthKey, budgets) {
+  const imports = { ...(model.imports || {}) };
+  Object.keys(assignments).forEach((colKey) => {
+    const unitId = assignments[colKey];
+    if (!unitId) return;
+    const unit = (model.units || []).find((u) => u.id === unitId);
+    if (!unit) return;
+    const { lines } = toolSageColumnLines(parsed, Number(colKey), toolDescriptionIndex(unit, budgets));
+    imports[unitId] = { ...(imports[unitId] || {}), [monthKey]: lines };
+  });
+  return { ...model, imports };
+}
+
+// ---------------------------------------------------------------------------
+// Excel workbook
+// ---------------------------------------------------------------------------
+
+// Rows of an account-style profit and loss for a set of lines already added up by account.
+function toolAccountRows(accounts) {
+  const rows = [];
+  const zero = () => Array(12).fill(0);
+  const addTo = (t, a) => a.model.forEach((v, i) => { t.model[i] += v; t.base[i] += a.base[i]; });
+  const totals = { revenue: { model: zero(), base: zero() }, expense: { model: zero(), base: zero() } };
+  [["revenue", "Revenue"], ["expense", "Expenditures"]].forEach(([type, label]) => {
+    const ofType = accounts.filter((a) => a.type === type);
+    rows.push({ kind: "section", label }); // always shown, so an empty unit still has the full layout to fill in
+    const known = CATEGORIES.filter((c) => c.type === type).map((c) => c.name);
+    const extra = [...new Set(ofType.map((a) => a.category))].filter((n) => !known.includes(n));
+    [...known, ...extra].forEach((catName) => {
+      const inCat = ofType.filter((a) => a.category === catName).sort((a, b) => String(a.subcategory).localeCompare(String(b.subcategory)));
+      if (inCat.length === 0) return;
+      rows.push({ kind: "category", label: catName });
+      const catTotal = { model: zero(), base: zero() };
+      inCat.forEach((a) => { rows.push({ kind: "account", label: a.subcategory || "(no account)", model: a.model, base: a.base }); addTo(catTotal, a); addTo(totals[type], a); });
+      rows.push({ kind: "categoryTotal", label: `Total ${catName}`, model: catTotal.model, base: catTotal.base });
+    });
+    rows.push({ kind: "total", label: `Total ${label}`, model: totals[type].model, base: totals[type].base });
+  });
+  rows.push({ kind: "net", label: "Changes in net income", model: totals.revenue.model.map((v, i) => v - totals.expense.model[i]), base: totals.revenue.base.map((v, i) => v - totals.expense.base[i]) });
+  return rows;
+}
+
+// Adds lines up by account (category + subcategory).
+function toolAggregateAccounts(lineLists) {
+  const map = {};
+  lineLists.forEach((lines) => lines.forEach((l) => {
+    if (l.type !== "revenue" && l.type !== "expense") return;
+    const key = `${l.category}|||${l.subcategory || ""}`;
+    const a = map[key] || (map[key] = { category: l.category, subcategory: l.subcategory || "", type: l.type, base: Array(12).fill(0), model: Array(12).fill(0) });
+    l.base.forEach((v, i) => { a.base[i] += v; });
+    l.model.forEach((v, i) => { a.model[i] += v; });
+  }));
+  return Object.values(map);
+}
+
+function buildBudgetToolWorkbook(rollup, model) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "GrantFlow";
+  wb.created = new Date();
+  const FY = model.fy;
+  const BASE = model.fy - 1;
+  const HEAD = "FF1F5C6B", SECTION = "FFEEF3F0", TOTAL = "FFE3ECE8", GRAY = "FF8A8F87", RED = "FFB5443A", INK = "FF1C2624";
+  const NUM = '#,##0;(#,##0);"-"';
+  const PCT = '0.0%;(0.0%);"-"';
+  const TABS = ["FF1F5C6B", "FF2F6F53", "FFC08A2E", "FF7A5C8F", "FFB5443A", "FF3B7A99", "FF6B7F3A", "FF8A6B4F", "FF4F6D7A", "FF8A8F87"];
+  const monthLabels = MONTHS.map((m) => `${m} ${String(FY).slice(2)}`);
+  const used = new Set();
+  const sheetName = (s) => {
+    const base = String(s).replace(/[\\/*?:[\]]/g, "-").slice(0, 31).trim() || "Sheet";
+    let n = base;
+    let i = 2;
+    while (used.has(n.toLowerCase())) { const suf = ` ${i++}`; n = base.slice(0, 31 - suf.length) + suf; }
+    used.add(n.toLowerCase());
+    return n;
+  };
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+
+  const header = (ws, row, labels, leftCols) => {
+    const left = leftCols || [1];
+    ws.getRow(row).values = labels;
+    ws.getRow(row).eachCell((c) => {
+      c.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 10 };
+      c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: HEAD } };
+      c.alignment = { horizontal: left.includes(c.col) ? "left" : "right", vertical: "middle", indent: left.includes(c.col) && c.col > 1 ? 1 : 0 };
+    });
+    ws.getRow(row).height = 20;
+  };
+
+  const writeAccountSheet = (title, subtitle, accounts, tab) => {
+    const ws = wb.addWorksheet(sheetName(title.slice(0, 31)), { properties: { tabColor: { argb: tab } } });
+    ws.getCell(1, 1).value = "Nation's Finest";
+    ws.getCell(1, 1).font = { bold: true, size: 14, color: { argb: INK } };
+    ws.getCell(2, 1).value = `${title} · FY${FY} budget`;
+    ws.getCell(2, 1).font = { bold: true, size: 12, color: { argb: INK } };
+    ws.getCell(3, 1).value = subtitle;
+    ws.getCell(3, 1).font = { italic: true, size: 9, color: { argb: GRAY } };
+    header(ws, 5, ["Account", ...monthLabels, `FY${FY} total`, `FY${BASE} baseline`, "Change", "Change %"]);
+    let r = 6;
+    toolAccountRows(accounts).forEach((row) => {
+      const cells = ws.getRow(r);
+      cells.getCell(1).value = row.label;
+      if (row.model) {
+        row.model.forEach((v, i) => { cells.getCell(2 + i).value = toolRound2(v); });
+        const t = toolRound2(sum(row.model));
+        const b = toolRound2(sum(row.base));
+        cells.getCell(14).value = t;
+        cells.getCell(15).value = b;
+        cells.getCell(16).value = toolRound2(t - b);
+        if (Math.abs(b) > 0.005) cells.getCell(17).value = (t - b) / Math.abs(b);
+        for (let c = 2; c <= 16; c++) cells.getCell(c).numFmt = NUM;
+        cells.getCell(17).numFmt = PCT;
+      }
+      const bold = row.kind !== "account";
+      for (let c = 1; c <= 17; c++) {
+        const cell = cells.getCell(c);
+        cell.font = { bold, size: 10, color: { argb: INK } };
+        if (row.kind === "section") cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: SECTION } };
+        if (row.kind === "total" || row.kind === "net") {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: TOTAL } };
+          cell.border = { top: { style: row.kind === "net" ? "double" : "thin", color: { argb: INK } } };
+        }
+        if (row.kind === "categoryTotal") cell.border = { top: { style: "hair", color: { argb: GRAY } } };
+      }
+      cells.getCell(1).alignment = { indent: row.kind === "account" ? 3 : row.kind === "category" || row.kind === "categoryTotal" ? 1 : 0 };
+      if (row.kind === "net" && row.model) {
+        for (let c = 2; c <= 16; c++) if ((cells.getCell(c).value || 0) < 0) cells.getCell(c).font = { bold: true, size: 10, color: { argb: RED } };
+      }
+      r += 1;
+    });
+    ws.columns = [{ width: 46 }, ...monthLabels.map(() => ({ width: 11 })), { width: 13 }, { width: 14 }, { width: 12 }, { width: 10 }];
+    ws.views = [{ state: "frozen", xSplit: 1, ySplit: 5, showGridLines: false }];
+    ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+    return ws;
+  };
+
+  // ---- Summary ----
+  const ws = wb.addWorksheet(sheetName("Summary"), { properties: { tabColor: { argb: HEAD } } });
+  used.add("summary");
+  ws.getCell(1, 1).value = "Nation's Finest";
+  ws.getCell(1, 1).font = { bold: true, size: 16, color: { argb: INK } };
+  ws.getCell(2, 1).value = `FY${FY} budget · ${model.title || "Untitled model"}`;
+  ws.getCell(2, 1).font = { bold: true, size: 12, color: { argb: INK } };
+  ws.getCell(3, 1).value = `Calendar year ${FY} · built from FY${BASE} actuals through each unit's marked month, then run-rate · prepared ${new Date().toLocaleDateString("en-US")}`;
+  ws.getCell(3, 1).font = { italic: true, size: 9, color: { argb: GRAY } };
+  header(ws, 5, ["Group", "Units", `FY${BASE} revenue`, `FY${FY} revenue`, `FY${BASE} expense`, `FY${FY} expense`, `FY${BASE} net`, `FY${FY} net`, "Net change"]);
+  let r = 6;
+  const putSummary = (label, count, t, bold, fill) => {
+    const row = ws.getRow(r);
+    row.values = [label, count, t.baseRev, t.modRev, t.baseExp, t.modExp, t.baseNet, t.modNet, t.modNet - t.baseNet].map((v, i) => (i >= 2 ? toolRound2(v) : v));
+    for (let c = 1; c <= 9; c++) {
+      const cell = row.getCell(c);
+      cell.font = { bold, size: 10, color: { argb: c >= 7 && (cell.value || 0) < 0 ? RED : INK } };
+      if (c >= 3) cell.numFmt = NUM;
+      if (fill) { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: TOTAL } }; cell.border = { top: { style: "thin", color: { argb: INK } } }; }
+    }
+    r += 1;
+  };
+  rollup.groups.forEach((g) => putSummary(g.name, g.units.length, g.totals, false, false));
+  putSummary("Whole organization", rollup.units.length, rollup.org.totals, true, true);
+
+  r += 1;
+  ws.getCell(r, 1).value = "Units";
+  ws.getCell(r, 1).font = { bold: true, size: 12, color: { argb: INK } };
+  r += 1;
+  header(ws, r, ["Unit", "Group", `FY${BASE} revenue`, `FY${FY} revenue`, `FY${BASE} expense`, `FY${FY} expense`, `FY${BASE} net`, `FY${FY} net`, "Baseline"], [1, 2, 9]);
+  r += 1;
+  rollup.units.forEach((u) => {
+    const t = u.totals;
+    const row = ws.getRow(r);
+    row.values = [u.unit.name, u.unit.group, toolRound2(t.baseRev), toolRound2(t.modRev), toolRound2(t.baseExp), toolRound2(t.modExp), toolRound2(t.baseNet), toolRound2(t.modNet), u.baseline.basisLabel];
+    for (let c = 1; c <= 9; c++) {
+      const cell = row.getCell(c);
+      cell.font = { size: 10, color: { argb: c === 9 ? GRAY : c >= 7 && c <= 8 && (cell.value || 0) < 0 ? RED : INK } };
+      if (c >= 3 && c <= 8) cell.numFmt = NUM;
+      if (c === 9) cell.alignment = { horizontal: "left", indent: 1 };
+      if (c === 2) cell.alignment = { horizontal: "left", indent: 1 };
+    }
+    r += 1;
+  });
+
+  r += 1;
+  ws.getCell(r, 1).value = "Assumptions";
+  ws.getCell(r, 1).font = { bold: true, size: 12, color: { argb: INK } };
+  r += 1;
+  const adj = model.adjustments || {};
+  const note = (a, b) => { ws.getCell(r, 1).value = a; ws.getCell(r, 2).value = b; ws.getCell(r, 1).font = { size: 10, color: { argb: INK } }; ws.getCell(r, 2).font = { size: 10, color: { argb: INK } }; r += 1; };
+  const pct = (v) => (typeof v === "number" && v !== 0 ? `${v > 0 ? "+" : ""}${v}%` : "none");
+  note("Revenue, all units", pct(adj.global && adj.global.revenue));
+  note("Expense, all units", pct(adj.global && adj.global.expense));
+  Object.keys(adj.categories || {}).forEach((c) => note(`Category: ${c}`, pct(adj.categories[c])));
+  const unitAdj = Object.keys(adj.units || {}).length;
+  const lineAdj = Object.keys(adj.lines || {}).length;
+  const added = Object.values(model.addedLines || {}).reduce((n, l) => n + l.length, 0);
+  if (unitAdj) note("Units with their own percentages", String(unitAdj));
+  if (lineAdj) note("Lines adjusted individually", String(lineAdj));
+  if (added) note("Lines added by hand", String(added));
+  rollup.issues.forEach((i) => note(`${i.name}`, i.kind === "import" ? "No baseline yet: needs a Sage import" : "No baseline yet: no Template matched"));
+  ws.columns = [{ width: 38 }, { width: 30 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 14 }, { width: 14 }, { width: 44 }];
+  ws.views = [{ state: "frozen", ySplit: 5, showGridLines: false }];
+  ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+
+  // ---- Whole organization, then each group's total followed by its units ----
+  writeAccountSheet("TOTAL organization", `All ${rollup.units.length} units that roll forward`, toolAggregateAccounts(rollup.units.map((u) => u.lines)), HEAD);
+  rollup.groups.forEach((g, gi) => {
+    const tab = TABS[(gi + 1) % TABS.length];
+    writeAccountSheet(`TOTAL ${g.name}`, `${g.units.length} unit${g.units.length === 1 ? "" : "s"}`, toolAggregateAccounts(g.units.map((u) => u.lines)), tab);
+    g.units.forEach((u) => writeAccountSheet(`${u.unit.name} ${FY}`, u.baseline.basisLabel, toolAggregateAccounts([u.lines]), tab));
+  });
+  return wb;
+}
+
+// ---------------------------------------------------------------------------
+// Budget tool screens
+// ---------------------------------------------------------------------------
+
+const TOOL_TONES = {
+  amber: { bg: "#FBF3E4", fg: "#8A5A00" },
+  gray: { bg: "#EEF0EC", fg: "#5B6B66" },
+  teal: { bg: "#E3F0F2", fg: "#1F5C6B" },
+};
+
+function ToolChip({ text, tone }) {
+  const t = TOOL_TONES[tone] || TOOL_TONES.gray;
+  return <span className="inline-block text-[11px] px-1.5 py-0.5 rounded whitespace-nowrap" style={{ background: t.bg, color: t.fg }}>{text}</span>;
+}
+
+const toolPctText = (now, was) => {
+  if (Math.abs(was) < 0.5) return "—";
+  const p = ((now - was) / Math.abs(was)) * 100;
+  return `${p > 0 ? "+" : ""}${p.toFixed(1)}%`;
+};
+const toolSum = (a) => a.reduce((x, y) => x + y, 0);
+
+// A number box that lets you clear it (blank means "not set").
+function ToolNumberInput({ value, onCommit, placeholder, disabled, label, width, step }) {
+  const [text, setText] = useState(value === null || value === undefined ? "" : String(value));
+  useEffect(() => { setText(value === null || value === undefined ? "" : String(value)); }, [value]);
+  return (
+    <input
+      type="number"
+      step={step || "0.1"}
+      aria-label={label}
+      disabled={disabled}
+      placeholder={placeholder}
+      value={text}
+      className={`${width || "w-20"} rounded border px-2 py-1 text-sm text-right outline-none focus:ring-2`}
+      style={{ ...inputStyle, background: disabled ? "#F6F7F3" : "#FFFFFF" }}
+      onChange={(e) => {
+        const v = e.target.value;
+        setText(v);
+        if (v === "") onCommit(null);
+        else if (!isNaN(Number(v))) onCommit(Number(v));
+      }}
+    />
+  );
+}
+
+function BudgetToolView({ models, setModels, grants, budgets, costCenters, whoami, setTrash, canEdit, logActivity }) {
   const [openId, setOpenId] = useState(null);
-  const [wizardOpen, setWizardOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [confirm, setConfirm] = useState(null);
+  const open = models.find((m) => m.id === openId);
 
-  const open = scenarios.find((s) => s.id === openId);
-
-  const createScenario = (scen) => {
-    scen.createdBy = whoami || "Unknown";
-    setScenarios((prev) => [...prev, scen]);
-    logActivity?.("Scenario", "Created", scen.title);
-    setWizardOpen(false);
-    setOpenId(scen.id);
+  const update = (id, fn) => setModels((prev) => prev.map((m) => (m.id === id ? { ...fn(m), updatedAt: new Date().toISOString() } : m)));
+  const create = (title) => {
+    const model = newBudgetModel({ title, whoami, grants, costCenters, budgets });
+    setModels((prev) => [...prev, model]);
+    logActivity?.("Budget tool", "Created", title);
+    setCreating(false);
+    setOpenId(model.id);
   };
-  const saveScenario = (scen) => {
-    setScenarios((prev) => prev.map((s) => (s.id === scen.id ? scen : s)));
-    logActivity?.("Scenario", "Updated", scen.title);
-  };
-  const deleteScenario = (id) => {
-    const s = scenarios.find((x) => x.id === id);
-    pushTrash(setTrash, "scenario", s, whoami);
-    setScenarios((prev) => prev.filter((x) => x.id !== id));
-    logActivity?.("Scenario", "Deleted", s?.title || "Untitled scenario");
+  const remove = (id) => {
+    const m = models.find((x) => x.id === id);
+    pushTrash(setTrash, "budgetmodel", m, whoami);
+    setModels((prev) => prev.filter((x) => x.id !== id));
+    logActivity?.("Budget tool", "Deleted", m?.title || "Untitled model");
     setOpenId(null);
     setConfirm(null);
   };
 
   if (open) {
     return (
-      <ScenarioEditor
-        scenario={open}
-        grants={grants}
-        costCenters={costCenters}
-        budgets={budgets}
-        canEdit={canEdit}
-        onSave={saveScenario}
-        onDelete={canEdit ? () => setConfirm(open.id) : undefined}
-        onBack={() => setOpenId(null)}
-      />
+      <>
+        <BudgetModelEditor
+          key={open.id}
+          model={open}
+          grants={grants}
+          budgets={budgets}
+          costCenters={costCenters}
+          canEdit={canEdit}
+          onChange={(fn) => update(open.id, fn)}
+          onBack={() => setOpenId(null)}
+          onDelete={canEdit ? () => setConfirm(open.id) : undefined}
+        />
+        {confirm && <ConfirmModal message={`Delete "${open.title || "this model"}"? You can restore it from Trash.`} onConfirm={() => remove(confirm)} onCancel={() => setConfirm(null)} />}
+      </>
     );
   }
 
@@ -5845,63 +6162,746 @@ function ScenariosView({ scenarios, setScenarios, grants, budgets, costCenters, 
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Scenarios</h1>
-          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>A sandbox to play with what-if numbers — never touches real budgets or actuals</p>
+          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Budget tool</h1>
+          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Next year's budget, built from this year's actuals. Nothing here touches real budgets until you publish.</p>
         </div>
         {canEdit && (
-          <button onClick={() => setWizardOpen(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-            <Plus size={16} /> New scenario
+          <button onClick={() => setCreating(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+            <Plus size={16} /> New budget model
           </button>
         )}
       </div>
 
-      {scenarios.length === 0 ? (
+      {models.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          No scenarios yet — create one to start playing with what-if numbers.
+          No budget models yet. Create one to start next year's budget.
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {scenarios.map((s) => {
-            const revenue = s.lines.filter((l) => l.type === "revenue").reduce((a, l) => a + lineTotal(l), 0);
-            const expense = s.lines.filter((l) => l.type === "expense").reduce((a, l) => a + lineTotal(l), 0);
-            return (
-              <button
-                key={s.id}
-                onClick={() => setOpenId(s.id)}
-                className="text-left bg-white rounded-lg border p-4 hover:shadow-sm transition-shadow"
-                style={{ borderColor: "#E1E5DE" }}
-              >
-                <div className="font-medium" style={{ color: "#1C2624" }}>{s.title || "Untitled scenario"}</div>
-                <div className="text-xs mt-1" style={{ color: "#8A8F87" }}>{s.basedOn?.label ? `Based on ${s.basedOn.label}` : "Started blank"}</div>
-                <div className="flex items-center gap-4 mt-3 text-xs">
-                  <span style={{ color: "#2F6F53" }}>Rev {fmt(revenue)}</span>
-                  <span style={{ color: "#B5443A" }}>Exp {fmt(expense)}</span>
-                </div>
-                <div className="text-xs mt-2" style={{ color: "#8A8F87" }}>By {s.createdBy || "Unknown"}</div>
-              </button>
-            );
-          })}
+          {models.map((m) => <BudgetModelCard key={m.id} model={m} budgets={budgets} onOpen={() => setOpenId(m.id)} />)}
         </div>
       )}
 
-      {wizardOpen && (
-        <NewScenarioModal
+      {creating && <NewBudgetModelModal fy={new Date().getFullYear() + 1} onCreate={create} onClose={() => setCreating(false)} />}
+    </div>
+  );
+}
+
+function BudgetModelCard({ model, budgets, onOpen }) {
+  const r = useMemo(() => toolRollup(model, budgets), [model, budgets]);
+  const t = r.org.totals;
+  return (
+    <button onClick={onOpen} className="text-left bg-white rounded-lg border p-4 hover:shadow-sm transition-shadow" style={{ borderColor: "#E1E5DE" }}>
+      <div className="font-medium" style={{ color: "#1C2624" }}>{model.title || "Untitled model"}</div>
+      <div className="text-xs mt-1" style={{ color: "#8A8F87" }}>FY{model.fy} · {r.units.length} units rolling forward</div>
+      <div className="flex items-center gap-4 mt-3 text-xs">
+        <span style={{ color: "#2F6F53" }}>Rev {fmt(t.modRev)}</span>
+        <span style={{ color: "#B5443A" }}>Exp {fmt(t.modExp)}</span>
+      </div>
+      {r.issues.length > 0 && <div className="mt-2"><ToolChip text={`${r.issues.length} units need a baseline`} tone="amber" /></div>}
+      <div className="text-xs mt-2" style={{ color: "#8A8F87" }}>By {model.createdBy || "Unknown"}</div>
+    </button>
+  );
+}
+
+function NewBudgetModelModal({ fy, onCreate, onClose }) {
+  const [title, setTitle] = useState(`FY${fy} budget, draft 1`);
+  const go = () => { if (!title.trim()) { notify("Give the model a name first."); return; } onCreate(title.trim()); };
+  return (
+    <Modal title="New budget model" onClose={onClose}>
+      <div className="space-y-4">
+        <Field label="Name">
+          <input autoFocus className={inputCls} style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") go(); }} />
+        </Field>
+        <p className="text-sm" style={{ color: "#5B6B66" }}>
+          Calendar year {fy}, January to December. It starts from this year's actuals (what has been recorded so far, then each account's run-rate) and you adjust from there. Next you'll choose which grants and cost centers roll forward.
+        </p>
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button onClick={go} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Create</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function BudgetModelEditor({ model, grants, budgets, costCenters, canEdit, onChange, onBack, onDelete }) {
+  const rollup = useMemo(() => toolRollup(model, budgets), [model, budgets]);
+  const [pickerOpen, setPickerOpen] = useState(!model.setupDone);
+  const [detailId, setDetailId] = useState(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const t = rollup.org.totals;
+  const adj = model.adjustments || { global: {}, categories: {}, units: {}, lines: {} };
+  const detail = rollup.units.find((u) => u.unit.id === detailId);
+  const notRolling = (model.units || []).filter((u) => !u.include);
+
+  const setAdj = (fn) => onChange((m) => ({ ...m, adjustments: fn(m.adjustments || { global: {}, categories: {}, units: {}, lines: {} }) }));
+  const setGlobal = (type, v) => setAdj((a) => ({ ...a, global: { ...(a.global || {}), [type]: v === null ? 0 : v } }));
+  const setCategoryPct = (name, v) => setAdj((a) => { const c = { ...(a.categories || {}) }; if (v === null) delete c[name]; else c[name] = v; return { ...a, categories: c }; });
+
+  const exportExcel = async () => {
+    setExporting(true);
+    try {
+      const wb = buildBudgetToolWorkbook(rollup, model);
+      const buffer = await wb.xlsx.writeBuffer();
+      const slug = String(model.title || "budget").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "budget";
+      downloadFile(`${slug}-fy${model.fy}.xlsx`, buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } catch (e) {
+      notify("Couldn't build the Excel file: " + (e.message || e));
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const card = (label, now, was, color) => (
+    <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+      <div className="text-xs uppercase tracking-wide" style={{ color: "#8A8F87" }}>{label}</div>
+      <div className="text-xl font-medium mt-1" style={{ color }}>{fmt(now)}</div>
+      <div className="text-xs mt-1" style={{ color: "#5B6B66" }}>FY{model.fy - 1} baseline {fmt(was)} · {toolPctText(now, was)}</div>
+    </div>
+  );
+
+  const btn = "inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border";
+  const btnStyle = { borderColor: "#E1E5DE", color: "#1C2624", background: "#FFFFFF" };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <button onClick={onBack} className="text-sm mb-1" style={{ color: "#1F5C6B" }}>← All budget models</button>
+          <input
+            aria-label="Model name"
+            disabled={!canEdit}
+            value={model.title}
+            onChange={(e) => onChange((m) => ({ ...m, title: e.target.value }))}
+            className="font-display text-2xl bg-transparent outline-none border-b border-transparent focus:border-b w-full"
+            style={{ color: "#1C2624", borderColor: "#1F5C6B" }}
+          />
+          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>FY{model.fy} (calendar year) · built from FY{model.fy - 1} actuals</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {canEdit && <button onClick={() => setPickerOpen(true)} className={btn} style={btnStyle}>Choose units</button>}
+          {canEdit && <button onClick={() => setImportOpen(true)} className={btn} style={btnStyle}><Upload size={15} /> Import Sage export</button>}
+          {canEdit && <button onClick={() => setAddOpen(true)} className={btn} style={btnStyle}><Plus size={15} /> Add unit</button>}
+          <button onClick={exportExcel} disabled={exporting} className={btn + " text-white"} style={{ background: "#1F5C6B", borderColor: "#1F5C6B", opacity: exporting ? 0.6 : 1 }}>
+            <Download size={15} /> {exporting ? "Building…" : "Download Excel"}
+          </button>
+          {onDelete && <button onClick={onDelete} className={btn} style={{ ...btnStyle, color: "#B5443A" }}><Trash2 size={15} /> Delete</button>}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {card(`FY${model.fy} revenue`, t.modRev, t.baseRev, "#2F6F53")}
+        {card(`FY${model.fy} expense`, t.modExp, t.baseExp, "#B5443A")}
+        {card(`FY${model.fy} net`, t.modNet, t.baseNet, t.modNet < 0 ? "#B5443A" : "#1C2624")}
+      </div>
+
+      {rollup.issues.length > 0 && (
+        <div className="rounded-lg border p-3 text-sm flex gap-2" style={{ background: "#FBF3E4", borderColor: "#E9D5A8", color: "#6B4700" }}>
+          <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+          <div>
+            <span className="font-medium">{rollup.issues.length} unit{rollup.issues.length === 1 ? "" : "s"} {rollup.issues.length === 1 ? "has" : "have"} no baseline yet</span>, so {rollup.issues.length === 1 ? "it counts" : "they count"} as $0 in these totals:{" "}
+            {rollup.issues.slice(0, 6).map((i) => i.name).join(", ")}{rollup.issues.length > 6 ? `, and ${rollup.issues.length - 6} more` : ""}.
+            {" "}Import a Sage export, point the unit at a Template, or uncheck it in Choose units.
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+        <div className="font-medium mb-1" style={{ color: "#1C2624" }}>Adjustments</div>
+        <p className="text-xs mb-3" style={{ color: "#5B6B66" }}>
+          Percentages change FY{model.fy - 1}'s baseline. The most specific one wins: a line beats a unit, a unit beats a category, a category beats "all units". Open a unit to set its own.
+        </p>
+        <div className="flex flex-wrap items-center gap-6 mb-4 text-sm">
+          <label className="flex items-center gap-2" style={{ color: "#1C2624" }}>Revenue, all units
+            <ToolNumberInput label="Revenue percent, all units" disabled={!canEdit} value={(adj.global || {}).revenue ?? 0} onCommit={(v) => setGlobal("revenue", v)} /> %
+          </label>
+          <label className="flex items-center gap-2" style={{ color: "#1C2624" }}>Expense, all units
+            <ToolNumberInput label="Expense percent, all units" disabled={!canEdit} value={(adj.global || {}).expense ?? 0} onCommit={(v) => setGlobal("expense", v)} /> %
+          </label>
+        </div>
+        {Object.keys(rollup.categories).length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr style={{ color: "#8A8F87" }} className="text-xs text-left">
+                  <th className="py-1 pr-3 font-normal">By category</th>
+                  <th className="py-1 px-3 font-normal text-right">FY{model.fy - 1} baseline</th>
+                  <th className="py-1 px-3 font-normal text-right">Percent</th>
+                  <th className="py-1 pl-3 font-normal text-right">FY{model.fy}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.keys(rollup.categories).sort((a, b) => (rollup.categories[a].type === rollup.categories[b].type ? a.localeCompare(b) : rollup.categories[a].type === "revenue" ? -1 : 1)).map((name) => {
+                  const c = rollup.categories[name];
+                  const inherited = (adj.global || {})[c.type] ?? 0;
+                  return (
+                    <tr key={name} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                      <td className="py-1.5 pr-3" style={{ color: "#1C2624" }}>{name} <span className="text-xs" style={{ color: "#8A8F87" }}>{c.type}</span></td>
+                      <td className="py-1.5 px-3 text-right tabular-nums" style={{ color: "#5B6B66" }}>{fmt(c.base)}</td>
+                      <td className="py-1.5 px-3 text-right">
+                        <ToolNumberInput label={`Percent for ${name}`} disabled={!canEdit} value={typeof (adj.categories || {})[name] === "number" ? adj.categories[name] : null} placeholder={String(inherited)} onCommit={(v) => setCategoryPct(name, v)} />
+                      </td>
+                      <td className="py-1.5 pl-3 text-right tabular-nums" style={{ color: "#1C2624" }}>{fmt(c.model)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+              <th className="px-3 py-2 font-normal">Unit</th>
+              <th className="px-3 py-2 font-normal text-right">FY{model.fy - 1} revenue</th>
+              <th className="px-3 py-2 font-normal text-right">FY{model.fy} revenue</th>
+              <th className="px-3 py-2 font-normal text-right">FY{model.fy - 1} expense</th>
+              <th className="px-3 py-2 font-normal text-right">FY{model.fy} expense</th>
+              <th className="px-3 py-2 font-normal text-right">FY{model.fy} net</th>
+              <th className="px-3 py-2" />
+            </tr>
+          </thead>
+          <tbody>
+            {rollup.units.length === 0 && (
+              <tr><td colSpan={7} className="px-3 py-8 text-center" style={{ color: "#8A8F87" }}>No units are rolling forward. Use Choose units to pick them.</td></tr>
+            )}
+            {rollup.groups.map((g) => (
+              <Fragment key={g.name}>
+                <tr style={{ background: "#F6F7F3" }}>
+                  <td className="px-3 py-2 font-medium" style={{ color: "#1C2624" }}>{g.name} <span className="text-xs font-normal" style={{ color: "#8A8F87" }}>{g.units.length} unit{g.units.length === 1 ? "" : "s"}</span></td>
+                  <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(g.totals.baseRev)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(g.totals.modRev)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(g.totals.baseExp)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(g.totals.modExp)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums font-medium" style={{ color: g.totals.modNet < 0 ? "#B5443A" : "#1C2624" }}>{fmt(g.totals.modNet)}</td>
+                  <td />
+                </tr>
+                {g.units.map((u) => (
+                  <tr key={u.unit.id} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                    <td className="px-3 py-2 pl-6">
+                      <div style={{ color: "#1C2624" }}>{u.unit.name}</div>
+                      <div className="text-xs" style={{ color: u.needsData ? "#8A5A00" : "#8A8F87" }}>{u.baseline.basisLabel}</div>
+                    </td>
+                    <td className="px-3 py-2 text-right tabular-nums" style={{ color: "#5B6B66" }}>{fmt(u.totals.baseRev)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{fmt(u.totals.modRev)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums" style={{ color: "#5B6B66" }}>{fmt(u.totals.baseExp)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{fmt(u.totals.modExp)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums" style={{ color: u.totals.modNet < 0 ? "#B5443A" : "#1C2624" }}>{fmt(u.totals.modNet)}</td>
+                    <td className="px-3 py-2 text-right">
+                      <button onClick={() => setDetailId(u.unit.id)} aria-label={`Open ${u.unit.name}`} className="text-sm px-2 py-1 rounded border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>Open</button>
+                    </td>
+                  </tr>
+                ))}
+              </Fragment>
+            ))}
+            {rollup.units.length > 0 && (
+              <tr className="border-t-2" style={{ borderColor: "#1C2624", background: "#E3ECE8" }}>
+                <td className="px-3 py-2 font-medium">Whole organization</td>
+                <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(t.baseRev)}</td>
+                <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(t.modRev)}</td>
+                <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(t.baseExp)}</td>
+                <td className="px-3 py-2 text-right tabular-nums font-medium">{fmt(t.modExp)}</td>
+                <td className="px-3 py-2 text-right tabular-nums font-medium" style={{ color: t.modNet < 0 ? "#B5443A" : "#1C2624" }}>{fmt(t.modNet)}</td>
+                <td />
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {notRolling.length > 0 && (
+        <p className="text-xs" style={{ color: "#8A8F87" }}>{notRolling.length} unit{notRolling.length === 1 ? " is" : "s are"} not rolling forward: {notRolling.slice(0, 5).map((u) => u.name).join(", ")}{notRolling.length > 5 ? `, and ${notRolling.length - 5} more` : ""}.</p>
+      )}
+
+      {pickerOpen && (
+        <BudgetRollForwardModal
+          model={model}
+          grants={grants}
+          budgets={budgets}
+          canEdit={canEdit}
+          onChange={onChange}
+          onClose={() => { if (canEdit && !model.setupDone) onChange((m) => ({ ...m, setupDone: true })); setPickerOpen(false); }}
+        />
+      )}
+      {detail && <BudgetUnitModal model={model} row={detail} canEdit={canEdit} onChange={onChange} onClose={() => setDetailId(null)} />}
+      {importOpen && (
+        <BudgetSageImportModal
+          model={model}
+          budgets={budgets}
+          onImport={(next, summary) => { onChange(() => next); setImportOpen(false); notify(summary, "info"); }}
+          onClose={() => setImportOpen(false)}
+        />
+      )}
+      {addOpen && (
+        <BudgetAddUnitModal
+          model={model}
           grants={grants}
           costCenters={costCenters}
           budgets={budgets}
-          budgetGroups={budgetGroups}
-          onCreate={createScenario}
-          onClose={() => setWizardOpen(false)}
-        />
-      )}
-      {confirm && (
-        <ConfirmModal
-          message="This will permanently delete this scenario. It has no effect on any real budget or actual data."
-          onConfirm={() => deleteScenario(confirm)}
-          onCancel={() => setConfirm(null)}
+          onChange={onChange}
+          onClose={() => setAddOpen(false)}
         />
       )}
     </div>
+  );
+}
+
+// The roll-forward window: which units carry into next year, and where each
+// one's baseline comes from.
+function BudgetRollForwardModal({ model, grants, budgets, canEdit, onChange, onClose }) {
+  const [query, setQuery] = useState("");
+  const templates = useMemo(() => budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status)), [budgets]);
+  const q = query.trim().toLowerCase();
+  const visible = (model.units || []).filter((u) => !q || `${u.name} ${u.code} ${u.group}`.toLowerCase().includes(q));
+  const groups = [];
+  visible.forEach((u) => { let g = groups.find((x) => x.name === u.group); if (!g) { g = { name: u.group, units: [] }; groups.push(g); } g.units.push(u); });
+  const rolling = (model.units || []).filter((u) => u.include).length;
+
+  const patchUnits = (pred, patch) => onChange((m) => ({ ...m, units: m.units.map((u) => (pred(u) ? { ...u, ...patch } : u)) }));
+  const sourceValue = (u) => (u.baseline === "template" ? (u.templateIds.length === 1 ? u.templateIds[0] : "auto") : u.baseline);
+  const setSource = (u, v) => {
+    if (v === "auto") return;
+    if (v === "import") patchUnits((x) => x.id === u.id, { baseline: "import", templateIds: [] });
+    else if (v === "none") patchUnits((x) => x.id === u.id, { baseline: "none", templateIds: [] });
+    else patchUnits((x) => x.id === u.id, { baseline: "template", templateIds: [v] });
+  };
+
+  return (
+    <Modal title="Choose what rolls forward" onClose={onClose} size="xl">
+      <div className="space-y-3">
+        <p className="text-sm" style={{ color: "#5B6B66" }}>
+          Check the grants and cost centers that continue into FY{model.fy}. Grants that are Closing or Closed start unchecked. The last column is where each unit's FY{model.fy - 1} figures come from; change it if the match is wrong.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <Search size={14} className="absolute left-2.5 top-2.5" style={{ color: "#8A8F87" }} />
+            <input aria-label="Search units" className="rounded-md border pl-8 pr-3 py-2 text-sm outline-none" style={inputStyle} placeholder="Search units" value={query} onChange={(e) => setQuery(e.target.value)} />
+          </div>
+          {canEdit && <button onClick={() => patchUnits(() => true, { include: true })} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Check all</button>}
+          {canEdit && <button onClick={() => patchUnits(() => true, { include: false })} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Uncheck all</button>}
+          <span className="text-sm ml-auto" style={{ color: "#5B6B66" }}>{rolling} of {(model.units || []).length} units roll forward</span>
+        </div>
+
+        <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "55vh" }}>
+          {groups.map((g) => {
+            const allOn = g.units.every((u) => u.include);
+            return (
+              <div key={g.name}>
+                <div className="flex items-center gap-2 px-3 py-2 sticky top-0 z-10" style={{ background: "#F6F7F3", borderBottom: "1px solid #E1E5DE" }}>
+                  <input type="checkbox" aria-label={`Check all in ${g.name}`} disabled={!canEdit} checked={allOn} onChange={(e) => patchUnits((u) => u.group === g.name, { include: e.target.checked })} />
+                  <span className="font-medium text-sm" style={{ color: "#1C2624" }}>{g.name}</span>
+                  <span className="text-xs" style={{ color: "#8A8F87" }}>{g.units.filter((u) => u.include).length} of {g.units.length}</span>
+                </div>
+                {g.units.map((u) => (
+                  <div key={u.id} className="grid items-center gap-3 px-3 py-2 border-b text-sm" style={{ borderColor: "#EEF0EC", gridTemplateColumns: "22px minmax(180px,1.4fr) minmax(150px,1fr) minmax(150px,1.2fr) minmax(200px,1.2fr)" }}>
+                    <input type="checkbox" aria-label={`Roll forward ${u.name}`} disabled={!canEdit} checked={u.include} onChange={(e) => patchUnits((x) => x.id === u.id, { include: e.target.checked })} />
+                    <div style={{ color: u.include ? "#1C2624" : "#8A8F87" }}>{u.name}</div>
+                    <div className="text-xs" style={{ color: "#5B6B66" }}>{toolUnitDates(u, grants)}</div>
+                    <div className="flex flex-wrap gap-1">{toolUnitFlags(u, grants).map((f) => <ToolChip key={f.text} text={f.text} tone={f.tone} />)}</div>
+                    <select
+                      aria-label={`Baseline for ${u.name}`}
+                      disabled={!canEdit}
+                      value={sourceValue(u)}
+                      onChange={(e) => setSource(u, e.target.value)}
+                      className="rounded-md border px-2 py-1 text-xs outline-none w-full"
+                      style={inputStyle}
+                    >
+                      {sourceValue(u) === "auto" && <option value="auto">{u.templateIds.length} Templates (matched)</option>}
+                      <option value="none">No baseline yet</option>
+                      <option value="import">Sage import only</option>
+                      {templates.map((t) => <option key={t.id} value={t.id}>{String(t.title || "Template").trim().slice(0, 56)}</option>)}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+          {groups.length === 0 && <div className="p-6 text-center text-sm" style={{ color: "#8A8F87" }}>No units match.</div>}
+        </div>
+
+        <div className="flex justify-end">
+          <button onClick={onClose} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>{model.setupDone ? "Done" : "Continue"}</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// One unit's lines: baseline, a percentage or an exact figure, and what it comes to.
+function BudgetUnitModal({ model, row, canEdit, onChange, onClose }) {
+  const unit = row.unit;
+  const adj = model.adjustments || { global: {}, categories: {}, units: {}, lines: {} };
+  const unitAdj = (adj.units || {})[unit.id] || {};
+  const imports = Object.keys((model.imports || {})[unit.id] || {}).sort();
+  const [form, setForm] = useState({ category: "Operations", subcategory: "", description: "", annual: "" });
+  const catDef = CATEGORIES.find((c) => c.name === form.category) || CATEGORIES[0];
+
+  const order = [...CATEGORIES.map((c) => c.name), ...row.lines.map((l) => l.category)].filter((n, i, a) => a.indexOf(n) === i);
+  const byCat = order.map((name) => ({ name, lines: row.lines.filter((l) => l.category === name && (l.type === "revenue" || l.type === "expense")).sort((a, b) => String(a.subcategory).localeCompare(String(b.subcategory))) })).filter((c) => c.lines.length > 0);
+
+  const setUnitPct = (type, v) => onChange((m) => {
+    const a = m.adjustments || { global: {}, categories: {}, units: {}, lines: {} };
+    const units = { ...(a.units || {}) };
+    const u = { ...(units[unit.id] || {}) };
+    if (v === null) delete u[type]; else u[type] = v;
+    if (Object.keys(u).length === 0) delete units[unit.id]; else units[unit.id] = u;
+    return { ...m, adjustments: { ...a, units } };
+  });
+  const setLine = (line, patch) => onChange((m) => {
+    const a = m.adjustments || { global: {}, categories: {}, units: {}, lines: {} };
+    const k = `${unit.id}|${line.key}`;
+    const next = { ...((a.lines || {})[k] || {}), ...patch };
+    Object.keys(next).forEach((p) => { if (next[p] === null || next[p] === undefined) delete next[p]; });
+    const lines = { ...(a.lines || {}) };
+    if (Object.keys(next).length === 0) delete lines[k]; else lines[k] = next;
+    return { ...m, adjustments: { ...a, lines } };
+  });
+  const setAddedAnnual = (id, v) => onChange((m) => ({ ...m, addedLines: { ...(m.addedLines || {}), [unit.id]: ((m.addedLines || {})[unit.id] || []).map((a) => (a.id === id ? { ...a, annual: v === null ? 0 : v } : a)) } }));
+  const removeAdded = (id) => onChange((m) => ({ ...m, addedLines: { ...(m.addedLines || {}), [unit.id]: ((m.addedLines || {})[unit.id] || []).filter((a) => a.id !== id) } }));
+  const addLine = () => {
+    const annual = Number(form.annual);
+    if (!form.annual || isNaN(annual)) { notify("Enter the yearly amount for the new line."); return; }
+    const line = { id: uid(), category: form.category, subcategory: form.subcategory, description: form.description.trim(), type: catDef.type, annual };
+    onChange((m) => ({ ...m, addedLines: { ...(m.addedLines || {}), [unit.id]: [...((m.addedLines || {})[unit.id] || []), line] } }));
+    setForm({ ...form, description: "", annual: "" });
+  };
+  const removeImport = (mk) => onChange((m) => {
+    const imports2 = { ...(m.imports || {}) };
+    const mine = { ...(imports2[unit.id] || {}) };
+    delete mine[mk];
+    if (Object.keys(mine).length === 0) delete imports2[unit.id]; else imports2[unit.id] = mine;
+    return { ...m, imports: imports2 };
+  });
+  const T = row.totals;
+  const th = "px-3 py-2 font-normal text-right";
+
+  return (
+    <Modal title={unit.name} onClose={onClose} size="xl">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+          <span style={{ color: row.needsData ? "#8A5A00" : "#5B6B66" }}>{row.baseline.basisLabel}</span>
+          <label className="flex items-center gap-2" style={{ color: "#1C2624" }}>This unit's revenue
+            <ToolNumberInput label="Revenue percent for this unit" disabled={!canEdit} value={typeof unitAdj.revenue === "number" ? unitAdj.revenue : null} placeholder={String(toolAdjPct({ ...adj, units: {} }, unit, { type: "revenue", category: "" }))} onCommit={(v) => setUnitPct("revenue", v)} /> %
+          </label>
+          <label className="flex items-center gap-2" style={{ color: "#1C2624" }}>expense
+            <ToolNumberInput label="Expense percent for this unit" disabled={!canEdit} value={typeof unitAdj.expense === "number" ? unitAdj.expense : null} placeholder={String(toolAdjPct({ ...adj, units: {} }, unit, { type: "expense", category: "" }))} onCommit={(v) => setUnitPct("expense", v)} /> %
+          </label>
+        </div>
+
+        <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "50vh" }}>
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 z-10">
+              <tr className="text-xs" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+                <th className="px-3 py-2 font-normal text-left">Account</th>
+                <th className={th}>FY{model.fy - 1} baseline</th>
+                <th className={th}>Percent</th>
+                <th className={th}>Or exact FY{model.fy}</th>
+                <th className={th}>FY{model.fy}</th>
+                <th className={th}>Change</th>
+                <th className="px-3 py-2" />
+              </tr>
+            </thead>
+            <tbody>
+              {byCat.length === 0 && <tr><td colSpan={7} className="px-3 py-8 text-center" style={{ color: "#8A8F87" }}>Nothing to show yet. This unit has no baseline.</td></tr>}
+              {byCat.map((c) => (
+                <Fragment key={c.name}>
+                  <tr style={{ background: "#F6F7F3" }}><td colSpan={7} className="px-3 py-1.5 text-xs font-medium" style={{ color: "#1C2624" }}>{c.name}</td></tr>
+                  {c.lines.map((l) => {
+                    const own = (adj.lines || {})[`${unit.id}|${l.key}`] || {};
+                    const inherited = toolAdjPct({ ...adj, lines: {} }, unit, l);
+                    const base = toolSum(l.base);
+                    const now = toolSum(l.model);
+                    const hasOverride = l.override !== null;
+                    return (
+                      <tr key={l.key} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                        <td className="px-3 py-1.5 pl-6" style={{ color: "#1C2624" }}>
+                          {l.subcategory || "(no account)"}{l.manual && <span className="ml-2"><ToolChip text="added by hand" tone="teal" /></span>}
+                          {l.manual && l.description && <div className="text-xs" style={{ color: "#8A8F87" }}>{l.description}</div>}
+                        </td>
+                        <td className="px-3 py-1.5 text-right tabular-nums" style={{ color: "#5B6B66" }}>{fmt(base)}</td>
+                        <td className="px-3 py-1.5 text-right">
+                          {l.manual ? <span style={{ color: "#8A8F87" }}>—</span> : (
+                            <ToolNumberInput label={`Percent for ${l.subcategory}`} disabled={!canEdit || hasOverride} value={typeof own.pct === "number" ? own.pct : null} placeholder={String(inherited)} onCommit={(v) => setLine(l, { pct: v })} />
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5 text-right">
+                          <ToolNumberInput
+                            label={`Exact FY${model.fy} for ${l.subcategory}`}
+                            width="w-28"
+                            step="1"
+                            disabled={!canEdit}
+                            value={l.manual ? ((model.addedLines || {})[unit.id] || []).find((a) => a.id === l.addedId)?.annual ?? null : hasOverride ? l.override : null}
+                            placeholder="auto"
+                            onCommit={(v) => (l.manual ? setAddedAnnual(l.addedId, v) : setLine(l, { annual: v }))}
+                          />
+                        </td>
+                        <td className="px-3 py-1.5 text-right tabular-nums" style={{ color: "#1C2624" }}>{fmt(now)}</td>
+                        <td className="px-3 py-1.5 text-right tabular-nums text-xs" style={{ color: now - base < 0 ? "#2F6F53" : "#5B6B66" }}>{l.manual ? "new" : toolPctText(now, base)}</td>
+                        <td className="px-3 py-1.5 text-right">
+                          {canEdit && l.manual && <button aria-label="Remove this line" onClick={() => removeAdded(l.addedId)} style={{ color: "#B5443A" }}><X size={14} /></button>}
+                          {canEdit && !l.manual && (own.pct !== undefined || own.annual !== undefined) && <button aria-label={`Reset ${l.subcategory}`} onClick={() => setLine(l, { pct: null, annual: null })} title="Back to the default" style={{ color: "#8A8F87" }}><Undo2 size={14} /></button>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm" style={{ color: "#1C2624" }}>
+          <span>Revenue <b>{fmt(T.modRev)}</b> <span style={{ color: "#8A8F87" }}>(was {fmt(T.baseRev)})</span></span>
+          <span>Expense <b>{fmt(T.modExp)}</b> <span style={{ color: "#8A8F87" }}>(was {fmt(T.baseExp)})</span></span>
+          <span>Net <b style={{ color: T.modNet < 0 ? "#B5443A" : "#1C2624" }}>{fmt(T.modNet)}</b></span>
+        </div>
+
+        {canEdit && (
+          <div className="border rounded-lg p-3" style={{ borderColor: "#E1E5DE" }}>
+            <div className="text-sm font-medium mb-2" style={{ color: "#1C2624" }}>Add a line</div>
+            <div className="flex flex-wrap items-end gap-2">
+              <Field label="Category">
+                <select aria-label="New line category" className={inputCls} style={inputStyle} value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value, subcategory: "" })}>
+                  {CATEGORIES.filter((c) => c.type === "revenue" || c.type === "expense").map((c) => <option key={c.name}>{c.name}</option>)}
+                </select>
+              </Field>
+              <Field label="Account">
+                <select aria-label="New line account" className={inputCls} style={inputStyle} value={form.subcategory} onChange={(e) => setForm({ ...form, subcategory: e.target.value })}>
+                  <option value="">(none)</option>
+                  {catDef.subs.map((s) => <option key={s}>{s}</option>)}
+                </select>
+              </Field>
+              <Field label="Note">
+                <input aria-label="New line note" className={inputCls} style={inputStyle} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="What it is" />
+              </Field>
+              <Field label={`FY${model.fy} for the year`}>
+                <input aria-label="New line yearly amount" type="number" className={inputCls} style={{ ...inputStyle, width: 140 }} value={form.annual} onChange={(e) => setForm({ ...form, annual: e.target.value })} />
+              </Field>
+              <button onClick={addLine} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Add</button>
+            </div>
+          </div>
+        )}
+
+        {imports.length > 0 && (
+          <div className="text-sm" style={{ color: "#5B6B66" }}>
+            Imported from Sage:{" "}
+            {imports.map((mk) => (
+              <span key={mk} className="inline-flex items-center gap-1 mr-2 px-2 py-0.5 rounded" style={{ background: "#EEF0EC" }}>
+                {MONTHS[Number(mk.slice(5, 7)) - 1]} {mk.slice(0, 4)}
+                {canEdit && <button aria-label={`Remove ${mk} import`} onClick={() => removeImport(mk)} style={{ color: "#B5443A" }}><X size={12} /></button>}
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="flex justify-end">
+          <button onClick={onClose} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Done</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function BudgetAddUnitModal({ model, grants, costCenters, budgets, onChange, onClose }) {
+  const groups = [...new Set((model.units || []).map((u) => u.group))];
+  const templates = budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status));
+  const uncovered = toolUncoveredTemplates(model, budgets);
+  const [name, setName] = useState("");
+  const [group, setGroup] = useState(groups[0] || "Other");
+  const [newGroup, setNewGroup] = useState("");
+  const [source, setSource] = useState("none");
+
+  const add = () => {
+    if (!name.trim()) { notify("Give the unit a name."); return; }
+    const g = group === "__new" ? newGroup.trim() : group;
+    if (!g) { notify("Name the new group."); return; }
+    const unit = { id: "u-" + uid(), code: "", name: name.trim(), group: g, kind: "new", grantId: "", costCenterId: "", templateIds: [], baseline: "none", include: true };
+    if (source === "import") unit.baseline = "import";
+    else if (source !== "none") { unit.baseline = "template"; unit.templateIds = [source]; unit.kind = "template"; }
+    onChange((m) => ({ ...m, units: [...m.units, unit] }));
+    onClose();
+  };
+  const addUncovered = () => {
+    const added = uncovered.map((t) => toolUnitForTemplate(t, grants, costCenters, "From GrantFlow"));
+    onChange((m) => ({ ...m, units: [...m.units, ...added] }));
+    onClose();
+  };
+
+  return (
+    <Modal title="Add a unit" onClose={onClose}>
+      <div className="space-y-4">
+        {uncovered.length > 0 && (
+          <div className="rounded-lg border p-3 text-sm" style={{ borderColor: "#E1E5DE", background: "#FAFBF9" }}>
+            <div style={{ color: "#1C2624" }}>{uncovered.length} active Template{uncovered.length === 1 ? "" : "s"} in GrantFlow {uncovered.length === 1 ? "isn't" : "aren't"} in any unit:</div>
+            <div className="text-xs mt-1" style={{ color: "#5B6B66" }}>{uncovered.slice(0, 6).map((t) => String(t.title || "").trim()).join(", ")}{uncovered.length > 6 ? `, and ${uncovered.length - 6} more` : ""}</div>
+            <button onClick={addUncovered} className="mt-2 px-3 py-1.5 rounded-md text-sm border" style={{ borderColor: "#1F5C6B", color: "#1F5C6B" }}>Add all {uncovered.length} as units</button>
+          </div>
+        )}
+        <Field label="Unit name"><input autoFocus aria-label="Unit name" className={inputCls} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+        <Field label="Group">
+          <select aria-label="Group" className={inputCls} style={inputStyle} value={group} onChange={(e) => setGroup(e.target.value)}>
+            {groups.map((g) => <option key={g}>{g}</option>)}
+            <option value="__new">New group…</option>
+          </select>
+        </Field>
+        {group === "__new" && <Field label="New group name"><input aria-label="New group name" className={inputCls} style={inputStyle} value={newGroup} onChange={(e) => setNewGroup(e.target.value)} /></Field>}
+        <Field label="Baseline from">
+          <select aria-label="Baseline from" className={inputCls} style={inputStyle} value={source} onChange={(e) => setSource(e.target.value)}>
+            <option value="none">No baseline yet</option>
+            <option value="import">Sage import only</option>
+            {templates.map((t) => <option key={t.id} value={t.id}>{String(t.title || "Template").trim().slice(0, 70)}</option>)}
+          </select>
+        </Field>
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button onClick={add} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Add unit</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// Import one month of a Sage profit and loss export that has a column per project
+// or location, and say which unit each column is.
+function BudgetSageImportModal({ model, budgets, onImport, onClose }) {
+  const [parsed, setParsed] = useState(null);
+  const [error, setError] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [assign, setAssign] = useState({});
+  const [year, setYear] = useState("");
+  const [monthIndex, setMonthIndex] = useState(0);
+
+  const readFile = async (file) => {
+    setError("");
+    setParsed(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: null });
+      const p = parseSageByColumnExport(aoa);
+      if (p.error) { setError(p.error); return; }
+      if (p.rows.length === 0) { setError("No account rows were found in this file."); return; }
+      const a = {};
+      p.columns.forEach((c) => { a[c.index] = toolGuessUnitForColumn(c.label, model.units, p.projectCode) || ""; });
+      setAssign(a);
+      setYear(p.month && p.month.year ? String(p.month.year) : String(model.fy - 1));
+      setMonthIndex(p.month ? p.month.monthIndex : 0);
+      setFileName(file.name);
+      setParsed(p);
+    } catch (e) {
+      setError("Couldn't read that file: " + (e.message || e));
+    }
+  };
+
+  const info = useMemo(() => {
+    if (!parsed) return {};
+    const out = {};
+    parsed.columns.forEach((c) => {
+      const u = (model.units || []).find((x) => x.id === assign[c.index]);
+      out[c.index] = toolSageColumnLines(parsed, c.index, u ? toolDescriptionIndex(u, budgets) : {});
+    });
+    return out;
+  }, [parsed, assign, model.units, budgets]);
+
+  const chosen = parsed ? parsed.columns.filter((c) => assign[c.index]) : [];
+  const yearNum = Number(year);
+  const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+  const duplicates = chosen.filter((c) => ((model.imports || {})[assign[c.index]] || {})[monthKey]);
+  const lost = chosen.reduce((s, c) => s + info[c.index].unmapped.length, 0);
+  const sameUnit = chosen.some((c, i) => chosen.findIndex((d) => assign[d.index] === assign[c.index]) !== i);
+  const canImport = chosen.length > 0 && Number.isInteger(yearNum) && yearNum > 2000 && !sameUnit;
+
+  const run = () => {
+    const clean = {};
+    chosen.forEach((c) => { clean[c.index] = assign[c.index]; });
+    const next = toolApplySageImport(model, clean, parsed, monthKey, budgets);
+    onImport(next, `Imported ${MONTHS[monthIndex]} ${year} for ${chosen.length} unit${chosen.length === 1 ? "" : "s"}.`);
+  };
+
+  return (
+    <Modal title="Import a Sage export" onClose={onClose} size="xl">
+      <div className="space-y-4">
+        <p className="text-sm" style={{ color: "#5B6B66" }}>
+          Use a Sage profit and loss report with one column per project or location, for one month. Each import fills that month for the units you choose; import more months to build the year. Months you don't import are filled with each account's average.
+        </p>
+        <div>
+          <label className="inline-flex items-center gap-2 px-3 py-2 rounded-md text-sm border cursor-pointer" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            <Upload size={15} /> {parsed ? "Choose a different file" : "Choose an Excel file"}
+            <input aria-label="Sage export file" type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) readFile(f); e.target.value = ""; }} />
+          </label>
+          {fileName && <span className="ml-3 text-sm" style={{ color: "#5B6B66" }}>{fileName}</span>}
+        </div>
+        {error && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{error}</div>}
+
+        {parsed && (
+          <>
+            <div className="flex flex-wrap items-center gap-3 text-sm" style={{ color: "#1C2624" }}>
+              <span>This file is for</span>
+              <select aria-label="Month" className="rounded-md border px-2 py-1.5 text-sm" style={inputStyle} value={monthIndex} onChange={(e) => setMonthIndex(Number(e.target.value))}>
+                {MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}
+              </select>
+              <input aria-label="Year" type="number" className="rounded-md border px-2 py-1.5 text-sm w-24" style={inputStyle} value={year} onChange={(e) => setYear(e.target.value)} />
+              {!(parsed.month && parsed.month.year) && <ToolChip text="Year not in the file; check it" tone="amber" />}
+            </div>
+
+            <div className="border rounded-lg overflow-auto" style={{ borderColor: "#E1E5DE", maxHeight: "40vh" }}>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-xs text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+                    <th className="px-3 py-2 font-normal">Column in the file</th>
+                    <th className="px-3 py-2 font-normal">Unit</th>
+                    <th className="px-3 py-2 font-normal text-right">Expense</th>
+                    <th className="px-3 py-2 font-normal text-right">Revenue</th>
+                    <th className="px-3 py-2 font-normal">Rows</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {parsed.columns.map((c) => {
+                    const r = info[c.index];
+                    const rev = Object.values(r.lines).filter((l) => l.type === "revenue").reduce((s, l) => s + l.amount, 0);
+                    return (
+                      <tr key={c.index} className="border-t" style={{ borderColor: "#EEF0EC" }}>
+                        <td className="px-3 py-2" style={{ color: "#1C2624" }}>{c.label}</td>
+                        <td className="px-3 py-2">
+                          <select aria-label={`Unit for ${c.label}`} className="rounded-md border px-2 py-1 text-sm w-full" style={inputStyle} value={assign[c.index] || ""} onChange={(e) => setAssign({ ...assign, [c.index]: e.target.value })}>
+                            <option value="">Skip this column</option>
+                            {(model.units || []).map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+                          </select>
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums">{assign[c.index] ? fmt(r.expenseTotal) : "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{assign[c.index] ? fmt(rev) : "—"}</td>
+                        <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>
+                          {assign[c.index] ? (
+                            <>{r.matched + r.guessed} placed{r.guessed > 0 && <> · <span style={{ color: "#8A5A00" }}>{r.guessed} guessed</span></>}{r.unmapped.length > 0 && <> · <span style={{ color: "#B5443A" }}>{r.unmapped.length} not placed</span></>}</>
+                          ) : ""}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {parsed.columns.some((c) => !assign[c.index] && /all|total/i.test(c.label)) && (
+              <p className="text-xs" style={{ color: "#8A8F87" }}>Columns that add other columns together (marked "All") are skipped automatically so nothing counts twice.</p>
+            )}
+            {sameUnit && <div className="text-sm" style={{ color: "#B5443A" }}>Two columns are set to the same unit. Pick a different unit for one of them, or skip it.</div>}
+            {lost > 0 && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBF3E4", borderColor: "#E9D5A8", color: "#6B4700" }}>{lost} row{lost === 1 ? "" : "s"} with money couldn't be matched to an account and will be left out.</div>}
+            {duplicates.length > 0 && <div className="text-sm" style={{ color: "#8A5A00" }}>{MONTHS[monthIndex]} {year} was already imported for {duplicates.map((c) => c.label).join(", ")}. Importing again replaces it.</div>}
+          </>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>Cancel</button>
+          <button onClick={run} disabled={!canImport} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B", opacity: canImport ? 1 : 0.5 }}>Import {chosen.length > 0 ? `${chosen.length} column${chosen.length === 1 ? "" : "s"}` : ""}</button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -9698,7 +10698,7 @@ function WhoamiModal({ current, onSave, onSkip }) {
 function ActivityLogView({ activity }) {
   const [entityFilter, setEntityFilter] = useState("All");
   const [personFilter, setPersonFilter] = useState("All");
-  const entities = ["All", "Grant", "Budget", "Cost Center", "Budget Group", "Scenario", "Report", "Staff", "Task", "Invoice", "Data"];
+  const entities = ["All", "Grant", "Budget", "Cost Center", "Budget Group", "Scenario", "Budget tool", "Report", "Staff", "Task", "Invoice", "Data"];
   const people = ["All", ...new Set(activity.map((a) => a.by).filter(Boolean))];
   const visible = activity
     .filter((a) => entityFilter === "All" || a.entity === entityFilter)
@@ -9906,7 +10906,7 @@ function pickCadences(val) {
   return { matched: [...new Set(matched)], leftover: leftover.join(", ") };
 }
 
-function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [], setRestrictedFunds, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, paylocitySnapshots = [], setPaylocitySnapshots }) {
+function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, costCenters, budgetGroups, scenarios, budgetModels = [], setBudgetModels = () => {}, trash, setGrants, setBudgets, setReports, setStaff, setTasks, setActivity, setInvoices, setCostCenters, setBudgetGroups, setScenarios, setTrash, canEdit, logActivity, restrictedFunds = [], setRestrictedFunds, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, paylocitySnapshots = [], setPaylocitySnapshots }) {
   const [showHealthCheck, setShowHealthCheck] = useState(false);
 
   // Runs the same categories of checks we've done manually against backup
@@ -10012,7 +11012,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   const [reportImportSummary, setReportImportSummary] = useState("");
 
   const downloadBackup = () => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, budgetTool: budgetModels, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
     downloadFile(`nations-finest-grantflow-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), "application/json");
   };
 
@@ -10049,9 +11049,9 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
   };
   const [copyStatus, setCopyStatus] = useState("");
   const backupText = useMemo(() => {
-    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
+    const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, budgetTool: budgetModels, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
     return JSON.stringify(payload, null, 2);
-  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots]);
+  }, [grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, budgetModels, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots]);
 
   const copyBackupText = async () => {
     try {
@@ -10080,6 +11080,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
         if (Array.isArray(data.costCenters)) setCostCenters(data.costCenters);
         if (Array.isArray(data.budgetGroups)) setBudgetGroups(data.budgetGroups);
         if (Array.isArray(data.scenarios)) setScenarios(data.scenarios);
+        if (Array.isArray(data.budgetTool)) setBudgetModels(data.budgetTool);
         if (Array.isArray(data.trash)) setTrash(data.trash);
         if (Array.isArray(data.activity)) setActivity(data.activity);
         if (Array.isArray(data.restrictedFunds)) setRestrictedFunds?.(data.restrictedFunds);
@@ -10593,7 +11594,7 @@ const NAV = [
   { key: "grant-reports", label: "Grant Reports", icon: ClipboardList },
   { key: "reporting", label: "Reporting", icon: BarChart3 },
   { key: "org-budget", label: "Org Budget", icon: PieChart },
-  { key: "scenarios", label: "Scenarios", icon: FlaskConical },
+  { key: "budgettool", label: "Budget tool", icon: FlaskConical },
   { key: "burn-rate", label: "Burn Rate", icon: TrendingUp },
   { key: "restricted-funds", label: "Restricted Funds", icon: Lock },
   { key: "personnel", label: "Personnel", icon: Users },
@@ -10621,6 +11622,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   const [costCenters, setCostCenters] = useState([]);
   const [budgetGroups, setBudgetGroups] = useState([]);
   const [scenarios, setScenarios] = useState([]);
+  const [budgetModels, setBudgetModels] = useState([]);
   const [trash, setTrash] = useState([]);
   const [paylocityProgramMap, setPaylocityProgramMap] = useState([]);
   const [paylocityLastImport, setPaylocityLastImport] = useState(null);
@@ -10736,7 +11738,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   latestStateRef.current = {
     "grantflow:grants": grants, "grantflow:budgets": budgets, "grantflow:reports": reports, "grantflow:staff": staff,
     "grantflow:activity": activity, "grantflow:tasks": tasks, "grantflow:invoices": invoices, "grantflow:costcenters": costCenters,
-    "grantflow:budgetgroups": budgetGroups, "grantflow:scenarios": scenarios, "grantflow:paylocityprogrammap": paylocityProgramMap,
+    "grantflow:budgetgroups": budgetGroups, "grantflow:scenarios": scenarios, "grantflow:budgettool": budgetModels, "grantflow:paylocityprogrammap": paylocityProgramMap,
     "grantflow:paylocitylastimport": paylocityLastImport, "grantflow:restrictedfunds": restrictedFunds,
     "grantflow:paylocitysnapshots": paylocitySnapshots, "grantflow:trash": trash,
   };
@@ -10762,6 +11764,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
     { key: "grantflow:costcenters", label: "Cost Centers", set: setCostCenters },
     { key: "grantflow:budgetgroups", label: "Budget Groups", set: setBudgetGroups },
     { key: "grantflow:scenarios", label: "Scenarios", set: setScenarios },
+    { key: "grantflow:budgettool", label: "Budget tool", set: setBudgetModels },
     { key: "grantflow:paylocityprogrammap", label: "Paylocity program mapping", set: setPaylocityProgramMap },
     { key: "grantflow:paylocitylastimport", label: "Paylocity last import", set: setPaylocityLastImport },
     { key: "grantflow:restrictedfunds", label: "Restricted funds", set: setRestrictedFunds },
@@ -10926,6 +11929,11 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
 
   useEffect(() => {
     if (!loaded) return;
+    queueSave("grantflow:budgettool", budgetModels, "Budget tool");
+  }, [budgetModels, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
     queueSave("grantflow:paylocityprogrammap", paylocityProgramMap, "Paylocity program mapping");
   }, [paylocityProgramMap, loaded]);
 
@@ -10992,7 +12000,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       } catch (e) { /* no meta yet */ }
       if (meta?.lastBackupDate === today) return; // already backed up today
       try {
-        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
+        const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, budgetTool: budgetModels, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
         await window.storage.set(`grantflow:autobackup:${today}`, JSON.stringify(payload), true);
         await window.storage.set(metaKey, JSON.stringify({ lastBackupDate: today }), true);
         const list = await window.storage.list("grantflow:autobackup:", true);
@@ -11211,10 +12219,10 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           />
         ) : tab === "org-budget" ? (
           <OrgBudgetView grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups} />
-        ) : tab === "scenarios" ? (
-          <ScenariosView
-            scenarios={scenarios} setScenarios={setScenarios}
-            grants={grants} budgets={budgets} costCenters={costCenters} budgetGroups={budgetGroups}
+        ) : tab === "budgettool" ? (
+          <BudgetToolView
+            models={budgetModels} setModels={setBudgetModels}
+            grants={grants} budgets={budgets} costCenters={costCenters}
             whoami={currentUserEmail || whoami} setTrash={setTrash} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "burn-rate" ? (
@@ -11241,13 +12249,13 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
           <TrashView
             trash={trash} setTrash={setTrash}
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setTasks={setTasks}
-            setInvoices={setInvoices} setStaff={setStaff} setCostCenters={setCostCenters} setScenarios={setScenarios}
+            setInvoices={setInvoices} setStaff={setStaff} setCostCenters={setCostCenters} setScenarios={setScenarios} setBudgetModels={setBudgetModels}
             setRestrictedFunds={setRestrictedFunds}
             isAdmin={isAdmin} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "data" ? (
           <DataView
-            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} scenarios={scenarios} trash={trash} activity={activity}
+            grants={grants} budgets={budgets} reports={reports} staff={staff} tasks={tasks} invoices={invoices} costCenters={costCenters} budgetGroups={budgetGroups} scenarios={scenarios} budgetModels={budgetModels} setBudgetModels={setBudgetModels} trash={trash} activity={activity}
             setGrants={setGrants} setBudgets={setBudgets} setReports={setReports} setStaff={setStaff} setTasks={setTasks} setInvoices={setInvoices} setCostCenters={setCostCenters} setBudgetGroups={setBudgetGroups} setScenarios={setScenarios} setTrash={setTrash} setActivity={setActivity}
             canEdit={canEdit}
             logActivity={logActivity}
