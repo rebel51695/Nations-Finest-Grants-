@@ -135,15 +135,21 @@ function computeOrgFYTotals(budgets, grants, costCenters, budgetGroups, calYear)
   return { planRevenue, actualExpense };
 }
 
+// Copies actuals from the Template(s) feeding a Grant Budget onto it, matching by
+// category+subcategory and by calendar month. When several Templates feed the
+// same Grant Budget (SSVF's three states, GPD's two locations) their actuals are
+// ADDED together. Copying them one at a time let whichever Template saved last
+// overwrite the rest. The result is always worked out from the Templates as they
+// stand, so repeating it never piles up.
+// Known limitation, unchanged on purpose: inside ONE Template, lines that share a
+// category+subcategory (one wage line per position, told apart only by their
+// description) still behave as they always have: the last one wins and the others
+// are dropped. Fixing that changes Grant Budget actuals, so it is a separate fix.
 function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
-  const linkedIds = templateBudget.linkedBudgetIds && templateBudget.linkedBudgetIds.length
-    ? templateBudget.linkedBudgetIds
-    : (templateBudget.linkedBudgetId ? [templateBudget.linkedBudgetId] : []); // legacy single-link fallback
+  const linkedIds = linkedIdsOf(templateBudget);
   if (templateBudget.budgetType !== "Template" || linkedIds.length === 0 || !templateBudget.periodStart || !templateBudget.periodEnd) return [];
 
-  const templateCols = monthColumnsForBudget(templateBudget.periodStart, templateBudget.periodEnd);
   const results = [];
-
   linkedIds.forEach((targetId) => {
     const target = allBudgets.find((b) => b.id === targetId);
     if (!target || !target.periodStart || !target.periodEnd) return;
@@ -152,32 +158,56 @@ function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
     const targetColIndexByYM = {};
     targetCols.forEach((c, j) => { targetColIndexByYM[`${c.year}-${c.monthIndex}`] = j; });
 
+    // Every Template feeding this Grant Budget. The version passed in is the
+    // newest copy of its own Template, so it replaces any older one in the list.
+    const feeders = allBudgets.filter((b) => b.id !== templateBudget.id && b.budgetType === "Template" && b.periodStart && b.periodEnd && linkedIdsOf(b).includes(targetId));
+    feeders.push(templateBudget);
+
+    // key -> the total for each month of the target, added across the feeders.
+    // Only months that fall inside the target's period count, and a line is only
+    // created in the target when some feeder line has an in-range month.
+    const sums = {};
+    feeders.forEach((f) => {
+      const cols = monthColumnsForBudget(f.periodStart, f.periodEnd);
+      // this one Template's figure for each account and month (last line wins, as before)
+      const own = {};
+      (f.lines || []).forEach((tl) => {
+        const key = `${tl.category}|||${tl.subcategory || ""}`;
+        (tl.actuals || []).forEach((v, i) => {
+          const col = cols[i];
+          if (!col) return;
+          const j = targetColIndexByYM[`${col.year}-${col.monthIndex}`];
+          if (j === undefined) return;
+          const entry = own[key] || (own[key] = { category: tl.category, subcategory: tl.subcategory, type: tl.type, months: {} });
+          entry.months[j] = Number(v) || 0;
+        });
+      });
+      Object.keys(own).forEach((key) => {
+        const entry = sums[key] || (sums[key] = { category: own[key].category, subcategory: own[key].subcategory, type: own[key].type, months: {} });
+        Object.keys(own[key].months).forEach((jKey) => {
+          const m = entry.months[jKey] || (entry.months[jKey] = { total: 0, count: 0 });
+          m.total += own[key].months[jKey];
+          m.count += 1; // how many Templates contributed to this month
+        });
+      });
+    });
+
     let changed = false;
     const newLines = target.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(targetCols.length).fill(0))] }));
-
-    templateBudget.lines.forEach((tl) => {
-      const key = `${tl.category}|||${tl.subcategory || ""}`;
+    Object.keys(sums).forEach((key) => {
+      const entry = sums[key];
       let targetLine = newLines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
-      // Only months from this template line that actually fall within this
-      // specific target's period will match below — a line with no
-      // in-range months for this target simply won't create one.
-      const hasInRangeMonth = (tl.actuals || []).some((v, i) => {
-        const col = templateCols[i];
-        return col && targetColIndexByYM[`${col.year}-${col.monthIndex}`] !== undefined;
-      });
-      if (!targetLine && !hasInRangeMonth) return;
       if (!targetLine) {
-        targetLine = { ...newLine(), category: tl.category, subcategory: tl.subcategory, type: tl.type, amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
+        targetLine = { ...newLine(), category: entry.category, subcategory: entry.subcategory, type: entry.type, amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
         newLines.push(targetLine);
         changed = true;
       }
-      (tl.actuals || []).forEach((v, i) => {
-        const col = templateCols[i];
-        if (!col) return;
-        const j = targetColIndexByYM[`${col.year}-${col.monthIndex}`];
-        if (j === undefined) return;
-        const numVal = Number(v) || 0;
-        if ((Number(targetLine.actuals[j]) || 0) !== numVal) {
+      Object.keys(entry.months).forEach((jKey) => {
+        const j = Number(jKey);
+        const m = entry.months[j];
+        // a figure made by adding several Templates is kept to the cent, so floating-point dust never counts as a change
+        const numVal = m.count > 1 ? Math.round(m.total * 100) / 100 : m.total;
+        if (Math.abs((Number(targetLine.actuals[j]) || 0) - numVal) > 0.005) {
           targetLine.actuals[j] = numVal;
           changed = true;
         }
@@ -401,7 +431,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.5.3";
+const APP_VERSION = "1.5.4";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -573,6 +603,94 @@ function addActualSheet(wb, budget, label, headerRowIdx, header) {
   });
   wsA.columns = [{ width: 26 }, { width: 28 }, { width: 20 }, { width: 10 }, ...monthLabels.map(() => ({ width: 12 })), { width: 14 }];
   wsA.views = [{ state: "frozen", xSplit: 2, ySplit: headerRowIdx }];
+}
+
+// Actual-mode projection for ONE owner's budgets (a grant or cost center), used
+// by Org Budget. Calls emit(meta, year, monthIndex, value, isProjected) for every
+// calendar month of every line, as real figures (up to a budget's "Actuals
+// complete through" month) or as that line's run-rate average after it.
+// A budget's projection can carry forward into a later budget of the same owner.
+// A budget that has no such line contributes nothing for it: otherwise a grant
+// with several Templates (SSVF's three states, GPD's two locations) would be
+// handed a second copy of any line that only one of them has.
+function orgProjectOwnerBudgets(ownerBudgetsIn, emit) {
+  const ownerBudgets = [...ownerBudgetsIn].sort((a, b) => new Date(a.periodStart) - new Date(b.periodStart));
+
+  // Every distinct category+subcategory line seen anywhere for this owner.
+  const lineMeta = {};
+  ownerBudgets.forEach((b) => b.lines.forEach((l) => {
+    const key = `${l.category}|||${l.subcategory || ""}`;
+    if (!lineMeta[key]) lineMeta[key] = { category: l.category, subcategory: l.subcategory || "", type: l.type };
+  }));
+
+  // Each budget's own run-rate average per line, summed across EVERY line that
+  // shares that category+subcategory. A single budget can have many
+  // individually-entered lines under the same category (e.g. one payroll line
+  // per staff position), so matching only the first line found would silently
+  // drop the rest.
+  const budgetLineAvg = {}; // `${budgetId}|||${lineKey}` -> average
+  const budgetLineActuals = {}; // `${budgetId}|||${lineKey}` -> combined actuals array
+  ownerBudgets.forEach((b) => {
+    const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+    Object.keys(lineMeta).forEach((key) => {
+      const matching = b.lines.filter((l) => `${l.category}|||${l.subcategory || ""}` === key);
+      if (matching.length === 0) return;
+      const combined = Array(cols.length).fill(0);
+      matching.forEach((l) => {
+        (l.actuals || []).forEach((v, i) => { if (i < combined.length) combined[i] += Number(v) || 0; });
+      });
+      budgetLineActuals[`${b.id}|||${key}`] = combined;
+      const cutoff = parseActualsThrough(b.actualsThrough);
+      if (!cutoff) return;
+      const vals = cols
+        .map((col, i) => (colIsWithinCutoff(col, cutoff) ? combined[i] : null))
+        .filter((v) => v !== null);
+      budgetLineAvg[`${b.id}|||${key}`] = vals.length ? vals.reduce((a, x) => a + x, 0) / vals.length : 0;
+    });
+  });
+
+  Object.keys(lineMeta).forEach((key) => {
+    const meta = lineMeta[key];
+    // Flatten this line's data across the owner's budgets that have it into one
+    // chronological timeline of calendar months.
+    const timeline = [];
+    ownerBudgets.forEach((b) => {
+      const combined = budgetLineActuals[`${b.id}|||${key}`];
+      if (!combined) return; // this budget has no such line, so it adds nothing for it
+      const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+      const cutoff = parseActualsThrough(b.actualsThrough);
+      cols.forEach((col, i) => {
+        timeline.push({
+          year: col.year,
+          monthIndex: col.monthIndex,
+          isRealEntry: !!(cutoff && colIsWithinCutoff(col, cutoff)),
+          rawValue: Number(combined[i]) || 0,
+          budgetId: b.id,
+          atOrAfterCutoff: cutoff ? !colIsWithinCutoff(col, cutoff) : false,
+        });
+      });
+    });
+    timeline.sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
+
+    let basis = null; // most recently established run-rate average for this line
+    timeline.forEach((t) => {
+      const avgKey = `${t.budgetId}|||${key}`;
+      if (t.atOrAfterCutoff && budgetLineAvg[avgKey] !== undefined) basis = budgetLineAvg[avgKey];
+
+      let value, isProjected;
+      if (t.isRealEntry) {
+        value = t.rawValue;
+        isProjected = false;
+      } else if (basis !== null) {
+        value = basis;
+        isProjected = true;
+      } else {
+        value = t.rawValue; // no basis established anywhere yet: behaves as before projections existed
+        isProjected = false;
+      }
+      emit(meta, t.year, t.monthIndex, value, isProjected);
+    });
+  });
 }
 
 function resizeMonthlyArray(arr, newLength) {
@@ -5789,85 +5907,9 @@ function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
     scopedBudgets.forEach((b) => { (byOwner[ownerKey(b)] = byOwner[ownerKey(b)] || []).push(b); });
 
     Object.values(byOwner).forEach((ownerBudgets) => {
-      ownerBudgets.sort((a, b) => new Date(a.periodStart) - new Date(b.periodStart));
-
-      // Every distinct category+subcategory line seen anywhere for this owner.
-      const lineMeta = {};
-      ownerBudgets.forEach((b) => b.lines.forEach((l) => {
-        const key = `${l.category}|||${l.subcategory || ""}`;
-        if (!lineMeta[key]) lineMeta[key] = { category: l.category, subcategory: l.subcategory || "", type: l.type };
-      }));
-
-      // Each budget's own run-rate average per line — summed across EVERY
-      // line that shares that category+subcategory. A single budget can have
-      // many individually-entered lines under the same category (e.g. one
-      // payroll line per staff position, all filed under "Wages and
-      // Benefits"), so matching only the first line found would silently
-      // drop the rest.
-      const budgetLineAvg = {}; // `${budgetId}|||${lineKey}` -> average
-      const budgetLineActuals = {}; // `${budgetId}|||${lineKey}` -> combined actuals array
-      ownerBudgets.forEach((b) => {
-        const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-        Object.keys(lineMeta).forEach((key) => {
-          const matching = b.lines.filter((l) => `${l.category}|||${l.subcategory || ""}` === key);
-          if (matching.length === 0) return;
-          const combined = Array(cols.length).fill(0);
-          matching.forEach((l) => {
-            (l.actuals || []).forEach((v, i) => { if (i < combined.length) combined[i] += Number(v) || 0; });
-          });
-          budgetLineActuals[`${b.id}|||${key}`] = combined;
-          const cutoff = parseActualsThrough(b.actualsThrough);
-          if (!cutoff) return;
-          const vals = cols
-            .map((col, i) => (colIsWithinCutoff(col, cutoff) ? combined[i] : null))
-            .filter((v) => v !== null);
-          budgetLineAvg[`${b.id}|||${key}`] = vals.length ? vals.reduce((a, x) => a + x, 0) / vals.length : 0;
-        });
-      });
-
-      Object.keys(lineMeta).forEach((key) => {
-        const meta = lineMeta[key];
-        // Flatten this line's data across every owner budget into one
-        // chronological timeline of calendar months.
-        const timeline = [];
-        ownerBudgets.forEach((b) => {
-          const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
-          const combined = budgetLineActuals[`${b.id}|||${key}`]; // undefined if this budget has no matching lines
-          const cutoff = parseActualsThrough(b.actualsThrough);
-          cols.forEach((col, i) => {
-            timeline.push({
-              year: col.year,
-              monthIndex: col.monthIndex,
-              isRealEntry: !!(combined && cutoff && colIsWithinCutoff(col, cutoff)),
-              rawValue: combined ? (Number(combined[i]) || 0) : 0,
-              budgetId: b.id,
-              cutoff,
-              atOrAfterCutoff: cutoff ? !colIsWithinCutoff(col, cutoff) : false,
-            });
-          });
-        });
-        timeline.sort((a, b) => (a.year - b.year) || (a.monthIndex - b.monthIndex));
-
-        let basis = null; // most recently established run-rate average for this line
-        timeline.forEach((t) => {
-          const avgKey = `${t.budgetId}|||${key}`;
-          if (t.atOrAfterCutoff && budgetLineAvg[avgKey] !== undefined) basis = budgetLineAvg[avgKey];
-
-          let value, isProjected;
-          if (t.isRealEntry) {
-            value = t.rawValue;
-            isProjected = false;
-          } else if (basis !== null) {
-            value = basis;
-            isProjected = true;
-          } else {
-            value = t.rawValue; // no basis established anywhere yet — behaves as before this feature existed
-            isProjected = false;
-          }
-
-          if (calYear !== "All" && t.year !== calYear) return;
-          addToBucket(meta.category, meta.subcategory, meta.type, t.monthIndex, value, isProjected);
-        });
+      orgProjectOwnerBudgets(ownerBudgets, (meta, year, monthIndex, value, isProjected) => {
+        if (calYear !== "All" && year !== calYear) return;
+        addToBucket(meta.category, meta.subcategory, meta.type, monthIndex, value, isProjected);
       });
     });
 
