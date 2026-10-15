@@ -524,7 +524,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.7.0";
+const APP_VERSION = "1.8.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -5338,6 +5338,211 @@ function TrashView({ trash, setTrash, setGrants, setBudgets, setReports, setTask
 }
 
 // ===========================================================================
+// Personnel driver for the Budget tool: build next year's wages (5000) and
+// payroll taxes and benefits (5900) from the people in GrantFlow instead of
+// from last year's run-rate. Plain calculation, no screens.
+// ===========================================================================
+
+// Assumptions that apply to everyone unless a person says otherwise.
+//   raisePct / raiseMonth   cost-of-living raise and the month it starts (0 = January)
+//   overtimePct             extra pay on top of non-exempt wages
+//   benefitsPct             increase in the benefits cost per person
+//   includeBonus / bonusMonth   whether bonuses are budgeted, and the month they are paid
+//   includeInactive         whether staff marked Inactive are budgeted
+//   useAll                  use Personnel for every unit that has people (a unit can override)
+function toolPersonnelConfig(model) {
+  const p = (model && model.personnel) || {};
+  const num = (v, d) => (typeof v === "number" && !isNaN(v) ? v : d);
+  return {
+    raisePct: num(p.raisePct, 3), raiseMonth: num(p.raiseMonth, 0), overtimePct: num(p.overtimePct, 5), benefitsPct: num(p.benefitsPct, 0),
+    includeBonus: p.includeBonus !== false, bonusMonth: num(p.bonusMonth, 11), includeInactive: p.includeInactive === true,
+    useAll: p.useAll === true, units: p.units || {}, moves: p.moves || {},
+  };
+}
+
+function toolPersonnelEnabled(unit, cfg) {
+  const u = cfg.units[unit.id];
+  if (u && typeof u.enabled === "boolean") return u.enabled;
+  return !!cfg.useAll;
+}
+
+// Monday-to-Friday days in each month, which is how hourly pay is spread.
+function toolWeekdays(year) {
+  const out = [];
+  for (let m = 0; m < 12; m++) {
+    const days = new Date(Date.UTC(year, m + 1, 0)).getUTCDate();
+    let n = 0;
+    for (let d = 1; d <= days; d++) { const dow = new Date(Date.UTC(year, m, d)).getUTCDay(); if (dow !== 0 && dow !== 6) n += 1; }
+    out.push(n);
+  }
+  return out;
+}
+
+// One person's year, month by month.
+//   share  the part of this person charged to the unit (1 = all of them)
+//   ov     this person's own choices: raisePct, raiseMonth, startMonth, endMonth, fte
+// Wages include the bonus. Benefits and payroll tax come back together as "benefits"
+// because that is what 5900 holds; the pieces are kept for the detail screens.
+function toolPersonMonths(person, share, cfg, ov, fy) {
+  const o = ov || {};
+  const zeros = () => Array(12).fill(0);
+  const fte = typeof o.fte === "number" ? o.fte : Number(person.fte) || 0;
+  const hourly = person.payType === "Hourly";
+  const annualBase = hourly ? (Number(person.hourlyRate) || 0) * (Number(person.annualHours) || ANNUAL_HOURS) * fte : (Number(person.annualSalary) || 0) * fte;
+  const start = typeof o.startMonth === "number" ? o.startMonth : 0;
+  const end = typeof o.endMonth === "number" ? o.endMonth : 11;
+  const active = (i) => i >= start && i <= end;
+
+  // Raise: the one you set for this person, else the shared one; plus any raise already scheduled on the record.
+  const raisePct = typeof o.raisePct === "number" ? o.raisePct : cfg.raisePct;
+  const raiseMonth = typeof o.raiseMonth === "number" ? o.raiseMonth : cfg.raiseMonth;
+  let scheduled = { pct: 0, month: 0 };
+  if (cfg.useScheduledRaises !== false && Number(person.raisePercent) && person.raiseDate) {
+    const y = Number(String(person.raiseDate).slice(0, 4));
+    const mth = Number(String(person.raiseDate).slice(5, 7)) - 1;
+    if (y < fy) scheduled = { pct: Number(person.raisePercent), month: 0 };
+    else if (y === fy) scheduled = { pct: Number(person.raisePercent), month: mth };
+  }
+  const factor = (i) => (i >= raiseMonth ? 1 + raisePct / 100 : 1) * (scheduled.pct && i >= scheduled.month ? 1 + scheduled.pct / 100 : 1);
+
+  const wd = toolWeekdays(fy);
+  const wdTotal = wd.reduce((a, b) => a + b, 0);
+  const weight = (i) => (hourly ? wd[i] / wdTotal : 1 / 12);
+  const ot = person.exempt === "Non-exempt" ? 1 + (cfg.overtimePct || 0) / 100 : 1;
+
+  const wages = zeros();
+  const bonus = zeros();
+  const ben = zeros();
+  const tax = zeros();
+  const taxRate = (Number(person.payrollTaxRate) || 0) / 100;
+  const annualBenefits = (Number(person.benefits) || 0) * fte * (1 + (cfg.benefitsPct || 0) / 100);
+  for (let i = 0; i < 12; i++) {
+    if (!active(i)) continue;
+    wages[i] = annualBase * share * weight(i) * factor(i) * ot;
+    if (cfg.includeBonus && i === cfg.bonusMonth) bonus[i] = (Number(person.bonus) || 0) * fte * share;
+    ben[i] = (annualBenefits * share) / 12;
+    tax[i] = (wages[i] + bonus[i]) * taxRate;
+  }
+  const withBonus = wages.map((w, i) => w + bonus[i]);
+  // Round each month to the cent, then put what the rounding left over into the last
+  // month with money in it, so the yearly total is exact.
+  const exact = (arr) => {
+    const r = arr.map(toolRound2);
+    const diff = toolRound2(arr.reduce((x, y) => x + y, 0) - r.reduce((x, y) => x + y, 0));
+    if (diff !== 0) { for (let i = 11; i >= 0; i--) { if (arr[i] !== 0) { r[i] = toolRound2(r[i] + diff); break; } } }
+    return r;
+  };
+  return {
+    wages: exact(withBonus), benefits: exact(ben.map((b, i) => b + tax[i])),
+    benefitsOnly: exact(ben), tax: exact(tax), fte, annualBase: toolRound2(annualBase),
+  };
+}
+
+// Which unit each person's pay is charged to. People are allocated to grants and
+// cost centers; where several units share one grant (SSVF's states, GPD's two
+// locations) the unit is found from the person's department code, then their
+// site, then a choice you made. Anyone still unplaced is spread across those
+// units in proportion to the pay already placed on each.
+function toolStaffUnitMap(model, staff) {
+  const cfg = toolPersonnelConfig(model);
+  const units = model.units || [];
+  const map = {};
+  units.forEach((u) => { map[u.id] = []; });
+  const outside = []; // allocations to something that is not a unit
+  const shared = []; // [{ staff, share, candidates }] to spread after the rest
+  const annual = (s) => toolPersonMonths(s, 1, { ...cfg, raisePct: 0, includeBonus: false, overtimePct: 0, benefitsPct: 0, useScheduledRaises: false }, {}, 2000).wages.reduce((a, b) => a + b, 0);
+
+  staff.forEach((s) => {
+    if (s.status === "Inactive" && !cfg.includeInactive) return;
+    (s.allocations || []).forEach((a) => {
+      const percent = Number(a.percent) || 0;
+      if (percent <= 0) return;
+      const targetId = a.type === "grant" ? a.grantId : a.costCenterId;
+      const cands = units.filter((u) => (a.type === "grant" ? u.grantId === a.grantId && !!a.grantId : u.costCenterId === a.costCenterId && !!a.costCenterId));
+      const share = percent / 100;
+      if (cands.length === 0) { outside.push({ staff: s, share, targetId, type: a.type }); return; }
+      if (cands.length === 1) { map[cands[0].id].push({ staff: s, share, how: "direct" }); return; }
+      const moved = cands.find((u) => u.id === cfg.moves[`${s.id}|${targetId}`]);
+      if (moved) { map[moved.id].push({ staff: s, share, how: "moved" }); return; }
+      const dept = (String(s.department || "").match(/^\s*(\d{4})/) || [])[1];
+      const byDept = dept ? cands.filter((u) => u.code === dept) : [];
+      if (byDept.length === 1) { map[byDept[0].id].push({ staff: s, share, how: "department" }); return; }
+      const site = toolNorm(s.site);
+      const bySite = site ? cands.filter((u) => toolNorm(u.name).includes(site)) : [];
+      if (bySite.length === 1) { map[bySite[0].id].push({ staff: s, share, how: "site" }); return; }
+      shared.push({ staff: s, share, candidates: cands });
+    });
+  });
+
+  shared.forEach((sh) => {
+    const placed = sh.candidates.map((u) => map[u.id].filter((e) => e.how !== "spread").reduce((t, e) => t + annual(e.staff) * e.share, 0));
+    const total = placed.reduce((a, b) => a + b, 0);
+    sh.candidates.forEach((u, i) => {
+      const weight = total > 0 ? placed[i] / total : 1 / sh.candidates.length;
+      if (weight > 0) map[u.id].push({ staff: sh.staff, share: sh.share * weight, how: "spread" });
+    });
+  });
+  // A person with several allocation lines that land on the same unit is one row, with the shares added.
+  Object.keys(map).forEach((id) => {
+    const merged = [];
+    map[id].forEach((e) => {
+      const hit = merged.find((m) => m.staff.id === e.staff.id);
+      if (hit) { hit.share += e.share; if (hit.how === "spread" && e.how !== "spread") hit.how = e.how; } else merged.push({ ...e });
+    });
+    map[id] = merged;
+  });
+  return { units: map, outside };
+}
+
+// A planned position, shaped like a person so the same costing applies.
+function toolNewPositionAsStaff(np) {
+  return {
+    id: np.id, name: np.title || "New position", position: np.title || "New position", payType: np.hourly ? "Hourly" : "Salary",
+    annualSalary: Number(np.annualPay) || 0, hourlyRate: Number(np.hourlyRate) || 0, annualHours: Number(np.annualHours) || ANNUAL_HOURS,
+    fte: typeof np.fte === "number" ? np.fte : 1, exempt: np.exempt === "Non-exempt" ? "Non-exempt" : "Exempt",
+    benefits: Number(np.benefits) || 0, payrollTaxRate: typeof np.payrollTaxRate === "number" ? np.payrollTaxRate : 8, bonus: 0, status: "Active",
+  };
+}
+
+// Everything the unit's people cost next year, person by person and in total.
+function toolPersonnelForUnit(unit, entries, cfg, fy) {
+  const mine = cfg.units[unit.id] || {};
+  const people = mine.people || {};
+  const zeros = () => Array(12).fill(0);
+  const rows = [];
+  (entries || []).forEach((e) => {
+    const ov = people[e.staff.id] || {};
+    const m = toolPersonMonths(e.staff, e.share, cfg, ov, fy);
+    const excluded = ov.exclude === true;
+    rows.push({
+      key: `p:${e.staff.id}`, staffId: e.staff.id, name: e.staff.name || "", position: e.staff.position || "", kind: "person", how: e.how, share: e.share, excluded,
+      ...(excluded ? { ...m, wages: zeros(), benefits: zeros(), benefitsOnly: zeros(), tax: zeros() } : m), ov,
+    });
+  });
+  (mine.newPositions || []).forEach((np) => {
+    const m = toolPersonMonths(toolNewPositionAsStaff(np), 1, { ...cfg, raisePct: 0, useScheduledRaises: false }, { raisePct: 0, startMonth: np.startMonth, endMonth: np.endMonth }, fy);
+    rows.push({ key: `n:${np.id}`, staffId: "", newId: np.id, name: "", position: np.title || "New position", kind: "new", how: "new", share: 1, excluded: false, ...m, ov: {} });
+  });
+  const sum = (field) => { const t = zeros(); rows.forEach((r) => { if (!r.excluded) r[field].forEach((v, i) => { t[i] += v; }); }); return t.map(toolRound2); };
+  return { rows, wages: sum("wages"), benefits: sum("benefits"), count: rows.filter((r) => !r.excluded).length };
+}
+
+// How the whole organization's payroll lines up with the units: what is in units
+// that roll forward, what is in units that don't, and what is charged to grants
+// that are not units at all.
+function toolPersonnelCheck(model, staff, map) {
+  const cfg = toolPersonnelConfig(model);
+  const loaded = (s, share) => staffFullyLoadedCost(s).total * share;
+  const inUnits = {};
+  (model.units || []).forEach((u) => { inUnits[u.id] = (map.units[u.id] || []).reduce((t, e) => t + loaded(e.staff, e.share), 0); });
+  const rolling = (model.units || []).filter((u) => u.include).reduce((t, u) => t + inUnits[u.id], 0);
+  const notRolling = (model.units || []).filter((u) => !u.include).reduce((t, u) => t + inUnits[u.id], 0);
+  const outside = map.outside.reduce((t, e) => t + loaded(e.staff, e.share), 0);
+  const people = staff.filter((s) => cfg.includeInactive || s.status !== "Inactive").length;
+  return { people, rolling, notRolling, outside, total: rolling + notRolling + outside, outsideRows: map.outside };
+}
+
+// ===========================================================================
 // Budget tool: next year's budget, built from this year's. Replaces Scenarios.
 // Everything in this block is plain calculation (no screens), so it can be
 // tested on its own against real data.
@@ -5646,7 +5851,7 @@ function toolAdjPct(adjustments, unit, line) {
 
 // The unit's next-year figures: baseline with the percentages applied, or an
 // exact yearly figure where one was typed in, plus any lines added by hand.
-function toolUnitModel(unit, baseline, model) {
+function toolUnitModel(unit, baseline, model, personnel) {
   const adj = model.adjustments || {};
   const out = [];
   baseline.lines.forEach((line) => {
@@ -5659,6 +5864,18 @@ function toolUnitModel(unit, baseline, model) {
     else values = line.base.map((v) => v * (1 + pct / 100));
     out.push({ ...line, pct, override: hasOverride ? own.annual : null, model: values.map(toolRound2), manual: false });
   });
+  // With the Personnel driver on, wages (5000) and payroll taxes and benefits (5900)
+  // come from the people, unless an exact yearly figure was typed in for that line.
+  if (personnel) {
+    [["5000 - Salary and Wages", personnel.wages], ["5900 - Payroll taxes and benefits", personnel.benefits]].forEach(([sub, arr]) => {
+      const key = `Wages and Benefits|||${sub}`;
+      const own = (adj.lines || {})[`${unit.id}|${key}`] || {};
+      if (typeof own.annual === "number" && !isNaN(own.annual)) return;
+      const line = out.find((l) => l.key === key);
+      if (line) { line.model = arr.map(toolRound2); line.pct = 0; line.fromPersonnel = true; }
+      else out.push({ key, category: "Wages and Benefits", subcategory: sub, type: "expense", base: Array(12).fill(0), real: Array(12).fill(false), pct: 0, override: null, model: arr.map(toolRound2), manual: false, fromPersonnel: true });
+    });
+  }
   ((model.addedLines || {})[unit.id] || []).forEach((a) => {
     out.push({
       key: `added|||${a.id}`, category: a.category, subcategory: a.subcategory || "", description: a.description || "", type: a.type,
@@ -5671,7 +5888,7 @@ function toolUnitModel(unit, baseline, model) {
 
 // All the totals the screens and the Excel file need: by unit, by group, for the
 // whole organization, and by category. Only units that roll forward count.
-function toolRollup(model, budgets) {
+function toolRollup(model, budgets, staff) {
   const zeros = () => Array(12).fill(0);
   const sum = (a) => a.reduce((x, y) => x + y, 0);
   const emptyTotals = () => ({ baseRev: zeros(), baseExp: zeros(), modRev: zeros(), modExp: zeros() });
@@ -5693,11 +5910,15 @@ function toolRollup(model, budgets) {
   const groupOrder = [];
   const units = [];
   const issues = [];
+  const pcfg = toolPersonnelConfig(model);
+  const pmap = staff ? toolStaffUnitMap(model, staff) : null;
 
   (model.units || []).forEach((unit) => {
     if (!unit.include) return;
     const baseline = toolUnitBaseline(unit, model, budgets);
-    const lines = toolUnitModel(unit, baseline, model);
+    const pers = pmap ? toolPersonnelForUnit(unit, pmap.units[unit.id] || [], pcfg, model.fy) : null;
+    const persOn = !!pers && toolPersonnelEnabled(unit, pcfg) && pers.count > 0;
+    const lines = toolUnitModel(unit, baseline, model, persOn ? pers : null);
     const monthly = emptyTotals();
     lines.forEach((l) => {
       addInto(monthly, l);
@@ -5710,7 +5931,7 @@ function toolRollup(model, budgets) {
     });
     const needsData = baseline.basis === "none";
     if (needsData) issues.push({ unitId: unit.id, name: unit.name, kind: unit.baseline === "import" ? "import" : "none" });
-    const row = { unit, baseline, lines, monthly, totals: summarize(monthly), needsData };
+    const row = { unit, baseline, lines, monthly, totals: summarize(monthly), needsData, personnel: pers, personnelOn: persOn };
     units.push(row);
     if (!groupMap[unit.group]) { groupMap[unit.group] = { name: unit.group, units: [], monthly: emptyTotals() }; groupOrder.push(unit.group); }
     const g = groupMap[unit.group];
@@ -5719,7 +5940,7 @@ function toolRollup(model, budgets) {
   });
 
   const groups = groupOrder.map((name) => ({ ...groupMap[name], totals: summarize(groupMap[name].monthly) }));
-  return { units, groups, org: { monthly: org, totals: summarize(org) }, categories, issues };
+  return { units, groups, org: { monthly: org, totals: summarize(org) }, categories, issues, personnelCheck: pmap ? toolPersonnelCheck(model, staff, pmap) : null };
 }
 
 // ---------------------------------------------------------------------------
@@ -6096,6 +6317,45 @@ function buildBudgetToolWorkbook(rollup, model) {
   ws.views = [{ state: "frozen", ySplit: 5, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 
+  // ---- Personnel detail, only when the driver builds anyone's wages ----
+  const withPeople = rollup.units.filter((u) => u.personnelOn);
+  if (withPeople.length) {
+    const pc = toolPersonnelConfig(model);
+    const wp = wb.addWorksheet(sheetName("Personnel"), { properties: { tabColor: { argb: "FF7A5C8F" } } });
+    wp.getCell(1, 1).value = "Nation's Finest";
+    wp.getCell(1, 1).font = { bold: true, size: 14, color: { argb: INK } };
+    wp.getCell(2, 1).value = `Personnel detail · FY${FY} budget`;
+    wp.getCell(2, 1).font = { bold: true, size: 12, color: { argb: INK } };
+    wp.getCell(3, 1).value = `Wages and benefits built from the people allocated to each unit · raise ${pc.raisePct}% from ${MONTHS[pc.raiseMonth]} · overtime ${pc.overtimePct}% on non-exempt · benefits ${pc.benefitsPct >= 0 ? "+" : ""}${pc.benefitsPct}% · bonuses ${pc.includeBonus ? "in " + MONTHS[pc.bonusMonth] : "not budgeted"}`;
+    wp.getCell(3, 1).font = { italic: true, size: 9, color: { argb: GRAY } };
+    header(wp, 5, ["Unit", "Position", "Name", "Placed by", "FTE", ...monthLabels, `FY${FY} wages`, "Benefits and tax"], [1, 2, 3, 4]);
+    let pr = 6;
+    const put = (vals, bold, fill) => {
+      const row = wp.getRow(pr);
+      row.values = vals;
+      for (let c = 1; c <= 19; c++) {
+        const cell = row.getCell(c);
+        cell.font = { bold, size: 10, color: { argb: INK } };
+        if (c >= 6) cell.numFmt = NUM;
+        if (c === 5) cell.numFmt = "0.00";
+        if (fill) { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: TOTAL } }; cell.border = { top: { style: "thin", color: { argb: INK } } }; }
+      }
+      pr += 1;
+    };
+    const grand = { wages: Array(12).fill(0), ben: 0 };
+    withPeople.forEach((u) => {
+      const live = u.personnel.rows.filter((r) => !r.excluded);
+      live.forEach((r) => put([u.unit.name, r.position, r.name, r.kind === "new" ? "planned position" : r.how, toolRound2(r.fte * r.share), ...r.wages, toolRound2(sum(r.wages)), toolRound2(sum(r.benefits))], false, false));
+      put([`${u.unit.name} total`, "", "", "", "", ...u.personnel.wages, toolRound2(sum(u.personnel.wages)), toolRound2(sum(u.personnel.benefits))], true, true);
+      u.personnel.wages.forEach((v, i) => { grand.wages[i] += v; });
+      grand.ben += sum(u.personnel.benefits);
+    });
+    put(["All units using Personnel", "", "", "", "", ...grand.wages.map(toolRound2), toolRound2(sum(grand.wages)), toolRound2(grand.ben)], true, true);
+    wp.columns = [{ width: 30 }, { width: 34 }, { width: 24 }, { width: 14 }, { width: 7 }, ...monthLabels.map(() => ({ width: 10 })), { width: 13 }, { width: 14 }];
+    wp.views = [{ state: "frozen", xSplit: 3, ySplit: 5, showGridLines: false }];
+    wp.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+  }
+
   // ---- Whole organization, then each group's total followed by its units ----
   writeAccountSheet("TOTAL organization", `All ${rollup.units.length} units that roll forward`, toolAggregateAccounts(rollup.units.map((u) => u.lines)), HEAD);
   rollup.groups.forEach((g, gi) => {
@@ -6152,7 +6412,7 @@ function ToolNumberInput({ value, onCommit, placeholder, disabled, label, width,
   );
 }
 
-function BudgetToolView({ models, setModels, grants, budgets, costCenters, whoami, setTrash, canEdit, logActivity }) {
+function BudgetToolView({ models, setModels, grants, budgets, costCenters, staff, whoami, setTrash, canEdit, logActivity }) {
   const [openId, setOpenId] = useState(null);
   const [creating, setCreating] = useState(false);
   const [confirm, setConfirm] = useState(null);
@@ -6184,6 +6444,7 @@ function BudgetToolView({ models, setModels, grants, budgets, costCenters, whoam
           grants={grants}
           budgets={budgets}
           costCenters={costCenters}
+          staff={staff}
           canEdit={canEdit}
           onChange={(fn) => update(open.id, fn)}
           onBack={() => setOpenId(null)}
@@ -6214,7 +6475,7 @@ function BudgetToolView({ models, setModels, grants, budgets, costCenters, whoam
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {models.map((m) => <BudgetModelCard key={m.id} model={m} budgets={budgets} onOpen={() => setOpenId(m.id)} />)}
+          {models.map((m) => <BudgetModelCard key={m.id} model={m} budgets={budgets} staff={staff} onOpen={() => setOpenId(m.id)} />)}
         </div>
       )}
 
@@ -6223,8 +6484,8 @@ function BudgetToolView({ models, setModels, grants, budgets, costCenters, whoam
   );
 }
 
-function BudgetModelCard({ model, budgets, onOpen }) {
-  const r = useMemo(() => toolRollup(model, budgets), [model, budgets]);
+function BudgetModelCard({ model, budgets, staff, onOpen }) {
+  const r = useMemo(() => toolRollup(model, budgets, staff), [model, budgets, staff]);
   const t = r.org.totals;
   return (
     <button onClick={onOpen} className="text-left bg-white rounded-lg border p-4 hover:shadow-sm transition-shadow" style={{ borderColor: "#E1E5DE" }}>
@@ -6261,8 +6522,10 @@ function NewBudgetModelModal({ fy, onCreate, onClose }) {
   );
 }
 
-function BudgetModelEditor({ model, grants, budgets, costCenters, canEdit, onChange, onBack, onDelete }) {
-  const rollup = useMemo(() => toolRollup(model, budgets), [model, budgets]);
+function BudgetModelEditor({ model, grants, budgets, costCenters, staff, canEdit, onChange, onBack, onDelete }) {
+  const rollup = useMemo(() => toolRollup(model, budgets, staff), [model, budgets, staff]);
+  const pcfg = toolPersonnelConfig(model);
+  const setPersonnel = (fn) => onChange((m) => ({ ...m, personnel: fn(m.personnel || {}) }));
   const [pickerOpen, setPickerOpen] = useState(!model.setupDone);
   const [detailId, setDetailId] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
@@ -6390,6 +6653,39 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, canEdit, onCha
         )}
       </div>
 
+      {staff && staff.length > 0 && rollup.personnelCheck && (
+        <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#E1E5DE" }}>
+          <div className="font-medium mb-1" style={{ color: "#1C2624" }}>Personnel</div>
+          <p className="text-xs mb-3" style={{ color: "#5B6B66" }}>
+            Builds a unit's wages and payroll taxes and benefits from the people allocated to it, month by month, instead of last year's run-rate. Turn it on per unit (open a unit), or for every unit that has people. Shared assumptions are below; each person can have their own.
+          </p>
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm mb-3" style={{ color: "#1C2624" }}>
+            <label className="flex items-center gap-2">Raise
+              <ToolNumberInput label="Raise percent" disabled={!canEdit} value={pcfg.raisePct} onCommit={(v) => setPersonnel((p) => ({ ...p, raisePct: v === null ? 0 : v }))} /> % from
+              <select aria-label="Raise month" disabled={!canEdit} className="rounded-md border px-2 py-1 text-sm" style={inputStyle} value={pcfg.raiseMonth} onChange={(e) => setPersonnel((p) => ({ ...p, raiseMonth: Number(e.target.value) }))}>{MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}</select>
+            </label>
+            <label className="flex items-center gap-2">Overtime on non-exempt
+              <ToolNumberInput label="Overtime percent" disabled={!canEdit} value={pcfg.overtimePct} onCommit={(v) => setPersonnel((p) => ({ ...p, overtimePct: v === null ? 0 : v }))} /> %
+            </label>
+            <label className="flex items-center gap-2">Benefits cost
+              <ToolNumberInput label="Benefits percent" disabled={!canEdit} value={pcfg.benefitsPct} onCommit={(v) => setPersonnel((p) => ({ ...p, benefitsPct: v === null ? 0 : v }))} /> %
+            </label>
+            <label className="flex items-center gap-2"><input type="checkbox" aria-label="Include bonuses" disabled={!canEdit} checked={pcfg.includeBonus} onChange={(e) => setPersonnel((p) => ({ ...p, includeBonus: e.target.checked }))} /> Bonuses, paid in
+              <select aria-label="Bonus month" disabled={!canEdit || !pcfg.includeBonus} className="rounded-md border px-2 py-1 text-sm" style={inputStyle} value={pcfg.bonusMonth} onChange={(e) => setPersonnel((p) => ({ ...p, bonusMonth: Number(e.target.value) }))}>{MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}</select>
+            </label>
+            <label className="flex items-center gap-2"><input type="checkbox" aria-label="Include inactive staff" disabled={!canEdit} checked={pcfg.includeInactive} onChange={(e) => setPersonnel((p) => ({ ...p, includeInactive: e.target.checked }))} /> Include staff marked Inactive</label>
+          </div>
+          <label className="flex items-start gap-2 text-sm mb-3" style={{ color: "#1C2624" }}>
+            <input type="checkbox" aria-label="Use Personnel in every unit" className="mt-1" disabled={!canEdit} checked={pcfg.useAll} onChange={(e) => setPersonnel((p) => ({ ...p, useAll: e.target.checked }))} />
+            <span>Use Personnel for wages and benefits in every unit that has people. A unit with nobody in GrantFlow keeps its run-rate. Check the corporate unit before relying on this: its people are normally charged out to programs, so counting them there can overstate cost.</span>
+          </label>
+          <div className="text-xs" style={{ color: "#5B6B66" }}>
+            {rollup.personnelCheck.people} people cost {fmt(rollup.personnelCheck.total)} a year loaded at today's pay: {fmt(rollup.personnelCheck.rolling)} in units that roll forward, {fmt(rollup.personnelCheck.notRolling)} in units that don't, and {fmt(rollup.personnelCheck.outside)} charged to grants that aren't units here.
+            {rollup.units.filter((x) => x.personnelOn).length > 0 && <> Personnel is building {rollup.units.filter((x) => x.personnelOn).length} unit{rollup.units.filter((x) => x.personnelOn).length === 1 ? "" : "s"}.</>}
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-lg border overflow-x-auto" style={{ borderColor: "#E1E5DE" }}>
         <table className="w-full text-sm">
           <thead>
@@ -6421,7 +6717,7 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, canEdit, onCha
                 {g.units.map((u) => (
                   <tr key={u.unit.id} className="border-t" style={{ borderColor: "#EEF0EC" }}>
                     <td className="px-3 py-2 pl-6">
-                      <div style={{ color: "#1C2624" }}>{u.unit.name}</div>
+                      <div style={{ color: "#1C2624" }}>{u.unit.name}{u.personnelOn && <span className="ml-2"><ToolChip text={`Personnel · ${u.personnel.count} people`} tone="teal" /></span>}</div>
                       <div className="text-xs" style={{ color: u.needsData ? "#8A5A00" : "#8A8F87" }}>{u.baseline.basisLabel}</div>
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums" style={{ color: "#5B6B66" }}>{fmt(u.totals.baseRev)}</td>
@@ -6464,7 +6760,7 @@ function BudgetModelEditor({ model, grants, budgets, costCenters, canEdit, onCha
           onClose={() => { if (canEdit && !model.setupDone) onChange((m) => ({ ...m, setupDone: true })); setPickerOpen(false); }}
         />
       )}
-      {detail && <BudgetUnitModal model={model} row={detail} canEdit={canEdit} onChange={onChange} onClose={() => setDetailId(null)} />}
+      {detail && <BudgetUnitModal model={model} row={detail} canEdit={canEdit} onChange={onChange} hasStaff={!!(staff && staff.length)} onClose={() => setDetailId(null)} />}
       {importOpen && (
         <BudgetSageImportModal
           model={model}
@@ -6569,7 +6865,7 @@ function BudgetRollForwardModal({ model, grants, budgets, canEdit, onChange, onC
 }
 
 // One unit's lines: baseline, a percentage or an exact figure, and what it comes to.
-function BudgetUnitModal({ model, row, canEdit, onChange, onClose }) {
+function BudgetUnitModal({ model, row, canEdit, onChange, hasStaff, onClose }) {
   const unit = row.unit;
   const adj = model.adjustments || { global: {}, categories: {}, units: {}, lines: {} };
   const unitAdj = (adj.units || {})[unit.id] || {};
@@ -6697,6 +6993,8 @@ function BudgetUnitModal({ model, row, canEdit, onChange, onClose }) {
           <span>Net <b style={{ color: T.modNet < 0 ? "#B5443A" : "#1C2624" }}>{fmt(T.modNet)}</b></span>
         </div>
 
+        {hasStaff && row.personnel && <BudgetPersonnelSection model={model} row={row} canEdit={canEdit} onChange={onChange} />}
+
         {canEdit && (
           <div className="border rounded-lg p-3" style={{ borderColor: "#E1E5DE" }}>
             <div className="text-sm font-medium mb-2" style={{ color: "#1C2624" }}>Add a line</div>
@@ -6740,6 +7038,133 @@ function BudgetUnitModal({ model, row, canEdit, onChange, onClose }) {
         </div>
       </div>
     </Modal>
+  );
+}
+
+// One unit's people: who is in it, what each costs next year, and the choices that change it.
+function BudgetPersonnelSection({ model, row, canEdit, onChange }) {
+  const unit = row.unit;
+  const cfg = toolPersonnelConfig(model);
+  const mine = cfg.units[unit.id] || {};
+  const pers = row.personnel;
+  const enabled = toolPersonnelEnabled(unit, cfg);
+  const siblings = (model.units || []).filter((x) => x.id !== unit.id && ((unit.grantId && x.grantId === unit.grantId) || (unit.costCenterId && x.costCenterId === unit.costCenterId)));
+  const targetId = unit.grantId || unit.costCenterId;
+  const [form, setForm] = useState({ title: "", annualPay: "", fte: "1", startMonth: "0", benefits: "" });
+  const sum = (a) => a.reduce((x, y) => x + y, 0);
+  const baseOf = (sub) => row.baseline.lines.filter((l) => l.subcategory === sub).reduce((t, l) => t + sum(l.base), 0);
+  const baseWages = baseOf("5000 - Salary and Wages");
+  const baseBen = baseOf("5900 - Payroll taxes and benefits");
+  const wages = sum(pers.wages);
+  const ben = sum(pers.benefits);
+  const gap = baseWages + baseBen > 0 ? ((wages + ben) - (baseWages + baseBen)) / (baseWages + baseBen) : null;
+
+  const patchUnit = (fn) => onChange((m) => {
+    const p = m.personnel || {};
+    const units = { ...(p.units || {}) };
+    units[unit.id] = fn({ ...(units[unit.id] || {}) });
+    return { ...m, personnel: { ...p, units } };
+  });
+  const setPerson = (staffId, patch) => patchUnit((u) => {
+    const people = { ...(u.people || {}) };
+    const next = { ...(people[staffId] || {}), ...patch };
+    Object.keys(next).forEach((k) => { if (next[k] === null || next[k] === undefined || next[k] === false) delete next[k]; });
+    if (Object.keys(next).length === 0) delete people[staffId]; else people[staffId] = next;
+    return { ...u, people };
+  });
+  const setMove = (staffId, unitId) => onChange((m) => {
+    const p = m.personnel || {};
+    const moves = { ...(p.moves || {}) };
+    const k = `${staffId}|${targetId}`;
+    if (!unitId) delete moves[k]; else moves[k] = unitId;
+    return { ...m, personnel: { ...p, moves } };
+  });
+  const addPosition = () => {
+    const pay = Number(form.annualPay);
+    if (!form.title.trim() || !form.annualPay || isNaN(pay)) { notify("Give the position a title and a yearly pay."); return; }
+    const np = { id: uid(), title: form.title.trim(), annualPay: pay, fte: Number(form.fte) || 1, startMonth: Number(form.startMonth) || 0, benefits: Number(form.benefits) || 0, exempt: "Exempt", payrollTaxRate: 8 };
+    patchUnit((u) => ({ ...u, newPositions: [...(u.newPositions || []), np] }));
+    setForm({ title: "", annualPay: "", fte: "1", startMonth: "0", benefits: "" });
+  };
+  const removePosition = (id) => patchUnit((u) => ({ ...u, newPositions: (u.newPositions || []).filter((n) => n.id !== id) }));
+  const howText = { direct: "", department: "by department", site: "by site", spread: "shared, spread", moved: "moved by you", new: "planned" };
+
+  return (
+    <div className="border rounded-lg p-3" style={{ borderColor: "#E1E5DE" }}>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div className="text-sm font-medium" style={{ color: "#1C2624" }}>Personnel</div>
+        <label className="flex items-center gap-2 text-sm" style={{ color: "#1C2624" }}>
+          <input type="checkbox" aria-label="Build wages and benefits from Personnel" disabled={!canEdit} checked={enabled} onChange={(e) => patchUnit((u) => ({ ...u, enabled: e.target.checked }))} />
+          Build this unit's wages and benefits from its people
+        </label>
+      </div>
+      <div className="text-xs mb-2" style={{ color: "#5B6B66" }}>
+        {pers.count} {pers.count === 1 ? "person" : "people"} → wages {fmt(wages)}, payroll taxes and benefits {fmt(ben)}. FY{model.fy - 1} run-rate baseline: wages {fmt(baseWages)}, benefits and tax {fmt(baseBen)}
+        {gap !== null && <> · <span style={{ color: Math.abs(gap) > 0.25 ? "#8A5A00" : "#5B6B66" }}>Personnel is {gap >= 0 ? "+" : ""}{(gap * 100).toFixed(0)}% against it</span></>}.
+        {" "}{enabled && row.personnelOn ? "These figures are in the model." : enabled ? "Nobody is in this unit, so it keeps its run-rate." : "Not used yet: the model still uses the run-rate."}
+      </div>
+      {pers.rows.length > 0 && (
+        <div className="border rounded-lg overflow-auto" style={{ borderColor: "#EEF0EC", maxHeight: "30vh" }}>
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 z-10">
+              <tr className="text-left" style={{ color: "#8A8F87", background: "#FAFBF9" }}>
+                <th className="px-2 py-1.5 font-normal">Person</th>
+                <th className="px-2 py-1.5 font-normal text-right">FTE × share</th>
+                <th className="px-2 py-1.5 font-normal text-right">Raise %</th>
+                <th className="px-2 py-1.5 font-normal">From</th>
+                <th className="px-2 py-1.5 font-normal">Through</th>
+                <th className="px-2 py-1.5 font-normal text-right">Wages</th>
+                <th className="px-2 py-1.5 font-normal text-right">Benefits and tax</th>
+                <th className="px-2 py-1.5 font-normal">In</th>
+                {siblings.length > 0 && <th className="px-2 py-1.5 font-normal">Charge to</th>}
+                <th className="px-2 py-1.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {pers.rows.map((r) => (
+                <tr key={r.key} className="border-t" style={{ borderColor: "#EEF0EC", opacity: r.excluded ? 0.5 : 1 }}>
+                  <td className="px-2 py-1.5"><div style={{ color: "#1C2624" }}>{r.name || r.position}</div><div style={{ color: "#8A8F87" }}>{r.name ? r.position : "planned position"}{howText[r.how] ? ` · ${howText[r.how]}` : ""}</div></td>
+                  <td className="px-2 py-1.5 text-right tabular-nums">{(r.fte * r.share).toFixed(2)}</td>
+                  {r.kind === "person" ? (
+                    <>
+                      <td className="px-2 py-1.5 text-right"><ToolNumberInput label={`Raise percent for ${r.name}`} width="w-16" disabled={!canEdit} value={typeof r.ov.raisePct === "number" ? r.ov.raisePct : null} placeholder={String(cfg.raisePct)} onCommit={(v) => setPerson(r.staffId, { raisePct: v })} /></td>
+                      <td className="px-2 py-1.5"><select aria-label={`From month for ${r.name}`} disabled={!canEdit} className="rounded border px-1 py-0.5" style={inputStyle} value={typeof r.ov.startMonth === "number" ? r.ov.startMonth : 0} onChange={(e) => setPerson(r.staffId, { startMonth: Number(e.target.value) || null })}>{MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}</select></td>
+                      <td className="px-2 py-1.5"><select aria-label={`Through month for ${r.name}`} disabled={!canEdit} className="rounded border px-1 py-0.5" style={inputStyle} value={typeof r.ov.endMonth === "number" ? r.ov.endMonth : 11} onChange={(e) => setPerson(r.staffId, { endMonth: Number(e.target.value) === 11 ? null : Number(e.target.value) })}>{MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}</select></td>
+                    </>
+                  ) : (<td colSpan={3} className="px-2 py-1.5" style={{ color: "#8A8F87" }}>from {MONTHS[((mine.newPositions || []).find((n) => n.id === r.newId) || {}).startMonth || 0]}</td>)}
+                  <td className="px-2 py-1.5 text-right tabular-nums">{fmt(sum(r.wages))}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums">{fmt(sum(r.benefits))}</td>
+                  <td className="px-2 py-1.5">{r.kind === "person" && <input type="checkbox" aria-label={`Include ${r.name}`} disabled={!canEdit} checked={!r.excluded} onChange={(e) => setPerson(r.staffId, { exclude: !e.target.checked })} />}</td>
+                  {siblings.length > 0 && (
+                    <td className="px-2 py-1.5">
+                      {r.kind === "person" && (r.how === "spread" || r.how === "moved" || r.how === "direct" || r.how === "department" || r.how === "site") && (
+                        <select aria-label={`Charge ${r.name} to`} disabled={!canEdit} className="rounded border px-1 py-0.5" style={inputStyle} value={r.how === "moved" ? unit.id : ""} onChange={(e) => setMove(r.staffId, e.target.value)}>
+                          <option value="">{r.how === "moved" ? "Back to automatic" : "Automatic"}</option>
+                          <option value={unit.id}>{unit.name} (all of them)</option>
+                          {siblings.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+                        </select>
+                      )}
+                    </td>
+                  )}
+                  <td className="px-2 py-1.5 text-right">{canEdit && r.kind === "new" && <button aria-label={`Remove ${r.position}`} onClick={() => removePosition(r.newId)} style={{ color: "#B5443A" }}><X size={13} /></button>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {pers.rows.length === 0 && <div className="text-xs" style={{ color: "#8A8F87" }}>Nobody in GrantFlow is allocated to this unit. Planned positions below will still be costed.</div>}
+      {canEdit && (
+        <div className="flex flex-wrap items-end gap-2 mt-3">
+          <Field label="Planned position"><input aria-label="Planned position title" className={inputCls} style={{ ...inputStyle, width: 180 }} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Title" /></Field>
+          <Field label="Yearly pay"><input aria-label="Planned position yearly pay" type="number" className={inputCls} style={{ ...inputStyle, width: 120 }} value={form.annualPay} onChange={(e) => setForm({ ...form, annualPay: e.target.value })} /></Field>
+          <Field label="FTE"><input aria-label="Planned position FTE" type="number" step="0.1" className={inputCls} style={{ ...inputStyle, width: 70 }} value={form.fte} onChange={(e) => setForm({ ...form, fte: e.target.value })} /></Field>
+          <Field label="Starts"><select aria-label="Planned position start month" className={inputCls} style={{ ...inputStyle, width: 90 }} value={form.startMonth} onChange={(e) => setForm({ ...form, startMonth: e.target.value })}>{MONTHS.map((m, i) => <option key={m} value={i}>{m}</option>)}</select></Field>
+          <Field label="Benefits a year"><input aria-label="Planned position benefits" type="number" className={inputCls} style={{ ...inputStyle, width: 110 }} value={form.benefits} onChange={(e) => setForm({ ...form, benefits: e.target.value })} /></Field>
+          <button onClick={addPosition} className="px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Add position</button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -12902,7 +13327,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
         ) : tab === "budgettool" ? (
           <BudgetToolView
             models={budgetModels} setModels={setBudgetModels}
-            grants={grants} budgets={budgets} costCenters={costCenters}
+            grants={grants} budgets={budgets} costCenters={costCenters} staff={staff}
             whoami={currentUserEmail || whoami} setTrash={setTrash} canEdit={canEdit} logActivity={logActivity}
           />
         ) : tab === "burn-rate" ? (
