@@ -135,16 +135,26 @@ function computeOrgFYTotals(budgets, grants, costCenters, budgetGroups, calYear)
   return { planRevenue, actualExpense };
 }
 
+// A line's name for matching purposes: case, punctuation and spacing ignored.
+function normalizeLineName(d) {
+  return String(d || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 // Copies actuals from the Template(s) feeding a Grant Budget onto it, matching by
-// category+subcategory and by calendar month. When several Templates feed the
-// same Grant Budget (SSVF's three states, GPD's two locations) their actuals are
-// ADDED together. Copying them one at a time let whichever Template saved last
-// overwrite the rest. The result is always worked out from the Templates as they
-// stand, so repeating it never piles up.
-// Known limitation, unchanged on purpose: inside ONE Template, lines that share a
-// category+subcategory (one wage line per position, told apart only by their
-// description) still behave as they always have: the last one wins and the others
-// are dropped. Fixing that changes Grant Budget actuals, so it is a separate fix.
+// category+subcategory and by calendar month.
+//  - Several Templates feeding one Grant Budget (SSVF's three states, GPD's two
+//    locations) are ADDED together; copying them one at a time let whichever
+//    saved last overwrite the rest.
+//  - A Template often lists one line per position under the same account (for
+//    example "5000 - Salary and Wages", told apart only by description). Where
+//    the Grant Budget follows the same position lines, each position's actuals go
+//    on the line with the same name, and positions it doesn't have yet are added.
+//    Matching by account alone used to keep only the last position and drop the rest.
+//  - A Grant Budget that holds those positions its own way (one consolidated line,
+//    or positions under custom subcategories) is left alone rather than risk
+//    counting the same money twice.
+// The result is always worked out from the Templates as they stand, so repeating
+// it never piles up.
 function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
   const linkedIds = linkedIdsOf(templateBudget);
   if (templateBudget.budgetType !== "Template" || linkedIds.length === 0 || !templateBudget.periodStart || !templateBudget.periodEnd) return [];
@@ -163,55 +173,137 @@ function syncActualsToLinkedBudgets(templateBudget, allBudgets) {
     const feeders = allBudgets.filter((b) => b.id !== templateBudget.id && b.budgetType === "Template" && b.periodStart && b.periodEnd && linkedIdsOf(b).includes(targetId));
     feeders.push(templateBudget);
 
-    // key -> the total for each month of the target, added across the feeders.
-    // Only months that fall inside the target's period count, and a line is only
-    // created in the target when some feeder line has an in-range month.
+    // What the feeders hold, by account and then by line name, added across
+    // Templates. Only months inside the target's period count.
+    //   ids[name]   -> { description, months: { monthIndex: { total, count } } }
+    //   monthSet    -> every target month some feeder line covers for this account
+    //   copies      -> what the old line-by-line copy leaves behind: the last line
+    //                  of the account, per Template (used to recognise its leftovers)
     const sums = {};
     feeders.forEach((f) => {
       const cols = monthColumnsForBudget(f.periodStart, f.periodEnd);
-      // this one Template's figure for each account and month (last line wins, as before)
-      const own = {};
+      const lastLine = {};
       (f.lines || []).forEach((tl) => {
         const key = `${tl.category}|||${tl.subcategory || ""}`;
+        const dn = normalizeLineName(tl.description);
         (tl.actuals || []).forEach((v, i) => {
           const col = cols[i];
           if (!col) return;
           const j = targetColIndexByYM[`${col.year}-${col.monthIndex}`];
           if (j === undefined) return;
-          const entry = own[key] || (own[key] = { category: tl.category, subcategory: tl.subcategory, type: tl.type, months: {} });
-          entry.months[j] = Number(v) || 0;
+          const e = sums[key] || (sums[key] = { category: tl.category, subcategory: tl.subcategory, type: tl.type, ids: {}, monthSet: {}, copies: [] });
+          const id = e.ids[dn] || (e.ids[dn] = { description: tl.description || "", months: {} });
+          const m = id.months[j] || (id.months[j] = { total: 0, count: 0 });
+          m.total += Number(v) || 0;
+          m.count += 1;
+          e.monthSet[j] = true;
+          (lastLine[key] || (lastLine[key] = {}))[j] = Number(v) || 0;
         });
       });
-      Object.keys(own).forEach((key) => {
-        const entry = sums[key] || (sums[key] = { category: own[key].category, subcategory: own[key].subcategory, type: own[key].type, months: {} });
-        Object.keys(own[key].months).forEach((jKey) => {
-          const m = entry.months[jKey] || (entry.months[jKey] = { total: 0, count: 0 });
-          m.total += own[key].months[jKey];
-          m.count += 1; // how many Templates contributed to this month
-        });
-      });
+      Object.keys(lastLine).forEach((key) => sums[key].copies.push(lastLine[key]));
     });
 
     let changed = false;
     const newLines = target.lines.map((l) => ({ ...l, actuals: [...(l.actuals || Array(targetCols.length).fill(0))] }));
-    Object.keys(sums).forEach((key) => {
-      const entry = sums[key];
-      let targetLine = newLines.find((l) => `${l.category}|||${l.subcategory || ""}` === key);
-      if (!targetLine) {
-        targetLine = { ...newLine(), category: entry.category, subcategory: entry.subcategory, type: entry.type, amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
-        newLines.push(targetLine);
-        changed = true;
-      }
-      Object.keys(entry.months).forEach((jKey) => {
+    const keyOf = (l) => `${l.category}|||${l.subcategory || ""}`;
+    const valueOf = (m) => (m.count > 1 ? Math.round(m.total * 100) / 100 : m.total); // a figure made by adding is kept to the cent
+    const setMonths = (line, months) => {
+      Object.keys(months).forEach((jKey) => {
         const j = Number(jKey);
-        const m = entry.months[j];
-        // a figure made by adding several Templates is kept to the cent, so floating-point dust never counts as a change
-        const numVal = m.count > 1 ? Math.round(m.total * 100) / 100 : m.total;
-        if (Math.abs((Number(targetLine.actuals[j]) || 0) - numVal) > 0.005) {
-          targetLine.actuals[j] = numVal;
-          changed = true;
-        }
+        const numVal = valueOf(months[jKey]);
+        if (Math.abs((Number(line.actuals[j]) || 0) - numVal) > 0.005) { line.actuals[j] = numVal; changed = true; }
       });
+    };
+    const clearMonths = (line, months) => {
+      Object.keys(months).forEach((jKey) => {
+        const j = Number(jKey);
+        if (Math.abs(Number(line.actuals[j]) || 0) > 0.005) { line.actuals[j] = 0; changed = true; }
+      });
+    };
+    const hasMoney = (id) => Object.keys(id.months).some((j) => Math.abs(valueOf(id.months[j])) > 0.005);
+    const addLine = (e, description) => {
+      const line = { ...newLine(), category: e.category, subcategory: e.subcategory, type: e.type, description: description || "", amounts: Array(targetCols.length).fill(0), actuals: Array(targetCols.length).fill(0) };
+      newLines.push(line);
+      changed = true;
+      return line;
+    };
+
+    Object.keys(sums).forEach((key) => {
+      const e = sums[key];
+      const names = Object.keys(e.ids);
+      const targetLines = newLines.filter((l) => keyOf(l) === key);
+
+      // One line name for this account: nothing positional to match, so it works
+      // as it always has. The figure goes on the account's first line, created if
+      // the Grant Budget doesn't have the account yet.
+      if (names.length === 1) {
+        setMonths(targetLines[0] || addLine(e, ""), e.ids[names[0]].months);
+        return;
+      }
+
+      // Several position lines. Work out what to do before touching anything.
+      const matches = []; // [line, name]: write that name's figures on that line
+      const repeats = []; // extra lines carrying a name already matched: cleared
+      const used = new Set();
+      const unmatchedNames = [];
+      names.forEach((dn) => {
+        const hits = targetLines.filter((l) => normalizeLineName(l.description) === dn);
+        if (hits.length === 0) { unmatchedNames.push(dn); return; }
+        matches.push([hits[0], dn]);
+        hits.slice(1).forEach((l) => repeats.push([l, dn])); // a repeated name: its total sits on the first line only
+        hits.forEach((l) => used.add(l));
+      });
+      // One position left over and one line left over: the same position, renamed.
+      let leftoverLines = targetLines.filter((l) => !used.has(l));
+      if (unmatchedNames.length === 1 && leftoverLines.length === 1 && matches.length > 0) {
+        matches.push([leftoverLines[0], unmatchedNames[0]]);
+        used.add(leftoverLines[0]);
+        unmatchedNames.length = 0;
+        leftoverLines = [];
+      }
+
+      // Positions the Grant Budget already holds under a custom subcategory of
+      // the same name are not added again.
+      const heldElsewhere = (dn) => dn !== "" && newLines.some((l) => l.category === e.category && l.subcategory && keyOf(l) !== key && normalizeLineName(l.subcategory) === dn);
+      const addMissing = () => unmatchedNames.forEach((dn) => {
+        if (heldElsewhere(dn) || !hasMoney(e.ids[dn])) return;
+        setMonths(addLine(e, e.ids[dn].description), e.ids[dn].months);
+      });
+
+      if (matches.length > 0) {
+        // This Grant Budget follows the Template's position lines for this account.
+        const months = Object.keys(e.monthSet);
+        const planOf = (l) => (l.amounts || []).reduce((acc, x) => acc + (Number(x) || 0), 0);
+        const moneyOf = (l) => months.some((j) => Math.abs(Number(l.actuals[j]) || 0) > 0.005);
+        const isOldCopy = (l) => e.copies.some((c) => months.every((j) => Math.abs((Number(l.actuals[j]) || 0) - (c[j] || 0)) <= 0.005));
+        const unplanned = leftoverLines.filter((l) => moneyOf(l) && planOf(l) === 0);
+        // Money someone entered by hand on a line no position owns, with no plan and
+        // not the old copy's leftover: filling in the positions as well could count
+        // it twice, and clearing it would delete their number, so leave the account
+        // exactly as it is until they sort that line out.
+        if (unplanned.some((l) => !isOldCopy(l))) return;
+        matches.forEach(([line, dn]) => setMonths(line, e.ids[dn].months));
+        repeats.forEach(([line, dn]) => clearMonths(line, e.ids[dn].months));
+        addMissing();
+        // What the old copy left behind on a line no position owns is cleared.
+        unplanned.forEach((l) => clearMonths(l, e.monthSet));
+      } else if (targetLines.length === 0) {
+        // The account isn't in the Grant Budget: add each position, unless the
+        // Grant Budget already holds it under a custom subcategory.
+        addMissing();
+      } else if (targetLines.length === 1 && !unmatchedNames.some(heldElsewhere)) {
+        // One consolidated line for the whole account: it holds the total.
+        const total = {};
+        names.forEach((dn) => Object.keys(e.ids[dn].months).forEach((j) => {
+          const m = total[j] || (total[j] = { total: 0, count: 0 });
+          m.total += e.ids[dn].months[j].total;
+          m.count += e.ids[dn].months[j].count;
+        }));
+        setMonths(targetLines[0], total);
+      }
+      // Otherwise the Grant Budget tracks these positions its own way (positions
+      // under custom subcategories, or several lines that match no name): leave it
+      // exactly as it is.
     });
 
     // The marker follows the Template(s) even when no dollar amount changed.
@@ -431,7 +523,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "1.5.4";
+const APP_VERSION = "1.5.5";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
