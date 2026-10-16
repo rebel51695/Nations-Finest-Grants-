@@ -404,6 +404,18 @@ function parseExcelTemplateWorkbook(aoa, sheet) {
   const actualsNote = String(aoa[4]?.[5] || "");
   const actualsNoteMatch = actualsNote.match(/Updated up to (\d{2})\/(\d{2})\/(\d{4})/);
   const actualsThroughDate = actualsNoteMatch ? { year: Number(actualsNoteMatch[3]), monthIndex: Number(actualsNoteMatch[1]) - 1 } : null;
+  // "Actuals complete through" is only a month that is finished. If the note's date falls part
+  // way through its month, that month's figures are still kept as actuals, but the marker is
+  // the month before, so a half-loaded month doesn't count as real and pull the run-rate down.
+  let markerDate = actualsThroughDate;
+  if (actualsNoteMatch) {
+    const lastDayOfNoteMonth = new Date(Date.UTC(actualsThroughDate.year, actualsThroughDate.monthIndex + 1, 0)).getUTCDate();
+    if (Number(actualsNoteMatch[2]) < lastDayOfNoteMonth) {
+      const t = actualsThroughDate.year * 12 + actualsThroughDate.monthIndex - 1;
+      markerDate = { year: Math.floor(t / 12), monthIndex: t % 12 };
+      warnings.push(`The file is updated up to ${actualsNoteMatch[1]}/${actualsNoteMatch[2]}/${actualsNoteMatch[3]}, part way through ${MONTHS[actualsThroughDate.monthIndex]}. "Actuals complete through" is set to ${MONTHS[markerDate.monthIndex]} ${markerDate.year} so a half-loaded month doesn't count as real; ${MONTHS[actualsThroughDate.monthIndex]}'s figures are kept.`);
+    }
+  }
 
   const monthCols = [];
   for (let c = 1; c <= 12; c++) {
@@ -478,7 +490,7 @@ function parseExcelTemplateWorkbook(aoa, sheet) {
   }
 
   return {
-    projectCode, fy, periodStart, periodEnd, actualsThroughDate, monthCols,
+    projectCode, fy, periodStart, periodEnd, actualsThroughDate, markerDate, monthCols,
     lines: Object.values(linesByKey),
     warnings,
     unrecognizedCodes: [...unrecognizedCodes],
@@ -524,7 +536,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "2.0.1";
+const APP_VERSION = "2.2.1";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -1151,8 +1163,9 @@ function spawnNextReportOccurrence(report, grant) {
     if (grant.stage === "Closed" || grant.stage === "Rejected") return null;
     if (grant.end && new Date(nextDue + "T00:00:00") > new Date(grant.end + "T00:00:00")) return null;
   }
+  const { completedAt, archiveHold, ...fresh } = report; // a new report starts without the old one's completion day or hold
   return {
-    ...report,
+    ...fresh,
     id: uid(),
     dueDate: nextDue,
     startDate: report.startDate ? advanceDateByRepeat(report.startDate, report.repeat) : "",
@@ -1163,6 +1176,43 @@ function spawnNextReportOccurrence(report, grant) {
     createdAt: new Date().toISOString().slice(0, 10),
   };
 }
+
+// Completing a recurring report creates its next occurrence exactly once, however it is completed
+// (the card's checkbox, or moving the card to Complete) and in whatever order: if a report for that
+// same grant, title and due date already exists, no second copy is made.
+function nextOccurrenceExists(reports, spawned) {
+  const title = (x) => String(x.title || "").trim();
+  return reports.some((x) => x.grantId === spawned.grantId && title(x) === title(spawned) && x.dueDate === spawned.dueDate);
+}
+function withNextOccurrence(reports, shouldSpawn, report, grant) {
+  if (!shouldSpawn) return { reports, spawned: null };
+  const spawned = spawnNextReportOccurrence(report, grant);
+  if (!spawned || nextOccurrenceExists(reports, spawned)) return { reports, spawned: null };
+  return { reports: [...reports, spawned], spawned };
+}
+// Moving a card to Complete checks its box (status Completed). Moving it out of Complete opens it
+// again, so the box is cleared, and the day it was completed is forgotten.
+function moveReportToBucket(list, report, bucket, grant, todayIso) {
+  const willComplete = bucket === "Complete" && report.bucket !== "Complete";
+  const leaving = report.bucket === "Complete" && bucket !== "Complete";
+  const next = list.map((x) => {
+    if (x.id !== report.id) return x;
+    let moved = stampReportMove(x, { ...x, bucket }, todayIso);
+    if (willComplete) moved = { ...moved, status: "Completed" };
+    else if (leaving && moved.status === "Completed") moved = { ...moved, status: bucket === "In progress" ? "In progress" : "Not started" };
+    return moved;
+  });
+  return withNextOccurrence(next, willComplete, report, grant);
+}
+// The checkbox on a card.
+function toggleReportDone(list, report, grant) {
+  const willComplete = report.status !== "Completed";
+  const next = list.map((x) => (x.id === report.id ? { ...x, status: willComplete ? "Completed" : "Not started" } : x));
+  return withNextOccurrence(next, willComplete, report, grant);
+}
+// On a card in Complete the box is checked for you and can't be changed by hand: move the card out of
+// Complete to reopen it.
+const isReportDoneLocked = (report) => report.bucket === "Complete" && report.status === "Completed";
 
 const checklistProgress = (report) => {
   const items = report.checklist || [];
@@ -1191,6 +1241,39 @@ function effectiveReportBucket(report) {
   if (due < today) return "Overdue";
   const daysUntil = (due - today) / 86400000;
   return daysUntil > 90 ? "Upcoming" : "Up next";
+}
+
+// ---------- archiving completed reports ----------
+// A report in the Complete column moves to the Archive once it is more than REPORT_ARCHIVE_DAYS
+// past its due date, so the column doesn't grow without end. Nothing is deleted or moved: this is
+// only a rule for what the board shows. The days count from the later of the due date and the day
+// it was marked complete, so a report finished late doesn't vanish the moment it is completed.
+// "Return to board" sets archiveHold, which keeps one on the board until it leaves Complete.
+const REPORT_ARCHIVE_DAYS = 30;
+function reportsTodayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function daysBetweenIso(a, b) {
+  const t = (s) => Date.UTC(Number(s.slice(0, 4)), Number(s.slice(5, 7)) - 1, Number(s.slice(8, 10)));
+  return Math.round((t(b) - t(a)) / 86400000);
+}
+function isReportArchived(report, todayIso) {
+  if (effectiveReportBucket(report) !== "Complete") return false;
+  if (report.archiveHold) return false;
+  const dates = [report.dueDate, report.completedAt].map((d) => String(d || "").slice(0, 10)).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+  if (dates.length === 0) return false; // nothing to count from
+  return daysBetweenIso(dates[dates.length - 1], todayIso || reportsTodayIso()) > REPORT_ARCHIVE_DAYS;
+}
+// Records the day a report moved into Complete, and clears the day and any hold when it leaves.
+function stampReportMove(prev, next, todayIso) {
+  const wasComplete = !!prev && prev.bucket === "Complete";
+  if (next.bucket === "Complete") {
+    if (prev && !wasComplete) { const { archiveHold, ...rest } = next; return { ...rest, completedAt: todayIso || reportsTodayIso() }; }
+    return next;
+  }
+  if (next.completedAt || next.archiveHold) { const { completedAt, archiveHold, ...rest } = next; return rest; }
+  return next;
 }
 
 // ---------- shared bits ----------
@@ -1296,6 +1379,129 @@ function grantLabel(g) {
   return g.programCode ? `${g.programCode} - ${g.title}` : g.title;
 }
 
+// ===========================================================================
+// Keeping the data safe and honest: compressed storage so no collection or backup
+// hits the 1 MiB record limit, a check on "actuals complete through" markers, and
+// two clean-ups. Plain calculation, so every rule can be tested on real data.
+// ===========================================================================
+
+// ---- Storage packing ----
+// Each collection (and each automatic backup) is saved as one record with a 1 MiB limit.
+// Anything over STORAGE_PACK_OVER characters is saved gzip-compressed, as text starting with
+// "GZ1:". It is checked by unpacking it again before it is used, and anything that doesn't
+// round-trip exactly is saved as plain text instead. Plain text still reads as before.
+const STORAGE_PACK_PREFIX = "GZ1:";
+const STORAGE_PACK_OVER = 300000;
+
+function storageBytesToBase64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function storageBase64ToBytes(b64) {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+async function unpackFromStorage(text) {
+  if (typeof text !== "string" || !text.startsWith(STORAGE_PACK_PREFIX)) return text;
+  const bytes = storageBase64ToBytes(text.slice(STORAGE_PACK_PREFIX.length));
+  const buf = await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+  return new TextDecoder().decode(buf);
+}
+async function packForStorage(text) {
+  if (typeof text !== "string" || text.length < STORAGE_PACK_OVER) return text;
+  if (typeof CompressionStream === "undefined" || typeof DecompressionStream === "undefined") return text;
+  try {
+    const gz = new Uint8Array(await new Response(new Blob([new TextEncoder().encode(text)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    const packed = STORAGE_PACK_PREFIX + storageBytesToBase64(gz);
+    if (packed.length >= text.length) return text;
+    if ((await unpackFromStorage(packed)) !== text) return text; // never store what doesn't come back identical
+    return packed;
+  } catch (e) {
+    return text;
+  }
+}
+
+// ---- Actuals markers ----
+function previousMonthKey(key) {
+  const t = Number(String(key).slice(0, 4)) * 12 + (Number(String(key).slice(5, 7)) - 1) - 1;
+  return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, "0")}`;
+}
+function monthKeyLabel(key) {
+  return key ? `${MONTHS[Number(String(key).slice(5, 7)) - 1]} ${String(key).slice(0, 4)}` : "not set";
+}
+const templateMonthExpense = (b, i) => b.lines.filter((l) => l.type === "expense").reduce((t, l) => t + (Number((l.actuals || [])[i]) || 0), 0);
+
+// Active Templates whose "actuals complete through" month looks half-loaded: that month's
+// expense is under half of the average of the three months before it. Those months count as
+// real in Org Budget, Burn Rate and the Budget tool, so a half-loaded one pulls the run-rate down.
+function actualsMarkerHealth(budgets) {
+  const out = [];
+  budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status) && b.actualsThrough).forEach((b) => {
+    const cols = monthColumnsForBudget(b.periodStart, b.periodEnd);
+    const idx = cols.findIndex((c) => `${c.year}-${String(c.monthIndex + 1).padStart(2, "0")}` === b.actualsThrough);
+    if (idx < 3) return;
+    const last = templateMonthExpense(b, idx);
+    const avg = (templateMonthExpense(b, idx - 1) + templateMonthExpense(b, idx - 2) + templateMonthExpense(b, idx - 3)) / 3;
+    if (avg < 2000 || last >= avg * 0.5) return;
+    out.push({ id: b.id, title: String(b.title || "").trim(), marker: b.actualsThrough, newMarker: previousMonthKey(b.actualsThrough), last, avg, ratio: last / avg });
+  });
+  return out.sort((a, b) => a.ratio - b.ratio);
+}
+
+// Moves those Templates' markers back one month (or clears one that would fall before its
+// period), then lets the Grant Budgets they feed follow.
+function moveMarkersBack(budgets, ids) {
+  const set = new Set(ids);
+  const next = budgets.map((b) => {
+    if (!set.has(b.id) || !b.actualsThrough) return b;
+    const prev = previousMonthKey(b.actualsThrough);
+    const first = monthColumnsForBudget(b.periodStart, b.periodEnd)[0];
+    const firstKey = first ? `${first.year}-${String(first.monthIndex + 1).padStart(2, "0")}` : "";
+    return { ...b, actualsThrough: firstKey && prev < firstKey ? "" : prev };
+  });
+  const al = alignLinkedMarkers(next);
+  return { budgets: al.budgets, changedIds: [...new Set([...ids, ...al.changedIds])] };
+}
+
+// Pairs of Templates for the same grant or cost center whose monthly expense is the same
+// month after month: copies of each other, not two separate sets of actuals.
+function duplicateTemplateActuals(budgets) {
+  const T = budgets.filter((b) => b.budgetType === "Template" && isActiveBudget(b.status));
+  const monthly = (b) => { const m = {}; monthColumnsForBudget(b.periodStart, b.periodEnd).forEach((c, i) => { m[`${c.year}-${c.monthIndex}`] = templateMonthExpense(b, i); }); return m; };
+  const out = [];
+  for (let i = 0; i < T.length; i++) {
+    for (let j = i + 1; j < T.length; j++) {
+      const a = T[i], b = T[j];
+      const owner = a.grantId || a.costCenterId;
+      if (!owner || owner !== (b.grantId || b.costCenterId)) continue;
+      const ma = monthly(a), mb = monthly(b);
+      let both = 0, same = 0;
+      Object.keys(ma).forEach((k) => { if (mb[k] !== undefined && ma[k] > 1000 && mb[k] > 1000) { both += 1; if (Math.abs(ma[k] - mb[k]) <= 0.02 * Math.max(ma[k], mb[k])) same += 1; } });
+      if (both >= 3 && same / both >= 0.8) out.push({ ids: [a.id, b.id], titles: [String(a.title).trim(), String(b.title).trim()], months: both, grantId: a.grantId || "", costCenterId: a.costCenterId || "" });
+    }
+  }
+  return out;
+}
+
+// A Template is where actuals come from; it is never a place another Template sends them. Any
+// link from one Template to another is dropped.
+function dropTemplateLinks(budgets) {
+  const byId = Object.fromEntries(budgets.map((b) => [b.id, b]));
+  const changedIds = [];
+  const next = budgets.map((b) => {
+    if (b.budgetType !== "Template") return b;
+    const ids = linkedIdsOf(b);
+    const good = ids.filter((id) => !(byId[id] && byId[id].budgetType === "Template"));
+    if (good.length === ids.length) return b;
+    changedIds.push(b.id);
+    return { ...b, linkedBudgetIds: good, ...(b.linkedBudgetId ? { linkedBudgetId: "" } : {}) };
+  });
+  return { budgets: changedIds.length ? next : budgets, changedIds };
+}
+
 // Tells "this record doesn't exist" apart from "the storage layer failed to
 // answer". The first is a normal empty state; the second must never be taken
 // for it, or a failed read looks exactly like lost data.
@@ -1310,7 +1516,7 @@ async function loadData(baseKey) {
   let readFailed = false;
   try {
     const plain = await window.storage.get(baseKey, true);
-    if (plain?.value) return JSON.parse(plain.value);
+    if (plain?.value) return JSON.parse(await unpackFromStorage(plain.value));
   } catch (e) { if (classifyStorageError(e) === "failure") readFailed = true; }
   // Fallback: in case data was ever written in the old chunked format
   try {
@@ -1329,11 +1535,11 @@ async function loadData(baseKey) {
 }
 
 async function saveData(baseKey, value) {
-  await window.storage.set(baseKey, JSON.stringify(value), true);
+  await window.storage.set(baseKey, await packForStorage(JSON.stringify(value)), true);
 }
 
 async function saveDataJson(baseKey, json) {
-  await window.storage.set(baseKey, json, true);
+  await window.storage.set(baseKey, await packForStorage(json), true);
 }
 
 // Keeps this browser's copy of each shared collection and the server's copy
@@ -3955,6 +4161,8 @@ function BudgetsView({ grants, budgets, setBudgets, selectedGrantId, setSelected
         <StatCard label="Closed" value={statusCounts["Closed"] || 0} />
       </div>
 
+      <BudgetDataHealth budgets={budgets} setBudgets={setBudgets} canEdit={canEdit} logActivity={logActivity} />
+
       {needsAttention.length > 0 && (
         <div className="bg-white rounded-lg border p-4" style={{ borderColor: "#C08A2E" }}>
           <h2 className="font-display text-sm mb-2" style={{ color: "#C08A2E" }}>Needs attention — {needsAttention.length} budget{needsAttention.length === 1 ? "" : "s"} awaiting approval</h2>
@@ -4273,8 +4481,8 @@ function ExcelTemplateImportModal({ grants, budgets, setBudgets, logActivity, on
 
       const matchedGrant = grants.find((g) => g.programCode && String(g.programCode).trim() === result.projectCode);
       const fy = String(result.fy || new Date(result.periodStart).getUTCFullYear());
-      const actualsThrough = result.actualsThroughDate
-        ? `${result.actualsThroughDate.year}-${String(result.actualsThroughDate.monthIndex + 1).padStart(2, "0")}`
+      const actualsThrough = result.markerDate
+        ? `${result.markerDate.year}-${String(result.markerDate.monthIndex + 1).padStart(2, "0")}`
         : "";
 
       const warnings = [...result.warnings];
@@ -4439,14 +4647,14 @@ function ExcelTemplateImportModal({ grants, budgets, setBudgets, logActivity, on
   );
 }
 
-function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
+function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit, doneHint }) {
   const progress = checklistProgress(report);
   const overdue = isOverdue(report);
   const atRisk = isAtRisk(report);
   return (
     <div className="bg-white rounded-lg border p-3.5" style={{ borderColor: overdue ? "#B5443A" : atRisk ? "#C08A2E" : "#E1E5DE" }}>
       <div className="flex items-start gap-2">
-        <button onClick={onToggleDone} disabled={!onToggleDone} className="mt-0.5 shrink-0">
+        <button onClick={onToggleDone} disabled={!onToggleDone} title={doneHint} aria-label={report.status === "Completed" ? "Completed" : "Mark complete"} className="mt-0.5 shrink-0">
           {report.status === "Completed" ? <CheckCircle size={17} style={{ color: "#2F6F53" }} /> : <Circle size={17} style={{ color: "#8A8F87" }} />}
         </button>
         <button onClick={onEdit} className="text-left flex-1">
@@ -4517,22 +4725,31 @@ function ReportCard({ report, grant, onToggleDone, onBucketChange, onEdit }) {
   );
 }
 
-function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, setTrash, currentUserEmail, canEdit, initialOpenReportId, logActivity }) {
+function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGrantFilter, setTrash, currentUserEmail, canEdit, initialOpenReportId, logActivity, todayIso }) {
   const [modal, setModal] = useState(() => (initialOpenReportId ? reports.find((r) => r.id === stripNonce(initialOpenReportId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [assignedFilter, setAssignedFilter] = useState("All");
+  const [showArchive, setShowArchive] = useState(false);
+  const [archiveQuery, setArchiveQuery] = useState("");
+  const today = todayIso || reportsTodayIso();
 
   const buckets = [...new Set([...DEFAULT_BUCKETS, ...reports.map((r) => r.bucket)])];
   const assignees = [...new Set(reports.map((r) => (r.assignedTo || "").trim()).filter(Boolean))].sort();
-  const visible = reports
+  const filtered = reports
     .filter((r) => grantFilter === "All" || r.grantId === grantFilter)
     .filter((r) => assignedFilter === "All" || (r.assignedTo || "").trim() === assignedFilter);
+  const visible = filtered.filter((r) => !isReportArchived(r, today));
+  const archived = filtered.filter((r) => isReportArchived(r, today));
+  const returnToBoard = (r) => {
+    setReports((prev) => prev.map((x) => (x.id === r.id ? { ...x, archiveHold: true } : x)));
+    logActivity?.("Report", "Updated", `${r.title || "Untitled report"} (returned to the board from the archive)`);
+  };
 
   const saveReport = (r) => {
     setReports((prev) => {
       const exists = prev.some((x) => x.id === r.id);
       logActivity?.("Report", exists ? "Updated" : "Created", r.title || "Untitled report");
-      return exists ? prev.map((x) => (x.id === r.id ? r : x)) : [...prev, r];
+      return exists ? prev.map((x) => (x.id === r.id ? stampReportMove(x, r, today) : x)) : [...prev, r];
     });
   };
   const createTaskFromReport = (r) => {
@@ -4553,31 +4770,17 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
     setConfirm(null);
   };
   const toggleDone = (r) => {
-    const willComplete = r.status !== "Completed";
     setReports((prev) => {
-      let next = prev.map((x) => (x.id === r.id ? { ...x, status: willComplete ? "Completed" : "Not started" } : x));
-      if (willComplete) {
-        const spawned = spawnNextReportOccurrence(r, grants.find((g) => g.id === r.grantId));
-        if (spawned) {
-          next = [...next, spawned];
-          logActivity?.("Report", "Created", `${spawned.title || "Untitled report"} — next occurrence auto-created`);
-        }
-      }
-      return next;
+      const out = toggleReportDone(prev, r, grants.find((g) => g.id === r.grantId));
+      if (out.spawned) logActivity?.("Report", "Created", `${out.spawned.title || "Untitled report"} — next occurrence auto-created`);
+      return out.reports;
     });
   };
   const changeBucket = (r, bucket) => {
-    const willComplete = bucket === "Complete" && r.bucket !== "Complete";
     setReports((prev) => {
-      let next = prev.map((x) => (x.id === r.id ? { ...x, bucket } : x));
-      if (willComplete) {
-        const spawned = spawnNextReportOccurrence(r, grants.find((g) => g.id === r.grantId));
-        if (spawned) {
-          next = [...next, spawned];
-          logActivity?.("Report", "Created", `${spawned.title || "Untitled report"} — next occurrence auto-created`);
-        }
-      }
-      return next;
+      const out = moveReportToBucket(prev, r, bucket, grants.find((g) => g.id === r.grantId), today);
+      if (out.spawned) logActivity?.("Report", "Created", `${out.spawned.title || "Untitled report"} — next occurrence auto-created`);
+      return out.reports;
     });
   };
 
@@ -4585,14 +4788,19 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>Grant Reports</h1>
-          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>Track reports and deliverables due to funders</p>
+          <h1 className="font-display text-2xl" style={{ color: "#1C2624" }}>{showArchive ? "Archived reports" : "Grant Reports"}</h1>
+          <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>{showArchive ? `Completed reports more than ${REPORT_ARCHIVE_DAYS} days past their due date. They are kept, and still show up in search.` : "Track reports and deliverables due to funders"}</p>
         </div>
-        {canEdit && (
-          <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
-            <Plus size={16} /> New report
+        <div className="flex items-center gap-2">
+          <button onClick={() => setShowArchive(!showArchive)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            {showArchive ? "← Back to board" : `Archive (${archived.length})`}
           </button>
-        )}
+          {canEdit && !showArchive && (
+            <button onClick={() => setModal("new")} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>
+              <Plus size={16} /> New report
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex gap-3 flex-wrap">
@@ -4607,9 +4815,11 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
         </Field>
       </div>
 
-      {visible.length === 0 ? (
+      {showArchive ? (
+        <ReportArchive reports={archived} grants={grants} canEdit={canEdit} query={archiveQuery} setQuery={setArchiveQuery} onOpen={setModal} onReturn={returnToBoard} />
+      ) : visible.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          No grant reports yet.
+          {archived.length > 0 ? `No active reports. ${archived.length} completed report${archived.length === 1 ? " is" : "s are"} in the Archive.` : "No grant reports yet."}
         </div>
       ) : (
         <div className="overflow-x-auto pb-2">
@@ -4625,11 +4835,13 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
                       key={r.id}
                       report={{ ...r, bucket: effectiveReportBucket(r) }}
                       grant={grants.find((g) => g.id === r.grantId)}
-                      onToggleDone={canEdit ? () => toggleDone(r) : undefined}
+                      onToggleDone={canEdit && !isReportDoneLocked(r) ? () => toggleDone(r) : undefined}
+                      doneHint={isReportDoneLocked(r) ? "Checked automatically in Complete. Move the card out of Complete to reopen it." : undefined}
                       onBucketChange={canEdit ? (b) => changeBucket(r, b) : undefined}
                       onEdit={() => setModal(r)}
                     />
                   ))}
+                  {bucket === "Complete" && <p className="text-xs" style={{ color: "#8A8F87" }}>Completed reports more than {REPORT_ARCHIVE_DAYS} days past their due date move to the Archive.</p>}
                 </div>
               </div>
             ))}
@@ -4651,6 +4863,48 @@ function ReportsView({ grants, reports, setReports, setTasks, grantFilter, setGr
       {confirm && (
         <ConfirmModal message="This will permanently delete this report." onConfirm={() => deleteReport(confirm)} onCancel={() => setConfirm(null)} />
       )}
+    </div>
+  );
+}
+
+// The archive: completed reports old enough to leave the board, newest first, grouped by year.
+function ReportArchive({ reports, grants, canEdit, query, setQuery, onOpen, onReturn }) {
+  const q = query.trim().toLowerCase();
+  const grantName = (r) => { const g = grants.find((x) => x.id === r.grantId); return g ? (g.programCode ? `${g.programCode} - ${g.title}` : g.title) : ""; };
+  const shown = reports.filter((r) => !q || `${r.title} ${grantName(r)} ${r.assignedTo || ""}`.toLowerCase().includes(q))
+    .sort((a, b) => String(b.dueDate || "").localeCompare(String(a.dueDate || "")));
+  const years = [];
+  shown.forEach((r) => { const y = String(r.dueDate || "").slice(0, 4) || "No due date"; let g = years.find((x) => x.year === y); if (!g) { g = { year: y, items: [] }; years.push(g); } g.items.push(r); });
+  return (
+    <div className="space-y-4">
+      <div className="relative" style={{ maxWidth: 320 }}>
+        <Search size={14} className="absolute left-2.5 top-2.5" style={{ color: "#8A8F87" }} />
+        <input aria-label="Search archived reports" className="w-full rounded-md border pl-8 pr-3 py-2 text-sm outline-none" style={inputStyle} placeholder="Search archived reports" value={query} onChange={(e) => setQuery(e.target.value)} />
+      </div>
+      {reports.length === 0 ? (
+        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Nothing is archived yet. Completed reports move here once they are more than {REPORT_ARCHIVE_DAYS} days past their due date.</div>
+      ) : shown.length === 0 ? (
+        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>No archived reports match.</div>
+      ) : years.map((g) => (
+        <div key={g.year}>
+          <h3 className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#5B6B66" }}>{g.year} <span style={{ color: "#8A8F87", fontWeight: 400 }}>({g.items.length})</span></h3>
+          <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-sm">
+              <tbody>
+                {g.items.map((r) => (
+                  <tr key={r.id} className="border-t first:border-t-0" style={{ borderColor: "#EEF0EC" }}>
+                    <td className="px-3 py-2"><button onClick={() => onOpen(r)} className="text-left" style={{ color: "#1C2624" }}>{r.title || "Untitled report"}</button></td>
+                    <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>{grantName(r)}</td>
+                    <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>{r.assignedTo}</td>
+                    <td className="px-3 py-2 text-xs whitespace-nowrap" style={{ color: "#5B6B66" }}>Due {r.dueDate ? fmtDate(r.dueDate) : "—"}{r.completedAt ? ` · completed ${fmtDate(r.completedAt)}` : ""}</td>
+                    <td className="px-3 py-2 text-right">{canEdit && <button onClick={() => onReturn(r)} aria-label={`Return ${r.title} to the board`} className="text-xs px-2 py-1 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>Return to board</button>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -6273,9 +6527,9 @@ function toolRollup(model, budgets, staff) {
 const TOOL_MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
 
 function toolParseDateCell(v) {
-  if (v instanceof Date && !isNaN(v)) return { year: v.getUTCFullYear(), monthIndex: v.getUTCMonth() };
+  if (v instanceof Date && !isNaN(v)) return { year: v.getUTCFullYear(), monthIndex: v.getUTCMonth(), day: v.getUTCDate() };
   const m = String(v || "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  return m ? { year: Number(m[3]), monthIndex: Number(m[1]) - 1 } : null;
+  return m ? { year: Number(m[3]), monthIndex: Number(m[1]) - 1, day: Number(m[2]) } : null;
 }
 
 // Reads a Sage profit and loss export that has one column per project or
@@ -8300,12 +8554,22 @@ function tiesToFile(plan, totals) {
   return okExp && okRev;
 }
 
+// Is this month still going on as of the date the report was run?
+function toolMonthInProgress(parsed, year, monthIndex) {
+  const a = parsed && parsed.asOf;
+  if (!a || !a.day) return false;
+  const last = new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+  const asOfIdx = a.year * 12 + a.monthIndex;
+  const fileIdx = year * 12 + monthIndex;
+  return asOfIdx < fileIdx || (asOfIdx === fileIdx && a.day < last);
+}
+
 // The whole upload, as a dry run or for real: files in, updated budgets out.
 //   files:  [{ name, parsed, year, monthIndex }]
 //   assign: normalized column heading -> { templateId } | { create: { grantId, name } } | null
 //   replace: { [grantId]: [templateId, ...] }  Templates the new ones stand in for
 // Returns the new budgets list and a report line for every column of every file.
-function planMonthlyActualsUpload({ files, assign, budgets, replace, overrides }) {
+function planMonthlyActualsUpload({ files, assign, budgets, replace, overrides, forceMarker }) {
   const sorted = [...files].sort((a, b) => (a.year * 12 + a.monthIndex) - (b.year * 12 + b.monthIndex));
   let working = budgets.map((b) => b);
   const report = [];
@@ -8347,8 +8611,15 @@ function planMonthlyActualsUpload({ files, assign, budgets, replace, overrides }
       const monthCol = cols.findIndex((c) => c.year === file.year && c.monthIndex === file.monthIndex);
       if (monthCol < 0) { report.push({ ...entry, error: `${template.title} doesn't cover ${entry.month}.` }); return; }
       const plan = planActualsForTemplate(file.parsed, col.index, template, monthCol, ((overrides || {})[templateId] || {}));
+      // "Actuals complete through" must only move onto a month that is finished and looks whole: one
+      // still going on, or far below the three months before it, would count as real and pull the run-rate down.
+      const prior = monthCol >= 3 ? (templateMonthExpense(template, monthCol - 1) + templateMonthExpense(template, monthCol - 2) + templateMonthExpense(template, monthCol - 3)) / 3 : 0;
+      const lowMonth = prior >= 2000 && plan.placedExpense < prior * 0.5 ? { ratio: plan.placedExpense / prior, avg: prior } : null;
+      const inProgress = toolMonthInProgress(file.parsed, file.year, file.monthIndex);
       let next = applyActualsPlan(template, plan, monthCol);
-      const marker = nextActualsThrough(next, file.year, file.monthIndex);
+      let marker = nextActualsThrough(next, file.year, file.monthIndex);
+      const held = marker.advanced && !forceMarker && (inProgress || !!lowMonth);
+      if (held) marker = { value: template.actualsThrough || "", advanced: false, gap: [], held: inProgress ? "in-progress" : "low" };
       // A Template is a source, never a destination: drop any link that points at another Template.
       const linkIds = linkedIdsOf(next);
       const goodLinks = linkIds.filter((id) => { const b = working.find((x) => x.id === id); return b && b.budgetType !== "Template"; });
@@ -8357,7 +8628,7 @@ function planMonthlyActualsUpload({ files, assign, budgets, replace, overrides }
       working = working.map((b) => (b.id === next.id ? next : b));
       touched[next.id] = true;
       report.push({
-        ...entry, plan, marker, markerBefore: template.actualsThrough || "", droppedLinks,
+        ...entry, plan, marker, markerBefore: template.actualsThrough || "", droppedLinks, inProgress, lowMonth, asOf: file.parsed && file.parsed.asOf ? file.parsed.asOf : null,
         newLines: Object.values(plan.toNew), unplaced: plan.unplaced, zeroed: plan.zeroed, pending: plan.pending,
         fileTotals: (file.parsed.totals || {})[col.index] || null,
         ties: tiesToFile(plan, (file.parsed.totals || {})[col.index]),
@@ -8400,6 +8671,7 @@ function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActi
   const [standIn, setStandIn] = useState({}); // grantId -> true
   const [overrides, setOverrides] = useState({}); // templateId -> rowKey -> lineId | "new"
   const [allowLost, setAllowLost] = useState(false);
+  const [forceMarker, setForceMarker] = useState(false);
   const [error, setError] = useState("");
 
   const templates = useMemo(() => budgets.filter((b) => b.budgetType === "Template" && b.status !== "Closed"), [budgets]);
@@ -8483,7 +8755,7 @@ function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActi
 
   const planFiles = good.map((f) => ({ name: f.name, parsed: f.parsed, year: Number(f.year), monthIndex: f.monthIndex }));
   const badYear = good.some((f) => !(Number.isInteger(Number(f.year)) && Number(f.year) > 2000));
-  const result = useMemo(() => (good.length && Object.keys(assign).length && !badYear ? planMonthlyActualsUpload({ files: planFiles, assign, budgets, replace, overrides }) : null), [files, assign, budgets, replace, overrides]);
+  const result = useMemo(() => (good.length && Object.keys(assign).length && !badYear ? planMonthlyActualsUpload({ files: planFiles, assign, budgets, replace, overrides, forceMarker }) : null), [files, assign, budgets, replace, overrides, forceMarker]);
 
   const entries = result ? result.report : [];
   const errors = entries.filter((e) => e.error);
@@ -8499,7 +8771,7 @@ function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActi
   const apply = () => {
     let summary = "";
     setBudgets((prev) => {
-      const r = planMonthlyActualsUpload({ files: planFiles, assign, budgets: prev, replace, overrides });
+      const r = planMonthlyActualsUpload({ files: planFiles, assign, budgets: prev, replace, overrides, forceMarker });
       const months = new Set(r.report.filter((x) => !x.error).map((x) => x.month));
       r.changedIds.forEach((id) => { const t = r.budgets.find((b) => b.id === id); logActivity?.("Budget", "Updated", `${t?.title || "Template"} (Sage monthly actuals upload)`); });
       summary = `Updated actuals on ${r.changedIds.length} Template${r.changedIds.length === 1 ? "" : "s"} for ${months.size} month${months.size === 1 ? "" : "s"}${r.syncedIds.length ? `, and ${r.syncedIds.length} Grant Budget${r.syncedIds.length === 1 ? "" : "s"}` : ""}.`;
@@ -8512,10 +8784,12 @@ function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActi
   const markerText = (e) => {
     const m = e.marker;
     const label = (v) => { if (!v) return "not set"; const p = parseActualsThrough(v); return p ? `${MONTHS[p.monthIndex]} ${p.year}` : v; };
+    if (m.held) return <span style={{ color: "#8A5A00" }}>stays {label(m.value)}: {m.held === "in-progress" ? `${e.month} is still in progress${e.asOf ? ` (report run ${MONTHS[e.asOf.monthIndex]} ${e.asOf.day})` : ""}` : `${e.month} looks half-loaded (${Math.round(e.lowMonth.ratio * 100)}% of the usual)`}</span>;
     if (m.advanced) return <span style={{ color: "#2F6F53" }}>{label(e.markerBefore)} → {label(m.value)}</span>;
     if (m.gap.length) return <span style={{ color: "#8A5A00" }}>stays {label(m.value)}; {m.gap.slice(0, 3).join(", ")}{m.gap.length > 3 ? ` and ${m.gap.length - 3} more` : ""} not loaded yet</span>;
     return <span style={{ color: "#8A8F87" }}>stays {label(m.value)}</span>;
   };
+  const heldAny = ok.some((e) => e.marker.held);
   const howText = (h) => [h.remembered && `${h.remembered} remembered`, h.name && `${h.name} by name`, h.chosen && `${h.chosen} you chose`, h.amount && `${h.amount} by matching figure`, h.account && `${h.account} to an account line`, h.category && `${h.category} to a category line`, h.created && `${h.created} new`].filter(Boolean).join(" · ");
 
   return (
@@ -8594,6 +8868,12 @@ function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActi
               </label>
             )))}
 
+            {heldAny && (
+              <label className="flex items-start gap-2 rounded-lg border p-3 text-sm" style={{ borderColor: "#E9D5A8", background: "#FBF3E4", color: "#6B4700" }}>
+                <input type="checkbox" aria-label="Move the actuals marker anyway" className="mt-1" checked={forceMarker} onChange={(e) => setForceMarker(e.target.checked)} />
+                <span>The figures will be loaded, but "actuals complete through" is not moved onto a month that is still in progress or looks half-loaded, because a half-finished month counts as real in Org Budget and drags the run-rate down. Tick this only if the month really is complete.</span>
+              </label>
+            )}
             {errors.length > 0 && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>{errors.map((e) => e.error).join(" ")}</div>}
             {dupes.length > 0 && <div className="rounded-lg border p-3 text-sm" style={{ background: "#FBEAE8", borderColor: "#E8B9B4", color: "#7A2A24" }}>Two files are set to the same month for {dupes.join(", ")}. Change the month on one of them.</div>}
 
@@ -8664,6 +8944,56 @@ function MonthlyActualsModal({ grants, costCenters, budgets, setBudgets, logActi
     </Modal>
   );
 }
+
+// A short warning on the Budgets page when the data looks wrong in a way that quietly skews the numbers.
+function BudgetDataHealth({ budgets, setBudgets, canEdit, logActivity }) {
+  const issues = useMemo(() => actualsMarkerHealth(budgets), [budgets]);
+  const dupes = useMemo(() => duplicateTemplateActuals(budgets), [budgets]);
+  const [open, setOpen] = useState(false);
+  if (issues.length === 0 && dupes.length === 0) return null;
+  const move = (ids) => {
+    setBudgets((prev) => moveMarkersBack(prev, ids).budgets);
+    logActivity?.("Budget", "Updated", `Moved "actuals complete through" back one month on ${ids.length} Template${ids.length === 1 ? "" : "s"}`);
+    notify(`Moved ${ids.length} marker${ids.length === 1 ? "" : "s"} back one month.`, "info");
+  };
+  return (
+    <div className="rounded-lg border p-4" style={{ background: "#FBF3E4", borderColor: "#E9D5A8" }}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="font-medium text-sm" style={{ color: "#6B4700" }}>Check your actuals{issues.length ? ` · ${issues.length} marker${issues.length === 1 ? "" : "s"} on a month that looks half-loaded` : ""}{dupes.length ? ` · ${dupes.length} pair${dupes.length === 1 ? "" : "s"} of Templates holding the same actuals` : ""}</div>
+        <button onClick={() => setOpen(!open)} className="text-sm px-2 py-1 rounded-md border" style={{ borderColor: "#E9D5A8", color: "#6B4700" }}>{open ? "Hide" : "Show details"}</button>
+      </div>
+      {open && (
+        <div className="mt-3 space-y-4 text-sm" style={{ color: "#1C2624" }}>
+          {issues.length > 0 && (
+            <div>
+              <p className="text-xs mb-2" style={{ color: "#6B4700" }}>
+                A Template's "actuals complete through" month counts as real in Org Budget, Burn Rate and the Budget tool. These are on a month whose expense is under half of the three months before it, which usually means the month was still being loaded. Moving the marker back one month keeps the figures but stops them counting as complete.
+              </p>
+              <div className="divide-y" style={{ borderColor: "#EFE3C4" }}>
+                {issues.map((i) => (
+                  <div key={i.id} className="py-1.5 flex flex-wrap items-center justify-between gap-2">
+                    <span>{i.title} <span className="text-xs" style={{ color: "#8A5A00" }}>· {monthKeyLabel(i.marker)}: {fmt(i.last)} against {fmt(i.avg)} usual ({Math.round(i.ratio * 100)}%)</span></span>
+                    {canEdit && <button onClick={() => move([i.id])} className="px-2 py-1 rounded-md border text-xs" style={{ borderColor: "#1F5C6B", color: "#1F5C6B", background: "#FFFFFF" }}>Move back to {monthKeyLabel(i.newMarker)}</button>}
+                  </div>
+                ))}
+              </div>
+              {canEdit && issues.length > 1 && <button onClick={() => move(issues.map((x) => x.id))} className="mt-2 px-3 py-1.5 rounded-md text-sm text-white" style={{ background: "#1F5C6B" }}>Move all {issues.length} back one month</button>}
+            </div>
+          )}
+          {dupes.length > 0 && (
+            <div>
+              <p className="text-xs mb-1" style={{ color: "#6B4700" }}>
+                These Templates share an owner and have nearly the same expense every month, so they look like copies of each other. Org Budget, and the Grant Budget they feed, count that money once for each copy. Upload each location's own figures from Sage (Budgets, Upload monthly actuals).
+              </p>
+              {dupes.map((d) => <div key={d.ids.join("|")} className="py-1">{d.titles.join("  and  ")} <span className="text-xs" style={{ color: "#8A5A00" }}>· the same in {d.months} months</span></div>)}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function OrgBudgetView({ grants, budgets, costCenters, budgetGroups }) {
   const [calYear, setCalYear] = useState("All");
@@ -12813,7 +13143,7 @@ function DataView({ grants, budgets, reports, staff, tasks, activity, invoices, 
     try {
       const res = await window.storage.get(`grantflow:autobackup:${date}`, true);
       if (!res?.value) { setAutoBackupError(`Couldn't find the backup for ${date}.`); return; }
-      downloadFile(`nations-finest-grantflow-autobackup-${date}.json`, res.value, "application/json");
+      downloadFile(`nations-finest-grantflow-autobackup-${date}.json`, await unpackFromStorage(res.value), "application/json");
     } catch (err) {
       setAutoBackupError(`Couldn't download the backup for ${date}.`);
     }
@@ -13446,7 +13776,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       verify: async (key) => {
         try {
           const r = await window.storage.get(key, true);
-          return r && r.value ? r.value : null;
+          return r && r.value ? await unpackFromStorage(r.value) : null;
         } catch (e) {
           if (classifyStorageError(e) === "missing") return null;
           throw e;
@@ -13750,7 +14080,13 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
   useEffect(() => {
     if (!loaded || !canEdit || markersAlignedRef.current || notLoaded.includes("Budgets")) return;
     markersAlignedRef.current = true;
-    const { budgets: aligned, changedIds } = alignLinkedMarkers(budgets);
+    // A Template is a source of actuals, never a destination: drop any link from one Template to another.
+    const cleaned = dropTemplateLinks(budgets);
+    const { budgets: aligned, changedIds } = alignLinkedMarkers(cleaned.budgets);
+    if (cleaned.changedIds.length) {
+      if (!changedIds.length) setBudgets(cleaned.budgets);
+      logActivity?.("Budget", "Updated", `Removed links between Templates on ${cleaned.changedIds.length} Template${cleaned.changedIds.length === 1 ? "" : "s"} (a Template only feeds Grant Budgets)`);
+    }
     if (changedIds.length) {
       setBudgets(aligned);
       logActivity?.("Budget", "Updated", `Aligned "actuals complete through" on ${changedIds.length} Grant Budget${changedIds.length === 1 ? "" : "s"} with the Template feeding ${changedIds.length === 1 ? "it" : "them"} (one-time update)`);
@@ -13772,7 +14108,7 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
       if (meta?.lastBackupDate === today) return; // already backed up today
       try {
         const payload = { exportedAt: new Date().toISOString(), grants, budgets, reports, staff, tasks, invoices, costCenters, budgetGroups, scenarios, budgetTool: budgetModels, trash, activity, restrictedFunds, paylocityProgramMap, paylocityLastImport, paylocitySnapshots };
-        await window.storage.set(`grantflow:autobackup:${today}`, JSON.stringify(payload), true);
+        await window.storage.set(`grantflow:autobackup:${today}`, await packForStorage(JSON.stringify(payload)), true);
         await window.storage.set(metaKey, JSON.stringify({ lastBackupDate: today }), true);
         const list = await window.storage.list("grantflow:autobackup:", true);
         const cutoff = Date.now() - AUTO_BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -13784,7 +14120,10 @@ function GrantFlowApp({ currentUserEmail, isAdmin, userRole, disabledModules, on
             window.storage.delete(key, true).catch(() => {});
           }
         }
-      } catch (e) { /* fail silently — this should never interrupt normal use */ }
+      } catch (e) {
+        // Never interrupts normal use, but a backup that can't be saved should not go unnoticed.
+        if (isAdmin) notify("Today's automatic backup couldn't be saved. Download a backup from Data & Backup to be safe.");
+      }
     })();
   }, [loaded]);
 
