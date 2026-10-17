@@ -536,7 +536,7 @@ const DEFAULT_BUCKETS = ["Upcoming", "Up next", "Overdue", "In progress", "Compl
 const TASK_STATUSES = ["Not started", "In progress", "Done"];
 const TASK_CATEGORIES = ["Application/Submission", "Site Visit", "Renewal Prep", "Document Collection", "Board Approval", "Compliance", "Personnel Reallocation", "Report Submission", "Other"];
 
-const APP_VERSION = "2.3.0";
+const APP_VERSION = "2.4.0";
 const uid = () => Math.random().toString(36).slice(2, 10);
 const stripNonce = (v) => (v ? v.split("::")[0] : "");
 const fmt = (n) => {
@@ -1273,6 +1273,29 @@ function stampReportMove(prev, next, todayIso) {
     return next;
   }
   if (next.completedAt || next.archiveHold) { const { completedAt, archiveHold, ...rest } = next; return rest; }
+  return next;
+}
+
+// ---------- archiving inactive staff ----------
+// A person marked Inactive stays on the Personnel list for STAFF_ARCHIVE_DAYS, so a mistaken click
+// is easy to see and undo, then moves to the Archive so the list doesn't grow as people come and go.
+// Nothing is deleted, and the cost views and Paylocity import still see everyone. The day someone
+// became inactive is recorded when their status is changed. Someone already inactive with no date
+// on file (everyone marked before this existed) is archived straight away, since how long they have
+// been inactive is unknown. Reactivating a person brings them back to the list.
+const STAFF_ARCHIVE_DAYS = 30;
+function isStaffArchived(person, todayIso) {
+  if ((person.status || "Active") !== "Inactive") return false;
+  const since = String(person.inactiveAt || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(since)) return true;
+  return daysBetweenIso(since, todayIso || reportsTodayIso()) > STAFF_ARCHIVE_DAYS;
+}
+// Records the day a person became inactive, and forgets it when they stop being inactive.
+function stampStaffStatus(prev, next, todayIso) {
+  const wasInactive = !!prev && (prev.status || "Active") === "Inactive";
+  const isInactive = (next.status || "Active") === "Inactive";
+  if (isInactive) return prev && !wasInactive ? { ...next, inactiveAt: todayIso || reportsTodayIso() } : next;
+  if (next.inactiveAt) { const { inactiveAt, ...rest } = next; return rest; }
   return next;
 }
 
@@ -9805,13 +9828,61 @@ function StaffModal({ staff, grants, costCenters, canEdit = true, onSave, onClos
   );
 }
 
-function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity, budgets = [], setBudgets, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, paylocitySnapshots = [], setPaylocitySnapshots }) {
+// The archive: people inactive for more than 30 days, newest first, grouped by the year they became inactive.
+function StaffArchive({ staff, canEdit, query, setQuery, onOpen, onReactivate }) {
+  const q = query.trim().toLowerCase();
+  const shown = staff.filter((s) => !q || `${s.name} ${s.position || ""} ${s.department || ""} ${s.site || ""}`.toLowerCase().includes(q))
+    .sort((a, b) => String(b.inactiveAt || "").localeCompare(String(a.inactiveAt || "")) || String(a.name || "").localeCompare(String(b.name || "")));
+  const years = [];
+  shown.forEach((s) => { const y = String(s.inactiveAt || "").slice(0, 4) || "Date not recorded"; let g = years.find((x) => x.year === y); if (!g) { g = { year: y, items: [] }; years.push(g); } g.items.push(s); });
+  years.sort((a, b) => (a.year === "Date not recorded" ? 1 : b.year === "Date not recorded" ? -1 : b.year.localeCompare(a.year)));
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="font-display text-lg" style={{ color: "#1C2624" }}>Archived staff</h2>
+        <p className="text-sm mt-1" style={{ color: "#5B6B66" }}>People who have been inactive for more than {STAFF_ARCHIVE_DAYS} days. They are kept, still count in Paylocity imports and search, and can be reactivated.</p>
+      </div>
+      <div className="relative" style={{ maxWidth: 320 }}>
+        <Search size={14} className="absolute left-2.5 top-2.5" style={{ color: "#8A8F87" }} />
+        <input aria-label="Search archived staff" className="w-full rounded-md border pl-8 pr-3 py-2 text-sm outline-none" style={inputStyle} placeholder="Search archived staff" value={query} onChange={(e) => setQuery(e.target.value)} />
+      </div>
+      {staff.length === 0 ? (
+        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>Nobody is archived yet. People move here once they have been inactive for more than {STAFF_ARCHIVE_DAYS} days.</div>
+      ) : shown.length === 0 ? (
+        <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>No archived staff match.</div>
+      ) : years.map((g) => (
+        <div key={g.year}>
+          <h3 className="text-xs font-semibold uppercase tracking-wide mb-2" style={{ color: "#5B6B66" }}>{g.year} <span style={{ color: "#8A8F87", fontWeight: 400 }}>({g.items.length})</span></h3>
+          <div className="bg-white rounded-lg border overflow-hidden" style={{ borderColor: "#E1E5DE" }}>
+            <table className="w-full text-sm">
+              <tbody>
+                {g.items.map((s) => (
+                  <tr key={s.id} className="border-t first:border-t-0" style={{ borderColor: "#EEF0EC" }}>
+                    <td className="px-3 py-2"><button onClick={() => onOpen(s)} className="text-left" style={{ color: "#1C2624" }}>{s.name || "Unnamed"}</button></td>
+                    <td className="px-3 py-2 text-xs" style={{ color: "#5B6B66" }}>{s.position}{s.department ? ` · ${s.department}` : ""}{s.site ? ` · ${s.site}` : ""}</td>
+                    <td className="px-3 py-2 text-xs whitespace-nowrap" style={{ color: "#5B6B66" }}>{s.inactiveAt ? `Inactive since ${fmtDate(String(s.inactiveAt).slice(0, 10))}` : "Inactive (date not recorded)"}</td>
+                    <td className="px-3 py-2 text-right">{canEdit && <button onClick={() => onReactivate(s)} aria-label={`Reactivate ${s.name}`} className="text-xs px-2 py-1 rounded-md border" style={{ borderColor: "#E1E5DE", color: "#1F5C6B" }}>Reactivate</button>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, currentUserEmail, canEdit, initialOpenStaffId, logActivity, budgets = [], setBudgets, paylocityProgramMap = [], setPaylocityProgramMap, paylocityLastImport, setPaylocityLastImport, paylocitySnapshots = [], setPaylocitySnapshots, todayIso }) {
   const [modal, setModal] = useState(() => (initialOpenStaffId ? staff.find((s) => s.id === stripNonce(initialOpenStaffId)) || null : null));
   const [confirm, setConfirm] = useState(null);
   const [deptFilter, setDeptFilter] = useState("All");
   const [positionFilter, setPositionFilter] = useState("All");
   const [siteFilter, setSiteFilter] = useState("All");
   const [statusFilter, setStatusFilter] = useState("All");
+  const [showArchive, setShowArchive] = useState(false);
+  const [archiveQuery, setArchiveQuery] = useState("");
+  const today = todayIso || reportsTodayIso();
   const [sortBy, setSortBy] = useState("name");
   const [showImport, setShowImport] = useState(false);
   const [costViewMode, setCostViewMode] = useState("summary");
@@ -9830,10 +9901,13 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
 
   const departments = ["All", ...new Set(staff.map((s) => s.department).filter(Boolean))];
   const positions = ["All", ...new Set(staff.map((s) => s.position).filter(Boolean))].sort((a, b) => (a === "All" ? -1 : b === "All" ? 1 : a.localeCompare(b)));
-  const visible = staff
+  const inScope = staff
     .filter((s) => deptFilter === "All" || s.department === deptFilter)
     .filter((s) => positionFilter === "All" || s.position === positionFilter)
-    .filter((s) => siteFilter === "All" || s.site === siteFilter)
+    .filter((s) => siteFilter === "All" || s.site === siteFilter);
+  const archivedStaff = inScope.filter((s) => isStaffArchived(s, today));
+  const visible = inScope
+    .filter((s) => !isStaffArchived(s, today))
     .filter((s) => statusFilter === "All" || (s.status || "Active") === statusFilter)
     .slice()
     .sort((a, b) => {
@@ -9853,8 +9927,12 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
     setStaff((prev) => {
       const exists = prev.some((x) => x.id === s.id);
       logActivity?.("Staff", exists ? "Updated" : "Created", s.name || "Untitled staff member");
-      return exists ? prev.map((x) => (x.id === s.id ? s : x)) : [...prev, s];
+      return exists ? prev.map((x) => (x.id === s.id ? stampStaffStatus(x, s, today) : x)) : [...prev, s];
     });
+  };
+  const reactivateStaff = (s) => {
+    setStaff((prev) => prev.map((x) => (x.id === s.id ? stampStaffStatus(x, { ...x, status: "Active" }, today) : x)));
+    logActivity?.("Staff", "Updated", `${s.name || "Untitled staff member"} (reactivated from the archive)`);
   };
   const deleteStaff = (id) => {
     const s = staff.find((x) => x.id === id);
@@ -10044,6 +10122,9 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
           )}
         </div>
         <div className="flex items-center gap-2 no-print">
+          <button onClick={() => setShowArchive(!showArchive)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624" }}>
+            {showArchive ? "← Back to staff" : `Archive (${archivedStaff.length})`}
+          </button>
           <button onClick={exportPersonnelExcel} disabled={exportingPersonnel} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-md text-sm border" style={{ borderColor: "#E1E5DE", color: "#1C2624", opacity: exportingPersonnel ? 0.6 : 1 }}>
             <Download size={16} /> {exportingPersonnel ? "Building…" : "Export Excel"}
           </button>
@@ -10495,9 +10576,11 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
         </Field>
       </div>
 
-      {visible.length === 0 ? (
+      {showArchive ? (
+        <StaffArchive staff={archivedStaff} canEdit={canEdit} query={archiveQuery} setQuery={setArchiveQuery} onOpen={setModal} onReactivate={reactivateStaff} />
+      ) : visible.length === 0 ? (
         <div className="bg-white rounded-lg border p-10 text-center" style={{ borderColor: "#E1E5DE", color: "#8A8F87" }}>
-          No staff members yet.
+          {archivedStaff.length > 0 ? `No staff to show. ${archivedStaff.length} inactive staff member${archivedStaff.length === 1 ? " is" : "s are"} in the Archive.` : "No staff members yet."}
         </div>
       ) : (
         <div className="space-y-3">
@@ -10547,6 +10630,10 @@ function PersonnelView({ grants, staff, setStaff, costCenters, setTrash, current
             );
           })}
         </div>
+      )}
+
+      {!showArchive && archivedStaff.length > 0 && (
+        <p className="text-xs" style={{ color: "#8A8F87" }}>{archivedStaff.length} staff member{archivedStaff.length === 1 ? "" : "s"} inactive for more than {STAFF_ARCHIVE_DAYS} days {archivedStaff.length === 1 ? "is" : "are"} in the Archive.</p>
       )}
 
       {modal && (
